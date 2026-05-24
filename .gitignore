@@ -1,0 +1,33 @@
+# Dependências
+node_modules/
+.pnp
+.pnp.js
+
+# Build e compilação
+dist/
+build/
+*.js.map
+
+# Variáveis de ambiente — NUNCA versionar
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.idea/
+
+# Docker
+.dockerignore
+
+# Cobertura de testes
+coverage/
