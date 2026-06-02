@@ -11,5 +11,9 @@
   },
   "keywords": [],
   "author": "DaviMoraisdev",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "prisma": "^6.19.3"
+  }
 }
