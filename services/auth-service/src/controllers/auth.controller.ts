@@ -33,7 +33,7 @@ export async function login(req: Request, res: Response): Promise<void> {
     res.status(200).json(result);
   } catch (error: any) {
     if (error.message === 'INVALID_CREDENTIALS') {
-      res.status(401).json({ error: 'Credentials invalidas' });
+      res.status(401).json({ error: 'Credenciais invalidas' });
       return;
     }
     res.status(500).json({ error: 'Erro interno do servidor' });
@@ -44,13 +44,15 @@ export async function me(req: Request, res: Response): Promise<void> {
     const userId = (req as any).userId;
     const user = await getUserById(userId);
     res.status(200).json(user);
-  } catch (error: any){
-    res.status(404).json({ error: 'Usuario nao encontrado'});
-    return;
+  } catch (error: any) {
+    if (error.message === 'USER_NOT_FOUND') {
+      res.status(404).json({ error: 'Usuario nao encontrado' });
+      return;
+    }
+    res.status(500).json({ error: 'Erro interno do servidor' });
   }
-  res.status(500).json({ error: 'Erro interno do servidor'});
-  }
-  
+}
+
 export async function refresh(req: Request, res: Response): Promise<void> {
   try {
     const { refreshToken } = req.body;
