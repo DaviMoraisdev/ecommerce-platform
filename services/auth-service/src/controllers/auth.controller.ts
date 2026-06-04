@@ -1,5 +1,5 @@
 import {Request, Response } from 'express';
-import { registerUser, loginUser, refreshAccessToken, getUserById } from '../services/auth.service';
+import { registerUser, loginUser, refreshAccessToken, getUserById, listUsers } from '../services/auth.service';
 
 export async function register(req: Request, res: Response): Promise<void> {
   try {
@@ -69,6 +69,14 @@ export async function refresh(req: Request, res: Response): Promise<void> {
       res.status(401).json({ error: 'Refresh token invalido ou expirado' });
       return;
     }
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+}
+export async function adminListUsers(req: Request, res: Response): Promise<void> {
+  try {
+    const users = await listUsers();
+    res.status(200).json(users);
+  } catch (error: any) {
     res.status(500).json({ error: 'Erro interno do servidor' });
   }
 }
