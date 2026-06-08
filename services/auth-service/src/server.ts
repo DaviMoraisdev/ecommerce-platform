@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import authRoutes from './routes/auth.routes';
+import { globalLimiter } from './middlewares/rateLimit.middleware';
 
 dotenv.config();
 
@@ -10,6 +11,7 @@ const PORT = process.env.AUTH_PORT || 3001;
 
 app.use(helmet());
 app.use(express.json());
+app.use(globalLimiter);
 
 app.use('/auth', authRoutes);
 
