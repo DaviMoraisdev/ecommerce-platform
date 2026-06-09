@@ -7,7 +7,7 @@
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc --project tsconfig.build.json",
     "start": "node dist/server.js",
-    "test": "jest",
+    "test": "jest --ci",
     "seed": "ts-node prisma/seed.ts"
   },
   "keywords": [],

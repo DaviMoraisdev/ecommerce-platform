@@ -16,7 +16,7 @@ jest.mock('@prisma/client', () => {
   };
 });
 
-import { registerUser, loginUser } from '../src/services/auth.service';
+import { registerUser, loginUser, refreshAccessToken } from '../src/services/auth.service';
 import bcrypt from 'bcrypt';
 import * as prismaModule from '@prisma/client';
 
@@ -73,5 +73,81 @@ describe('loginUser', () => {
     await expect(
       loginUser('davi@teste.com', 'senhaErrada')
     ).rejects.toThrow('INVALID_CREDENTIALS');
+  });
+});
+
+describe('loginUser - caminho feliz', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('deve gerar tokens, salvar refresh token e retornar usuario sem senha', async () => {
+    const hashReal = await bcrypt.hash('senhaCerta', 10);
+    mockFns.findUnique.mockResolvedValue({
+      id: '1', email: 'davi@teste.com', name: 'Davi',
+      password: hashReal, role: 'BUYER',
+    });
+    mockFns.update.mockResolvedValue({});
+
+    const result = await loginUser('davi@teste.com', 'senhaCerta');
+
+    // Gera os dois tokens
+    expect(result.accessToken).toBeDefined();
+    expect(result.refreshToken).toBeDefined();
+    // Persiste o refresh token no banco
+    expect(mockFns.update).toHaveBeenCalled();
+    const dadosUpdate = mockFns.update.mock.calls[0][0].data;
+    expect(dadosUpdate.refreshToken).toBe(result.refreshToken);
+    // Retorna o usuario SEM a senha
+    expect((result.user as any).password).toBeUndefined();
+    expect(result.user.email).toBe('davi@teste.com');
+  });
+});
+
+describe('refreshAccessToken', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('deve gerar novo access token quando o refresh token e valido', async () => {
+    // Primeiro faz login para obter um refresh token valido
+    const hashReal = await bcrypt.hash('senhaCerta', 10);
+    mockFns.findUnique.mockResolvedValue({
+      id: '1', email: 'davi@teste.com', name: 'Davi',
+      password: hashReal, role: 'BUYER',
+    });
+    mockFns.update.mockResolvedValue({});
+    const login = await loginUser('davi@teste.com', 'senhaCerta');
+
+    // Agora o usuario no banco tem o refresh token salvo
+    mockFns.findUnique.mockResolvedValue({
+      id: '1', email: 'davi@teste.com', name: 'Davi',
+      password: hashReal, role: 'BUYER',
+      refreshToken: login.refreshToken,
+    });
+
+    const result = await refreshAccessToken(login.refreshToken);
+    expect(result.accessToken).toBeDefined();
+  });
+
+  it('deve rejeitar quando o refresh token nao bate com o do banco', async () => {
+    const hashReal = await bcrypt.hash('senhaCerta', 10);
+    mockFns.findUnique.mockResolvedValue({
+      id: '1', email: 'davi@teste.com', name: 'Davi',
+      password: hashReal, role: 'BUYER',
+    });
+    mockFns.update.mockResolvedValue({});
+    const login = await loginUser('davi@teste.com', 'senhaCerta');
+
+    // Banco tem um refresh token DIFERENTE do apresentado
+    mockFns.findUnique.mockResolvedValue({
+      id: '1', email: 'davi@teste.com', name: 'Davi',
+      password: hashReal, role: 'BUYER',
+      refreshToken: 'token_diferente_salvo_no_banco',
+    });
+
+    await expect(
+      refreshAccessToken(login.refreshToken)
+    ).rejects.toThrow('INVALID_REFRESH_TOKEN');
   });
 });
