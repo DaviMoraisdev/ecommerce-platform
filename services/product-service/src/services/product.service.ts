@@ -1,7 +1,8 @@
 import { Product, IProduct } from '../models/product.model';
 
-// Campos que o cliente pode definir/alterar. Protege active, _id, timestamps.
 const ALLOWED_FIELDS = ['name', 'description', 'price', 'category', 'imageUrl'];
+const MAX_LIMIT = 50;
+const DEFAULT_LIMIT = 20;
 
 function pickAllowedFields(data: Record<string, any>): Record<string, any> {
   const result: Record<string, any> = {};
@@ -13,25 +14,67 @@ function pickAllowedFields(data: Record<string, any>): Record<string, any> {
   return result;
 }
 
+interface FindAllOptions {
+  page?: number;
+  limit?: number;
+  search?: string;
+  category?: string;
+}
+
+interface PaginatedResult {
+  data: IProduct[];
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
 export async function createProduct(data: Partial<IProduct>): Promise<IProduct> {
   const safeData = pickAllowedFields(data as Record<string, any>);
   const product = new Product(safeData);
   return await product.save();
 }
 
-export async function findAllProducts(): Promise<IProduct[]> {
-  return await Product.find({ active: true }).sort({ createdAt: -1 });
+export async function findAllProducts(options: FindAllOptions = {}): Promise<PaginatedResult> {
+  // Sanitiza paginacao: pagina minima 1, limite entre 1 e MAX_LIMIT
+  const page = Math.max(1, options.page || 1);
+  const limit = Math.min(MAX_LIMIT, Math.max(1, options.limit || DEFAULT_LIMIT));
+  const skip = (page - 1) * limit;
+
+  // Monta o filtro base: apenas produtos ativos
+  const filter: Record<string, any> = { active: true };
+
+  // Filtro por categoria, se fornecido
+  if (options.category) {
+    filter.category = options.category;
+  }
+
+  // Busca por texto, se fornecida
+  if (options.search) {
+    filter.$text = { $search: options.search };
+  }
+
+  // Executa a query paginada e a contagem total em paralelo
+  const [data, total] = await Promise.all([
+    Product.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    Product.countDocuments(filter),
+  ]);
+
+  return {
+    data,
+    page,
+    limit,
+    total,
+    totalPages: Math.ceil(total / limit),
+  };
 }
 
 export async function findProductById(id: string): Promise<IProduct | null> {
-  // So retorna produtos ativos, mesmo no acesso direto por ID
   return await Product.findOne({ _id: id, active: true });
 }
 
 export async function updateProduct(id: string, data: Partial<IProduct>): Promise<IProduct | null> {
   const safeData = pickAllowedFields(data as Record<string, any>);
-  // runValidators garante que o min:0 do preco seja respeitado no update
-  // O filtro active:true impede atualizar produto ja removido
   return await Product.findOneAndUpdate(
     { _id: id, active: true },
     safeData,
@@ -40,7 +83,6 @@ export async function updateProduct(id: string, data: Partial<IProduct>): Promis
 }
 
 export async function deleteProduct(id: string): Promise<IProduct | null> {
-  // Soft delete: so age sobre produto ativo
   return await Product.findOneAndUpdate(
     { _id: id, active: true },
     { active: false },

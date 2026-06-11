@@ -31,8 +31,13 @@ export async function create(req: Request, res: Response): Promise<void> {
 
 export async function findAll(req: Request, res: Response): Promise<void> {
   try {
-    const products = await productService.findAllProducts();
-    res.status(200).json(products);
+    const page = req.query.page ? parseInt(String(req.query.page), 10) : undefined;
+    const limit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
+    const search = req.query.search ? String(req.query.search) : undefined;
+    const category = req.query.category ? String(req.query.category) : undefined;
+
+    const result = await productService.findAllProducts({ page, limit, search, category });
+    res.status(200).json(result);
   } catch (error: any) {
     handleError(error, res);
   }
