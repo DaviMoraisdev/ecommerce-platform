@@ -498,7 +498,7 @@ O projeto será desenvolvido em fases para evitar acúmulo de complexidade e per
 |---|---:|---|
 | Fase 1 | Concluída | Fundação do projeto e ambiente local |
 | Fase 2 | Concluída | Serviço de autenticação |
-| Fase 3 | Pendente | Catálogo de produtos e estoque |
+| Fase 3 | Em andamento | Catálogo de produtos e estoque |
 | Fase 4 | Pendente | Carrinho e pedidos |
 | Fase 5 | Pendente | Pagamentos |
 | Fase 6 | Pendente | Notificações assíncronas |
