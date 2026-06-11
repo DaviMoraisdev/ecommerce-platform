@@ -1,6 +1,20 @@
 import { Request, Response } from 'express';
 import * as productService from '../services/product.service';
 
+function handleError(error: any, res: Response): void {
+  // Erro de validacao do Mongoose (ex: preco negativo) -> 400
+  if (error.name === 'ValidationError') {
+    res.status(400).json({ error: 'Dados invalidos', details: error.message });
+    return;
+  }
+  // ID malformado -> 400
+  if (error.name === 'CastError') {
+    res.status(400).json({ error: 'ID invalido' });
+    return;
+  }
+  res.status(500).json({ error: 'Erro interno do servidor' });
+}
+
 export async function create(req: Request, res: Response): Promise<void> {
   try {
     const { name, description, price, category } = req.body;
@@ -11,7 +25,7 @@ export async function create(req: Request, res: Response): Promise<void> {
     const product = await productService.createProduct(req.body);
     res.status(201).json(product);
   } catch (error: any) {
-    res.status(500).json({ error: 'Erro interno do servidor' });
+    handleError(error, res);
   }
 }
 
@@ -20,7 +34,7 @@ export async function findAll(req: Request, res: Response): Promise<void> {
     const products = await productService.findAllProducts();
     res.status(200).json(products);
   } catch (error: any) {
-    res.status(500).json({ error: 'Erro interno do servidor' });
+    handleError(error, res);
   }
 }
 
@@ -34,7 +48,7 @@ export async function findOne(req: Request, res: Response): Promise<void> {
     }
     res.status(200).json(product);
   } catch (error: any) {
-    res.status(500).json({ error: 'Erro interno do servidor' });
+    handleError(error, res);
   }
 }
 
@@ -48,7 +62,7 @@ export async function update(req: Request, res: Response): Promise<void> {
     }
     res.status(200).json(product);
   } catch (error: any) {
-    res.status(500).json({ error: 'Erro interno do servidor' });
+    handleError(error, res);
   }
 }
 
@@ -62,6 +76,6 @@ export async function remove(req: Request, res: Response): Promise<void> {
     }
     res.status(200).json({ message: 'Produto removido com sucesso' });
   } catch (error: any) {
-    res.status(500).json({ error: 'Erro interno do servidor' });
+    handleError(error, res);
   }
 }
