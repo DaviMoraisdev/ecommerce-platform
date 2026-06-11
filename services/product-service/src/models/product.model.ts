@@ -23,4 +23,10 @@ const productSchema = new Schema<IProduct>(
   { timestamps: true }
 );
 
+// Indice composto: otimiza a query de listagem (ativos, ordenados por data)
+productSchema.index({ active: 1, createdAt: -1 });
+
+// Indice de texto para busca por nome e descricao
+productSchema.index({ name: 'text', description: 'text' });
+
 export const Product = mongoose.model<IProduct>('Product', productSchema);
