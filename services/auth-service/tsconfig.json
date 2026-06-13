@@ -18,8 +18,7 @@
     "types": [
       "node",
       "jest"
-    ],
-    "rootDir": "./src"
+    ]
   },
   "include": [
     "src/**/*",
