@@ -15,5 +15,7 @@ model Inventory {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // Constraints CHECK aplicadas via migration:
+  // quantity >= 0, reserved >= 0, reserved <= quantity
   @@map("inventory")
 }
