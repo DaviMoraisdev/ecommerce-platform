@@ -1,9 +1,8 @@
-import express, { Request, Response } from 'express';
-import helmet from 'helmet';
 import dotenv from 'dotenv';
-import { connectDatabase } from './config/database';
-
 dotenv.config();
+
+import app from './app';
+import { connectDatabase } from './config/database';
 
 const REQUIRED_ENV = ['DATABASE_URL'];
 for (const key of REQUIRED_ENV) {
@@ -13,21 +12,19 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const app = express();
-const PORT = process.env.INVENTORY_PORT || 3004;
-
-app.use(helmet());
-app.use(express.json());
-
-app.get('/health', (req: Request, res: Response) => {
-  res.status(200).json({
-    status: 'ok',
-    service: 'inventory-service',
-    timestamp: new Date().toISOString(),
-  });
-});
+// Valida a porta: deve ser inteiro entre 1 e 65535
+function resolvePort(): number {
+  const raw = process.env.INVENTORY_PORT || '3004';
+  const port = parseInt(raw, 10);
+  if (isNaN(port) || port < 1 || port > 65535) {
+    console.error(`INVENTORY_PORT invalido: ${raw}`);
+    process.exit(1);
+  }
+  return port;
+}
 
 async function startServer() {
+  const PORT = resolvePort();
   await connectDatabase();
   app.listen(PORT, () => {
     console.log(`Inventory service rodando na porta ${PORT}`);
@@ -35,5 +32,3 @@ async function startServer() {
 }
 
 startServer();
-
-export default app;
