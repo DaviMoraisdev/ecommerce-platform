@@ -4,7 +4,7 @@ dotenv.config();
 import app from './app';
 import { connectDatabase } from './config/database';
 
-const REQUIRED_ENV = ['DATABASE_URL'];
+const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`Variavel de ambiente obrigatoria ausente: ${key}`);
