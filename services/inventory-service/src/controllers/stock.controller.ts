@@ -3,7 +3,15 @@ import * as stockService from '../services/stock.service';
 
 function handleError(error: any, res: Response): void {
   if (error.message === 'INVALID_AMOUNT') {
-    res.status(400).json({ error: 'A quantidade deve ser maior que zero' });
+    res.status(400).json({ error: 'A quantidade deve ser um inteiro positivo' });
+    return;
+  }
+  if (error.message === 'INVALID_PRODUCT_ID') {
+    res.status(400).json({ error: 'productId invalido' });
+    return;
+  }
+  if (error.message === 'QUANTITY_BELOW_RESERVED') {
+    res.status(409).json({ error: 'A nova quantidade e menor que o estoque ja reservado' });
     return;
   }
   if (error.message === 'PRODUCT_NOT_FOUND') {

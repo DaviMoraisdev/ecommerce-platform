@@ -12,6 +12,6 @@ router.post('/', authMiddleware, requireRole('ADMIN', 'SELLER'), stockController
 
 // Reservar e liberar: exigem autenticacao (serao chamados por outros servicos/usuarios logados)
 router.post('/reserve', authMiddleware, stockController.reserve);
-router.post('/release', authMiddleware, stockController.release);
+router.post('/release', authMiddleware, requireRole('ADMIN', 'SELLER'), stockController.release);
 
 export default router;

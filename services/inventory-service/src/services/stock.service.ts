@@ -1,6 +1,29 @@
 import { prisma } from '../config/database';
+import { Prisma } from '@prisma/client';
+
+// Valida que o valor e um inteiro finito e positivo
+function isPositiveInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+function isNonNegativeInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
 
 export async function setStock(productId: string, quantity: number) {
+  if (!productId || typeof productId !== 'string') {
+    throw new Error('INVALID_PRODUCT_ID');
+  }
+  if (!isNonNegativeInt(quantity)) {
+    throw new Error('INVALID_AMOUNT');
+  }
+
+  // Verifica se a nova quantidade nao fica abaixo do que ja esta reservado
+  const existing = await prisma.inventory.findUnique({ where: { productId } });
+  if (existing && quantity < existing.reserved) {
+    throw new Error('QUANTITY_BELOW_RESERVED');
+  }
+
   return await prisma.inventory.upsert({
     where: { productId },
     update: { quantity },
@@ -25,70 +48,55 @@ export async function getAvailability(productId: string) {
   };
 }
 
+// Reserva ATOMICA: um unico UPDATE condicional. A clausula WHERE garante
+// que so reserva se houver disponivel suficiente. O banco executa isso
+// como operacao indivisivel — nao ha fresta entre verificar e escrever.
 export async function reserveStock(productId: string, amount: number) {
-  if (amount <= 0) {
+  if (!isPositiveInt(amount)) {
     throw new Error('INVALID_AMOUNT');
   }
 
-  // Transacao atomica: le o estoque travando a linha (FOR UPDATE),
-  // verifica disponibilidade e so entao reserva. O lock impede que
-  // duas reservas concorrentes leiam o mesmo disponivel.
-  return await prisma.$transaction(async (tx) => {
-    const inventory = await tx.inventory.findUnique({
-      where: { productId },
-    });
+  const affected = await prisma.$executeRaw`
+    UPDATE inventory
+    SET reserved = reserved + ${amount}, "updatedAt" = NOW()
+    WHERE "productId" = ${productId}
+      AND quantity - reserved >= ${amount}
+  `;
 
-    if (!inventory) {
+  // affected = numero de linhas atualizadas. 0 significa que ou o produto
+  // nao existe, ou nao havia disponivel suficiente.
+  if (affected === 0) {
+    // Distingue "nao existe" de "sem estoque" para o status HTTP correto
+    const exists = await prisma.inventory.findUnique({ where: { productId } });
+    if (!exists) {
       throw new Error('PRODUCT_NOT_FOUND');
     }
+    throw new Error('INSUFFICIENT_STOCK');
+  }
 
-    const available = inventory.quantity - inventory.reserved;
-    if (available < amount) {
-      throw new Error('INSUFFICIENT_STOCK');
-    }
-
-    const updated = await tx.inventory.update({
-      where: { productId },
-      data: { reserved: { increment: amount } },
-    });
-
-    return {
-      productId: updated.productId,
-      quantity: updated.quantity,
-      reserved: updated.reserved,
-      available: updated.quantity - updated.reserved,
-    };
-  });
+  return await getAvailability(productId);
 }
 
+// Liberacao ATOMICA: mesma logica. So libera se houver reserva suficiente.
 export async function releaseStock(productId: string, amount: number) {
-  if (amount <= 0) {
+  if (!isPositiveInt(amount)) {
     throw new Error('INVALID_AMOUNT');
   }
 
-  return await prisma.$transaction(async (tx) => {
-    const inventory = await tx.inventory.findUnique({
-      where: { productId },
-    });
+  const affected = await prisma.$executeRaw`
+    UPDATE inventory
+    SET reserved = reserved - ${amount}, "updatedAt" = NOW()
+    WHERE "productId" = ${productId}
+      AND reserved >= ${amount}
+  `;
 
-    if (!inventory) {
+  if (affected === 0) {
+    const exists = await prisma.inventory.findUnique({ where: { productId } });
+    if (!exists) {
       throw new Error('PRODUCT_NOT_FOUND');
     }
+    throw new Error('INVALID_RELEASE');
+  }
 
-    if (inventory.reserved < amount) {
-      throw new Error('INVALID_RELEASE');
-    }
-
-    const updated = await tx.inventory.update({
-      where: { productId },
-      data: { reserved: { decrement: amount } },
-    });
-
-    return {
-      productId: updated.productId,
-      quantity: updated.quantity,
-      reserved: updated.reserved,
-      available: updated.quantity - updated.reserved,
-    };
-  });
+  return await getAvailability(productId);
 }
