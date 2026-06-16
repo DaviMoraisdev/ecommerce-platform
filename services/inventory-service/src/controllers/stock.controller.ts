@@ -6,6 +6,10 @@ function handleError(error: any, res: Response): void {
     res.status(400).json({ error: 'A quantidade deve ser um inteiro positivo' });
     return;
   }
+  if (error.message === 'INVALID_QUANTITY') {
+    res.status(400).json({ error: 'A quantidade deve ser um inteiro nao-negativo' });
+    return;
+  }
   if (error.message === 'INVALID_PRODUCT_ID') {
     res.status(400).json({ error: 'productId invalido' });
     return;
