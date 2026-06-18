@@ -1,4 +1,5 @@
 import { Product, IProduct } from '../models/product.model';
+import { fetchAvailability } from './inventory.client';
 
 const ALLOWED_FIELDS = ['name', 'description', 'price', 'category', 'imageUrl'];
 const MAX_LIMIT = 50;
@@ -69,8 +70,27 @@ export async function findAllProducts(options: FindAllOptions = {}): Promise<Pag
   };
 }
 
-export async function findProductById(id: string): Promise<IProduct | null> {
-  return await Product.findOne({ _id: id, active: true });
+export async function findProductById(id: string) {
+  const product = await Product.findOne({ _id: id, active: true });
+  if (!product) {
+    return null;
+  }
+
+  // Consulta o inventory-service para enriquecer com disponibilidade.
+  // Se o estoque nao responder, availability vem null e o produto
+  // ainda e retornado (degradacao graciosa).
+  const availability = await fetchAvailability(String(product._id));
+
+  return {
+    ...product.toObject(),
+    availability: availability
+      ? {
+          quantity: availability.quantity,
+          reserved: availability.reserved,
+          available: availability.available,
+        }
+      : null,
+  };
 }
 
 export async function updateProduct(id: string, data: Partial<IProduct>): Promise<IProduct | null> {
