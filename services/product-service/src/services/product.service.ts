@@ -81,13 +81,14 @@ export async function findProductById(id: string) {
   // ainda e retornado (degradacao graciosa).
   const availability = await fetchAvailability(String(product._id));
 
+  // Expoe apenas o minimo necessario ao cliente: se ha estoque e quantos
+  // restam. quantity total e reserved sao dados operacionais internos.
   return {
     ...product.toObject(),
     availability: availability
       ? {
-          quantity: availability.quantity,
-          reserved: availability.reserved,
           available: availability.available,
+          inStock: availability.available > 0,
         }
       : null,
   };
