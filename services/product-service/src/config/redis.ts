@@ -8,8 +8,8 @@ export function getRedisClient(): Redis {
   if (!redisClient) {
     const url = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
     redisClient = new Redis(url, {
-      // Se o Redis cair, nao queremos travar o servico esperando reconexao.
-      // maxRetriesPerRequest null + lazyConnect dao controle sobre falhas.
+      // Limita retentativas por comando: se o Redis cair, o comando falha rapido
+      // em vez de travar a requisicao esperando reconexao indefinida.
       maxRetriesPerRequest: 2,
     });
 

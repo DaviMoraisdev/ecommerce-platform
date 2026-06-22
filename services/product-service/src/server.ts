@@ -7,7 +7,7 @@ import productRoutes from './routes/product.routes';
 dotenv.config();
 
 // Validacao de variaveis obrigatorias no boot — falha clara em vez de 401 misterioso
-const REQUIRED_ENV = ['MONGO_URI', 'JWT_SECRET', 'REDIS_URL'];
+const REQUIRED_ENV = ['MONGO_URI', 'JWT_SECRET'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`Variavel de ambiente obrigatoria ausente: ${key}`);

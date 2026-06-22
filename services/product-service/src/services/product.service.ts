@@ -1,27 +1,41 @@
 import { Product, IProduct } from '../models/product.model';
 import { fetchAvailability } from './inventory.client';
 import { getRedisClient } from '../config/redis';
+import crypto from 'crypto';
 
 const ALLOWED_FIELDS = ['name', 'description', 'price', 'category', 'imageUrl'];
 
-// Prefixo e TTL do cache de listagem
+// Prefixo, chave de versao e TTL do cache de listagem
 const LIST_CACHE_PREFIX = 'products:list:';
+const LIST_VERSION_KEY = 'products:list:version';
 const LIST_CACHE_TTL = 60; // segundos
 
-// Invalida TODO o cache de listagem. Chamada sempre que um produto muda.
-// Estrategia simples e segura (Opcao B): em vez de descobrir quais paginas
-// foram afetadas, limpamos todas — evita servir dado velho.
+// Le a versao atual do cache. Se nao existe, assume 1.
+// A versao faz parte da chave de cada listagem cacheada — quando ela muda,
+// todo cache anterior fica orfao (escrito sob versao velha que ninguem le).
+async function getCacheVersion(): Promise<string> {
+  try {
+    const redis = getRedisClient();
+    const version = await redis.get(LIST_VERSION_KEY);
+    // Default '0' (nao '1') para nao colidir com o primeiro INCR, que tambem
+    // produz '1'. Assim a primeira invalidacao realmente muda a versao lida.
+    return version || '0';
+  } catch {
+    return '0';
+  }
+}
+
+// Invalida o cache de listagem INCREMENTANDO a versao. Chamada quando um produto muda.
+// Em vez de apagar chaves (que uma escrita atrasada poderia recriar com dado velho),
+// mudamos a versao: todo cache anterior fica sob uma versao que ninguem mais le.
+// Resolve a condicao de corrida e e O(1) — nao varre o keyspace.
 async function invalidateListCache(): Promise<void> {
   try {
     const redis = getRedisClient();
-    // Busca todas as chaves do cache de listagem e as remove
-    const keys = await redis.keys(`${LIST_CACHE_PREFIX}*`);
-    if (keys.length > 0) {
-      await redis.del(...keys);
-    }
+    // INCR cria a chave em 1 se nao existir, ou incrementa. Operacao atomica.
+    await redis.incr(LIST_VERSION_KEY);
   } catch (err) {
-    // Falha na invalidacao nao pode quebrar a operacao principal.
-    // O TTL de 60s e a rede de seguranca: o cache velho expira sozinho.
+    // Falha na invalidacao nao quebra a operacao. O TTL de 60s e a rede de seguranca.
     console.warn('[cache] invalidacao falhou (TTL cobrira)');
   }
 }
@@ -67,19 +81,23 @@ export async function findAllProducts(options: FindAllOptions = {}): Promise<Pag
   const limit = Math.min(MAX_LIMIT, Math.max(1, options.limit || DEFAULT_LIMIT));
   const skip = (page - 1) * limit;
 
-  // Monta a chave de cache a partir dos parametros desta consulta especifica
-  const cacheKey = `${LIST_CACHE_PREFIX}p=${page}:l=${limit}:c=${options.category || ''}:s=${options.search || ''}`;
+  // Le a versao atual e a inclui na chave. Hash dos parametros para limitar
+  // o tamanho/cardinalidade da chave (search/category sao limitados no controller,
+  // mas o hash garante chave de tamanho fixo).
+  const version = await getCacheVersion();
+  const rawParams = `p=${page}:l=${limit}:c=${options.category || ''}:s=${options.search || ''}`;
+  const paramHash = crypto.createHash('sha1').update(rawParams).digest('hex');
+  const cacheKey = `${LIST_CACHE_PREFIX}v${version}:${paramHash}`;
 
-  const redis = getRedisClient();
-
-  // 1. Tenta servir do cache (cache HIT)
+  // 1. Tenta servir do cache (cache HIT). getRedisClient dentro do try para
+  // que erro de criacao do cliente tambem caia na degradacao graciosa.
   try {
+    const redis = getRedisClient();
     const cached = await redis.get(cacheKey);
     if (cached) {
       return JSON.parse(cached) as PaginatedResult;
     }
   } catch (err) {
-    // Se o Redis falhar, seguimos para o banco — cache nao pode quebrar o servico
     console.warn('[cache] leitura falhou, indo ao banco');
   }
 
@@ -107,6 +125,7 @@ export async function findAllProducts(options: FindAllOptions = {}): Promise<Pag
 
   // 3. Guarda no cache para as proximas requisicoes, com expiracao (TTL)
   try {
+    const redis = getRedisClient();
     await redis.set(cacheKey, JSON.stringify(result), 'EX', LIST_CACHE_TTL);
   } catch (err) {
     console.warn('[cache] escrita falhou');
@@ -146,7 +165,10 @@ export async function updateProduct(id: string, data: Partial<IProduct>): Promis
     safeData,
     { new: true, runValidators: true }
   );
-  await invalidateListCache();
+  // So invalida se algo mudou de fato (evita churn de cache em no-op)
+  if (updated) {
+    await invalidateListCache();
+  }
   return updated;
 }
 
@@ -156,6 +178,8 @@ export async function deleteProduct(id: string): Promise<IProduct | null> {
     { active: false },
     { new: true }
   );
-  await invalidateListCache();
+  if (deleted) {
+    await invalidateListCache();
+  }
   return deleted;
 }
