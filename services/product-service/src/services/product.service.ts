@@ -1,7 +1,7 @@
 import { Product, IProduct } from '../models/product.model';
 import { fetchAvailability } from './inventory.client';
 import { getRedisClient } from '../config/redis';
-import crypto from 'crypto';
+import { createHash } from 'node:crypto';
 
 const ALLOWED_FIELDS = ['name', 'description', 'price', 'category', 'imageUrl'];
 
@@ -85,8 +85,10 @@ export async function findAllProducts(options: FindAllOptions = {}): Promise<Pag
   // o tamanho/cardinalidade da chave (search/category sao limitados no controller,
   // mas o hash garante chave de tamanho fixo).
   const version = await getCacheVersion();
-  const rawParams = `p=${page}:l=${limit}:c=${options.category || ''}:s=${options.search || ''}`;
-  const paramHash = crypto.createHash('sha1').update(rawParams).digest('hex');
+  // Serializa como array JSON: estruturalmente nao-ambiguo. Concatenar com
+  // delimitadores permitiria colisao (ex: category 'a:s=b' vs search 'b').
+  const rawParams = JSON.stringify([page, limit, options.category || '', options.search || '']);
+  const paramHash = createHash('sha1').update(rawParams).digest('hex');
   const cacheKey = `${LIST_CACHE_PREFIX}v${version}:${paramHash}`;
 
   // 1. Tenta servir do cache (cache HIT). getRedisClient dentro do try para
@@ -110,8 +112,10 @@ export async function findAllProducts(options: FindAllOptions = {}): Promise<Pag
     filter.$text = { $search: options.search };
   }
 
+  // .lean() retorna objetos JS puros (nao documentos Mongoose), igualando o
+  // formato do cache miss ao do cache hit (que vem de JSON.parse).
   const [data, total] = await Promise.all([
-    Product.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    Product.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
     Product.countDocuments(filter),
   ]);
 
