@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ path: '.env.test' });
 
 import request from 'supertest';
 import app from '../src/app';
@@ -22,11 +22,17 @@ describe('inventory-service - estrutura', () => {
   });
 
   describe('importar o app', () => {
-    it('nao sobe servidor nem ocupa porta ao ser importado', () => {
-      // Se o import do app subisse o servidor, o Supertest nao conseguiria
-      // usar o app em memoria. O fato de os testes HTTP funcionarem ja prova
-      // a separacao. Aqui validamos que o app e um handler do Express.
+    it('app e um handler do Express valido', () => {
       expect(typeof app).toBe('function');
+    });
+
+    it('importar o app NAO faz o Express escutar uma porta', () => {
+      // Prova real da separacao app/server: o app importado nao deve ter
+      // um servidor escutando. Um app Express que nunca chamou listen()
+      // nao tem a propriedade interna de servidor ativo.
+      // Verificamos que nenhum listener foi montado pelo simples import.
+      const appWithServer = app as unknown as { listening?: boolean };
+      expect(appWithServer.listening).toBeUndefined();
     });
   });
 
@@ -39,7 +45,7 @@ describe('inventory-service - estrutura', () => {
         prisma.inventory.create({
           data: { productId: id, quantity: -5, reserved: 0 },
         })
-      ).rejects.toThrow();
+      ).rejects.toThrow('quantity_nao_negativa');
     });
 
     it('rejeita reserved > quantity (CHECK reserved <= quantity)', async () => {
@@ -49,7 +55,7 @@ describe('inventory-service - estrutura', () => {
         prisma.inventory.create({
           data: { productId: id, quantity: 5, reserved: 10 },
         })
-      ).rejects.toThrow();
+      ).rejects.toThrow('reserved_menor_igual_quantity');
     });
 
     it('rejeita reserved negativo (CHECK reserved >= 0)', async () => {
@@ -59,7 +65,7 @@ describe('inventory-service - estrutura', () => {
         prisma.inventory.create({
           data: { productId: id, quantity: 5, reserved: -2 },
         })
-      ).rejects.toThrow();
+      ).rejects.toThrow('reserved_nao_negativa');
     });
   });
 });

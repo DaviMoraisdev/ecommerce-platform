@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ path: '.env.test' });
 
 import { prisma } from '../src/config/database';
 import { reserveStock, setStock } from '../src/services/stock.service';
