@@ -6,13 +6,15 @@ correto, em vez de corrigido na hora. Não são esquecimentos — são trade-off
 
 Organizado por DESTINO (onde será resolvido). Atualizado ao final de cada bloco.
 
-Última atualização: Fase 3, Bloco 6 concluído.
+Última atualização: Fase 3, Bloco 8a concluído (PR #22 + follow-up PR #24).
 
 ---
 
 ## BLOCO 8 (Testes da Fase 3) — bloco dedicado de testes
 
-### product-service
+Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o sub-bloco.
+
+### product-service (Bloco 8b — pendente)
 - POST /products com token ADMIN e SELLER (201)
 - POST /products sem token → 401
 - POST /products com BUYER → 403
@@ -24,20 +26,20 @@ Organizado por DESTINO (onde será resolvido). Atualizado ao final de cada bloco
 - Filtro por categoria; busca por texto; search vazia/muito longa
 - Formato da resposta paginada (data, page, limit, total, totalPages)
 
-### inventory-service
-- /health responde
-- Startup falha sem DATABASE_URL
-- INVENTORY_PORT inválido falha com erro claro
-- Erro de conexão não vaza detalhes sensíveis no log
-- Constraints rejeitam: quantity negativo, reserved negativo, reserved > quantity
-- Importar o app NÃO sobe o servidor nem conecta ao banco
-- **TESTE DE CONCORRÊNCIA OBRIGATÓRIO**: duas reservas simultâneas do último item — só uma deve passar (prova o lock atômico do $executeRaw)
-- release com ownership/autorização
-- setStock com quantity < reserved
-- Payloads inválidos: string, float, null, campos faltando, negativos
-- Mapeamento status: 400, 401, 403, 404, 409
+### inventory-service (Bloco 8a — CONCLUÍDO, exceto itens de camada HTTP → 8c)
+- ✅ /health responde (8a — suíte estrutura)
+- ✅ Startup falha sem DATABASE_URL (8a — suíte env)
+- ✅ INVENTORY_PORT inválido falha com erro claro (8a — suíte env)
+- ✅ Erro de conexão não vaza detalhes sensíveis no log (PR #24) — `sanitizeConnectionError` em módulo puro (`config/database-error.ts`) com allowlist de nomes de erro; a saída é limitada a um conjunto controlado, nunca confia no conteúdo do erro. Função 100% testada (`.message` e `.name` maliciosos). Teste do encadeamento de `connectDatabase` (console.error + process.exit) diferido → ver Fase 7/10.
+- ✅ Constraints rejeitam: quantity negativo, reserved negativo, reserved > quantity (8a — suíte estrutura, verificação por nome de constraint)
+- ✅ Importar o app NÃO sobe o servidor nem conecta ao banco (8a — suíte estrutura, separação app/server)
+- ✅ **TESTE DE CONCORRÊNCIA OBRIGATÓRIO**: duas reservas simultâneas do último item — só uma deve passar (8a — suíte concorrência, prova o lock atômico do $executeRaw)
+- ✅ setStock com quantity < reserved (8a — suíte stock.service, QUANTITY_BELOW_RESERVED)
+- ✅ Payloads inválidos: string, float, null, campos faltando, negativos (8a — suíte stock.service, validação numérica)
+- release com ownership/autorização → **PENDENTE (8c)**: lógica do `releaseStock` coberta no 8a, mas a autorização na camada de rota (ADMIN/SELLER) é teste HTTP. Ownership real (validar de quem é a reserva) é dívida do order-service (ver seção própria).
+- Mapeamento status: 400, 401, 403, 404, 409 → **PENDENTE (8c)**: o service lança os erros corretos (provado no 8a); falta provar a tradução para status HTTP na camada de rota.
 
-### inventory.client (product-service) — integração Bloco 6
+### inventory.client (product-service) — integração Bloco 6 (Bloco 8c — pendente)
 - fetchAvailability: sucesso, 404, non-OK, timeout/abort, erro de rede, JSON inválido, schema inválido, `available` negativo
 - Encoding de productId na URL
 - findProductById: produto ausente (null), com availability, com availability null (inventory fora)
@@ -61,6 +63,7 @@ Organizado por DESTINO (onde será resolvido). Atualizado ao final de cada bloco
 - **Criação de índices MongoDB em produção:** via script de migração ou passo de deploy documentado, em vez de auto-indexing do Mongoose.
 - **Rate limit com store no Redis:** compartilhado entre instâncias do auth-service ao escalar horizontalmente.
 - **Logger estruturado:** substituir os console.warn do inventory.client por logger de verdade, com rate limit para não gerar ruído se o inventory ficar instável.
+- **Teste de integração do `connectDatabase` (inventory-service):** provar que o `catch` chama só a saída sanitizada no `console.error` e dispara `process.exit(1)`. Exige mock de `process.exit` + spy de `console.error` + forçar `$connect` a falhar. A lógica de segurança já está coberta pela função pura `sanitizeConnectionError` (PR #24); este teste cobre apenas o encadeamento, de baixo risco de regressão. Fazer quando o `connectDatabase` ganhar lógica nova (ex.: retry) ou na rodada de robustez de testes.
 
 ---
 
