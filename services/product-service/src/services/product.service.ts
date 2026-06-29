@@ -42,7 +42,7 @@ async function invalidateListCache(): Promise<void> {
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 20;
 
-function pickAllowedFields(data: Record<string, any>): Record<string, any> {
+export function pickAllowedFields(data: Record<string, any>): Record<string, any> {
   const result: Record<string, any> = {};
   for (const field of ALLOWED_FIELDS) {
     if (data[field] !== undefined) {

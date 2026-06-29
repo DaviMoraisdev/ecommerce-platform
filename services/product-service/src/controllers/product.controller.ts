@@ -33,7 +33,7 @@ const MAX_PAGE = 10000;
 const MAX_SEARCH_LENGTH = 100;
 
 // Valida um inteiro positivo. Retorna o numero ou uma string de erro.
-function parsePositiveInt(raw: string, fieldName: string, max: number): number | { error: string } {
+export function parsePositiveInt(raw: string, fieldName: string, max: number): number | { error: string } {
   // Rejeita decimais, letras, negativos: so aceita digitos
   if (!/^[0-9]+$/.test(raw)) {
     return { error: `${fieldName} deve ser um inteiro positivo` };
