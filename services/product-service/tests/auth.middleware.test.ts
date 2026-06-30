@@ -55,12 +55,15 @@ describe('authMiddleware — tokens invalidos em rota protegida', () => {
     expect(res.status).toBe(401);
   });
 
-  it('token valido (controle) -> NAO retorna 401', async () => {
+  it('token valido (controle) -> 201 e cria o produto', async () => {
     const res = await request(app)
       .post('/products')
       .set('Authorization', authHeader('ADMIN'))
       .send(validProduct);
-    // Prova que o 401 dos casos acima vem do token ruim, nao de outra causa.
-    expect(res.status).not.toBe(401);
+    // Assercao forte: nao basta "nao ser 401". Com token valido e payload
+    // valido, o esperado e 201 com o produto criado. Um 400/403/500 aqui
+    // indicaria regressao na rota ou no controller, e seria pego.
+    expect(res.status).toBe(201);
+    expect(res.body).toHaveProperty('_id');
   });
 });
