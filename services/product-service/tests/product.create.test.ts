@@ -11,22 +11,8 @@ jest.mock('../src/services/inventory.client', () => ({
 // usados pelo service (get/set/incr) sem abrir conexao TCP. Evita tanto o
 // "[redis] erro de conexao" quanto o "[cache] invalidacao falhou", porque agora
 // o incr realmente funciona em vez de lancar.
-jest.mock('../src/config/redis', () => {
-  const store: Record<string, string> = {};
-  const fakeClient = {
-    get: jest.fn(async (key: string) => store[key] ?? null),
-    set: jest.fn(async (key: string, value: string) => {
-      store[key] = value;
-      return 'OK';
-    }),
-    incr: jest.fn(async (key: string) => {
-      const next = parseInt(store[key] ?? '0', 10) + 1;
-      store[key] = String(next);
-      return next;
-    }),
-  };
-  return { getRedisClient: () => fakeClient };
-});
+
+jest.mock('../src/config/redis', () => require('./helpers/mockRedis').makeRedisMock());
 
 const validProduct = {
   name: 'Teclado Mecanico',

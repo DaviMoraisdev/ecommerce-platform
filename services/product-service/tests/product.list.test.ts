@@ -7,22 +7,7 @@ jest.mock('../src/services/inventory.client', () => ({
   fetchAvailability: jest.fn().mockResolvedValue(null),
 }));
 
-jest.mock('../src/config/redis', () => {
-  const store: Record<string, string> = {};
-  const fakeClient = {
-    get: jest.fn(async (key: string) => store[key] ?? null),
-    set: jest.fn(async (key: string, value: string) => {
-      store[key] = value;
-      return 'OK';
-    }),
-    incr: jest.fn(async (key: string) => {
-      const next = parseInt(store[key] ?? '0', 10) + 1;
-      store[key] = String(next);
-      return next;
-    }),
-  };
-  return { getRedisClient: () => fakeClient };
-});
+jest.mock('../src/config/redis', () => require('./helpers/mockRedis').makeRedisMock());
 
 // Insere N produtos de uma vez. Por padrao, todos na mesma categoria.
 async function seedMany(count: number, overrides: Partial<Record<string, any>> = {}) {
