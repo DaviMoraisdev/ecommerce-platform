@@ -167,7 +167,7 @@ export async function updateProduct(id: string, data: Partial<IProduct>): Promis
   const updated = await Product.findOneAndUpdate(
     { _id: id, active: true },
     safeData,
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   );
   // So invalida se algo mudou de fato (evita churn de cache em no-op)
   if (updated) {
@@ -180,7 +180,7 @@ export async function deleteProduct(id: string): Promise<IProduct | null> {
   const deleted = await Product.findOneAndUpdate(
     { _id: id, active: true },
     { active: false },
-    { new: true }
+    { returnDocument: 'after' }
   );
   if (deleted) {
     await invalidateListCache();
