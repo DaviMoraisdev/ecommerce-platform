@@ -6,7 +6,7 @@ correto, em vez de corrigido na hora. Não são esquecimentos — são trade-off
 
 Organizado por DESTINO (onde será resolvido). Atualizado ao final de cada bloco.
 
-Última atualização: Fase 3, Bloco 8a concluído (PR #22 + follow-up PR #24).
+Última atualização: Fase 3, Bloco 8b concluído (PR #25).
 
 ---
 
@@ -14,17 +14,20 @@ Organizado por DESTINO (onde será resolvido). Atualizado ao final de cada bloco
 
 Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o sub-bloco.
 
-### product-service (Bloco 8b — pendente)
-- POST /products com token ADMIN e SELLER (201)
-- POST /products sem token → 401
-- POST /products com BUYER → 403
-- Criar/atualizar com preço negativo → 400
-- Soft delete: produto some da listagem E do detalhe (GET /:id)
-- Update não pode alterar `active`
-- ID inválido → 400; produto ausente → 404
-- Paginação: default, page/limit custom, limit>50, page/limit inválidos
-- Filtro por categoria; busca por texto; search vazia/muito longa
-- Formato da resposta paginada (data, page, limit, total, totalPages)
+### product-service (Bloco 8b — CONCLUÍDO, PR #25)
+- ✅ POST /products com token ADMIN e SELLER (201) (8b — product.create)
+- ✅ POST /products sem token → 401 (8b — product.create)
+- ✅ POST /products com BUYER → 403 (8b — product.create)
+- ✅ Criar/atualizar com preço negativo → 400 (8b — product.create / product.update-delete)
+- ✅ Soft delete: produto some da listagem E do detalhe (GET /:id) (8b — product.update-delete)
+- ✅ Update não pode alterar `active` (8b — product.update-delete, + unitário pickAllowedFields)
+- ✅ ID inválido → 400; produto ausente → 404 (8b — product.update-delete)
+- ✅ Paginação: default, page/limit custom, limit>50, page/limit inválidos (8b — product.list)
+- ✅ Filtro por categoria; busca por texto; search vazia/muito longa (8b — product.list)
+- ✅ Formato da resposta paginada (data, page, limit, total, totalPages) (8b — product.list)
+- ✅ Update/Delete com SELLER → 200 (8b — product.update-delete, correção review PR #25)
+- ✅ authMiddleware rejeita token malformado, expirado e com segredo errado → 401 (8b — auth.middleware, correção review PR #25)
+- ✅ GET /health responde (8b — health, correção review PR #25)
 
 ### inventory-service (Bloco 8a — CONCLUÍDO, exceto itens de camada HTTP → 8c)
 - ✅ /health responde (8a — suíte estrutura)
@@ -64,6 +67,7 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - **Rate limit com store no Redis:** compartilhado entre instâncias do auth-service ao escalar horizontalmente.
 - **Logger estruturado:** substituir os console.warn do inventory.client por logger de verdade, com rate limit para não gerar ruído se o inventory ficar instável.
 - **Teste de integração do `connectDatabase` (inventory-service):** provar que o `catch` chama só a saída sanitizada no `console.error` e dispara `process.exit(1)`. Exige mock de `process.exit` + spy de `console.error` + forçar `$connect` a falhar. A lógica de segurança já está coberta pela função pura `sanitizeConnectionError` (PR #24); este teste cobre apenas o encadeamento, de baixo risco de regressão. Fazer quando o `connectDatabase` ganhar lógica nova (ex.: retry) ou na rodada de robustez de testes.
+- **Fixar versão do MongoDB no `mongodb-memory-server` + cache do binário no CI (product-service):** hoje o `MongoMemoryServer.create()` baixa a versão padrão sem fixar, e sem CI ainda não há cache do binário. Quando o pipeline (Fase 10) existir, fixar a versão para reprodutibilidade entre máquinas e configurar cache para não rebaixar o binário a cada run. Levantado no review do PR #25.
 
 ---
 
@@ -73,6 +77,7 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - **Estender o tipo Request do Express** com interface de usuário autenticado, eliminando `(req as any).userId/userRole` em todos os serviços.
 - **DTO explícito `ProductWithAvailability`** para o retorno enriquecido do findProductById (hoje é objeto inline sem tipo nomeado).
 - **Normalizar base URL** do inventory.client (new URL() ou tratar barra final).
+- **Mover helpers puros para módulo `utils/` (product-service):** `parsePositiveInt` (controller) e `pickAllowedFields` (service) foram exportados para permitir teste unitário, aumentando a superfície pública dos módulos. Mover para um `utils/` dedicado mantém o teste sem expor helpers internos do controller/service. Levantado no review do PR #25; export atual é trade-off aceitável até lá.
 
 ---
 
