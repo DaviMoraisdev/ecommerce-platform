@@ -8,22 +8,7 @@ jest.mock('../src/services/inventory.client', () => ({
   fetchAvailability: jest.fn().mockResolvedValue(null),
 }));
 
-jest.mock('../src/config/redis', () => {
-  const store: Record<string, string> = {};
-  const fakeClient = {
-    get: jest.fn(async (key: string) => store[key] ?? null),
-    set: jest.fn(async (key: string, value: string) => {
-      store[key] = value;
-      return 'OK';
-    }),
-    incr: jest.fn(async (key: string) => {
-      const next = parseInt(store[key] ?? '0', 10) + 1;
-      store[key] = String(next);
-      return next;
-    }),
-  };
-  return { getRedisClient: () => fakeClient };
-});
+jest.mock('../src/config/redis', () => require('./helpers/mockRedis').makeRedisMock());
 
 // Cria um produto direto no banco (via Mongoose, sem passar pela API).
 // Usado para montar o estado inicial dos testes de update/delete/get.
@@ -45,10 +30,21 @@ describe('PUT /products/:id', () => {
     const res = await request(app)
       .put(`/products/${product._id}`)
       .set('Authorization', authHeader('ADMIN'))
-      .send({ price: 250 });
+      .send({ price: 300 });
 
     expect(res.status).toBe(200);
-    expect(res.body.price).toBe(250);
+    expect(res.body.price).toBe(300);
+  });
+
+  it('SELLER atualiza produto -> 200', async () => {
+    const product = await seedProduct();
+    const res = await request(app)
+      .put(`/products/${product._id}`)
+      .set('Authorization', authHeader('SELLER'))
+      .send({ price: 300 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.price).toBe(300);
   });
 
   it('NAO altera o campo active mesmo se enviado', async () => {
@@ -118,6 +114,15 @@ describe('DELETE /products/:id (soft delete)', () => {
     expect(list.status).toBe(200);
     const ids = list.body.data.map((p: any) => p._id);
     expect(ids).not.toContain(String(product._id));
+  });
+
+  it('SELLER deleta produto -> 200', async () => {
+    const product = await seedProduct();
+    const res = await request(app)
+      .delete(`/products/${product._id}`)
+      .set('Authorization', authHeader('SELLER'));
+
+    expect(res.status).toBe(200);
   });
 
   it('produto ausente -> 404', async () => {

@@ -1,8 +1,17 @@
 import { parsePositiveInt } from '../src/controllers/product.controller';
 import { pickAllowedFields } from '../src/services/product.service';
 
+// Assercao forte para o caso de erro: nao basta ser "object" (null tambem e
+// object em JS). Confirma que tem .error string nao-vazia — a forma real do erro.
+function expectValidationError(result: ReturnType<typeof parsePositiveInt>) {
+  expect(result).not.toBeNull();
+  expect(typeof result).toBe('object');
+  const err = result as { error: string };
+  expect(typeof err.error).toBe('string');
+  expect(err.error.length).toBeGreaterThan(0);
+}
+
 describe('parsePositiveInt', () => {
-  // Caminho feliz: string de digitos dentro do range vira numero.
   it('aceita um inteiro positivo valido', () => {
     expect(parsePositiveInt('5', 'page', 10000)).toBe(5);
   });
@@ -15,44 +24,38 @@ describe('parsePositiveInt', () => {
     expect(parsePositiveInt('50', 'limit', 50)).toBe(50);
   });
 
-  // Ramos de rejeicao: cada um retorna objeto com .error (nao lanca).
   it('rejeita decimal', () => {
     const result = parsePositiveInt('2.5', 'limit', 50);
-    expect(typeof result).toBe('object');
+    expectValidationError(result);
     expect((result as { error: string }).error).toContain('limit');
   });
 
   it('rejeita letras', () => {
-    const result = parsePositiveInt('abc', 'page', 10000);
-    expect(typeof result).toBe('object');
+    expectValidationError(parsePositiveInt('abc', 'page', 10000));
   });
 
   it('rejeita negativo', () => {
-    // O regex de digitos ja barra o sinal de menos.
-    const result = parsePositiveInt('-3', 'page', 10000);
-    expect(typeof result).toBe('object');
+    expectValidationError(parsePositiveInt('-3', 'page', 10000));
   });
 
   it('rejeita zero (menor que 1)', () => {
     const result = parsePositiveInt('0', 'page', 10000);
-    expect(typeof result).toBe('object');
+    expectValidationError(result);
     expect((result as { error: string }).error).toContain('1');
   });
 
   it('rejeita valor acima do maximo', () => {
     const result = parsePositiveInt('51', 'limit', 50);
-    expect(typeof result).toBe('object');
+    expectValidationError(result);
     expect((result as { error: string }).error).toContain('maximo');
   });
 
   it('rejeita string vazia', () => {
-    const result = parsePositiveInt('', 'page', 10000);
-    expect(typeof result).toBe('object');
+    expectValidationError(parsePositiveInt('', 'page', 10000));
   });
 });
 
 describe('pickAllowedFields', () => {
-  // Mantem apenas os campos da allowlist.
   it('mantem os campos permitidos', () => {
     const input = {
       name: 'Produto',
@@ -65,14 +68,12 @@ describe('pickAllowedFields', () => {
     expect(result).toEqual(input);
   });
 
-  // O teste central de seguranca: active NUNCA passa, mesmo se enviado.
   it('descarta o campo active', () => {
     const result = pickAllowedFields({ name: 'P', active: false });
     expect(result).not.toHaveProperty('active');
     expect(result).toHaveProperty('name', 'P');
   });
 
-  // Qualquer campo fora da allowlist e ignorado (ex: tentativa de injetar _id).
   it('descarta campos arbitrarios fora da allowlist', () => {
     const result = pickAllowedFields({ name: 'P', _id: 'hack', role: 'ADMIN' });
     expect(result).not.toHaveProperty('_id');
@@ -80,7 +81,6 @@ describe('pickAllowedFields', () => {
     expect(result).toHaveProperty('name', 'P');
   });
 
-  // Campos undefined nao entram (evita sobrescrever com undefined num update).
   it('ignora campos undefined', () => {
     const result = pickAllowedFields({ name: 'P', price: undefined });
     expect(result).toHaveProperty('name', 'P');
