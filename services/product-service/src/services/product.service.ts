@@ -42,7 +42,7 @@ async function invalidateListCache(): Promise<void> {
 const MAX_LIMIT = 50;
 const DEFAULT_LIMIT = 20;
 
-function pickAllowedFields(data: Record<string, any>): Record<string, any> {
+export function pickAllowedFields(data: Record<string, any>): Record<string, any> {
   const result: Record<string, any> = {};
   for (const field of ALLOWED_FIELDS) {
     if (data[field] !== undefined) {
@@ -167,7 +167,7 @@ export async function updateProduct(id: string, data: Partial<IProduct>): Promis
   const updated = await Product.findOneAndUpdate(
     { _id: id, active: true },
     safeData,
-    { new: true, runValidators: true }
+    { returnDocument: 'after', runValidators: true }
   );
   // So invalida se algo mudou de fato (evita churn de cache em no-op)
   if (updated) {
@@ -180,7 +180,7 @@ export async function deleteProduct(id: string): Promise<IProduct | null> {
   const deleted = await Product.findOneAndUpdate(
     { _id: id, active: true },
     { active: false },
-    { new: true }
+    { returnDocument: 'after' }
   );
   if (deleted) {
     await invalidateListCache();
