@@ -68,6 +68,7 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - **Logger estruturado:** substituir os console.warn do inventory.client por logger de verdade, com rate limit para não gerar ruído se o inventory ficar instável.
 - **Teste de integração do `connectDatabase` (inventory-service):** provar que o `catch` chama só a saída sanitizada no `console.error` e dispara `process.exit(1)`. Exige mock de `process.exit` + spy de `console.error` + forçar `$connect` a falhar. A lógica de segurança já está coberta pela função pura `sanitizeConnectionError` (PR #24); este teste cobre apenas o encadeamento, de baixo risco de regressão. Fazer quando o `connectDatabase` ganhar lógica nova (ex.: retry) ou na rodada de robustez de testes.
 - **Fixar versão do MongoDB no `mongodb-memory-server` + cache do binário no CI (product-service):** hoje o `MongoMemoryServer.create()` baixa a versão padrão sem fixar, e sem CI ainda não há cache do binário. Quando o pipeline (Fase 10) existir, fixar a versão para reprodutibilidade entre máquinas e configurar cache para não rebaixar o binário a cada run. Levantado no review do PR #25.
+- **Rodar `npm run verify` (build + test) no CI do product-service:** o script `verify` já existe localmente (build com tsconfig.build.json + jest). Falta automatiza-lo no pipeline para que todo PR prove que o artefato de producao compila, nao so que os testes passam. Depende do CI (Fase 10). Levantado no review do PR #25.
 
 ---
 
