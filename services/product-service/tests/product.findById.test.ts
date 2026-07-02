@@ -7,8 +7,6 @@ jest.mock('../src/config/redis', () => require('./helpers/mockRedis').makeRedisM
 
 const mockFetch = fetchAvailability as jest.MockedFunction<typeof fetchAvailability>;
 
-// mockReset (nao clearAllMocks): limpa chamadas E implementacoes, evitando que
-// um teste herde o mockResolvedValue de outro (achado do review).
 beforeEach(() => {
   mockFetch.mockReset();
 });
@@ -38,10 +36,13 @@ describe('findProductById', () => {
     expect(result).toBeNull();
   });
 
-  it('ID malformado -> lanca (CastError propaga; o controller traduz p/ 400)', async () => {
-    // findProductById nao tem try/catch: um _id invalido faz o Mongoose lancar.
-    // O contrato e propagar; quem traduz para 400 e o handleError do controller.
-    await expect(findProductById('id-invalido')).rejects.toThrow();
+  it('ID malformado -> lanca CastError (service nao tem try/catch, propaga)', async () => {
+    // O contrato do SERVICE e propagar o CastError do Mongoose. A traducao
+    // desse erro para HTTP 400 e responsabilidade do controller (handleError),
+    // testada separadamente na camada de rota — nao aqui.
+    await expect(findProductById('id-invalido')).rejects.toThrow(
+      expect.objectContaining({ name: 'CastError' })
+    );
     expect(mockFetch).not.toHaveBeenCalled();
   });
 

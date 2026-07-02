@@ -6,7 +6,10 @@ import {
 } from '../src/services/product.service';
 import { Product } from '../src/models/product.model';
 import { redisFns, resetRedisMock } from './helpers/mockRedisInstrumented';
-
+// NOTA: a limpeza das collections entre testes e feita globalmente no
+// tests/setup.ts (afterEach que esvazia todas as collections do Mongo em
+// memoria). Por isso os totais exatos (total: 3, data.length) sao confiaveis:
+// cada teste comeca com o banco vazio. Setup veio no 8b (PR #25).
 jest.mock('../src/config/redis', () =>
   require('./helpers/mockRedisInstrumented').makeInstrumentedRedis()
 );
