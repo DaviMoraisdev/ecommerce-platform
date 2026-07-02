@@ -2,15 +2,15 @@ import { findProductById } from '../src/services/product.service';
 import { Product } from '../src/models/product.model';
 import { fetchAvailability } from '../src/services/inventory.client';
 
-// fetchAvailability e mockado: ja testado isolado no 8c-1. Aqui controlamos
-// o retorno dele para simular os 3 cenarios de disponibilidade.
 jest.mock('../src/services/inventory.client');
 jest.mock('../src/config/redis', () => require('./helpers/mockRedis').makeRedisMock());
 
 const mockFetch = fetchAvailability as jest.MockedFunction<typeof fetchAvailability>;
 
-afterEach(() => {
-  jest.clearAllMocks();
+// mockReset (nao clearAllMocks): limpa chamadas E implementacoes, evitando que
+// um teste herde o mockResolvedValue de outro (achado do review).
+beforeEach(() => {
+  mockFetch.mockReset();
 });
 
 async function seedProduct(active = true) {
@@ -29,7 +29,6 @@ describe('findProductById', () => {
   it('produto ausente -> null', async () => {
     const result = await findProductById(MISSING_ID);
     expect(result).toBeNull();
-    // Nem chega a consultar disponibilidade se o produto nao existe.
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
@@ -37,6 +36,13 @@ describe('findProductById', () => {
     const product = await seedProduct(false);
     const result = await findProductById(String(product._id));
     expect(result).toBeNull();
+  });
+
+  it('ID malformado -> lanca (CastError propaga; o controller traduz p/ 400)', async () => {
+    // findProductById nao tem try/catch: um _id invalido faz o Mongoose lancar.
+    // O contrato e propagar; quem traduz para 400 e o handleError do controller.
+    await expect(findProductById('id-invalido')).rejects.toThrow();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('com availability e estoque > 0 -> inStock true', async () => {
@@ -66,7 +72,6 @@ describe('findProductById', () => {
 
     const result = await findProductById(String(product._id));
 
-    // Prova a derivacao inStock = available > 0 (0 nao e "em estoque").
     expect(result?.availability).toEqual({ available: 0, inStock: false });
   });
 
@@ -76,7 +81,6 @@ describe('findProductById', () => {
 
     const result = await findProductById(String(product._id));
 
-    // Degradacao graciosa: o produto ainda volta, so sem disponibilidade.
     expect(result).not.toBeNull();
     expect(result?.availability).toBeNull();
     expect(result?.name).toBe('Monitor 4K');

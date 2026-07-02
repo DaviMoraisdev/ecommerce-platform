@@ -5,7 +5,7 @@ import {
   deleteProduct,
 } from '../src/services/product.service';
 import { Product } from '../src/models/product.model';
-import { redisFns } from './helpers/mockRedisInstrumented';
+import { redisFns, resetRedisMock } from './helpers/mockRedisInstrumented';
 
 jest.mock('../src/config/redis', () =>
   require('./helpers/mockRedisInstrumented').makeInstrumentedRedis()
@@ -15,10 +15,7 @@ jest.mock('../src/services/inventory.client', () => ({
 }));
 
 beforeEach(() => {
-  redisFns.get.mockReset();
-  redisFns.set.mockReset();
-  redisFns.incr.mockReset();
-  redisFns.incr.mockResolvedValue(1);
+  resetRedisMock();
 });
 
 async function seedProducts(n: number) {
@@ -29,33 +26,43 @@ async function seedProducts(n: number) {
   await Product.insertMany(docs);
 }
 
-// Captura a cacheKey que o service usa: e o 1o argumento do redis.get da
-// LEITURA do cache (a 2a chamada de get; a 1a e a versao). Com get devolvendo
-// null, o service segue para o banco e chama set — o 1o arg do set tambem e a key.
+// Captura a cacheKey pela LEITURA do cache: o service faz get(versao) e
+// get(cacheKey). O 2o get (indice 1) e a chave do cache.
 async function keyForOptions(opts: any): Promise<string> {
-  redisFns.get.mockResolvedValue(null);
-  redisFns.set.mockClear();
+  redisFns.get.mockClear();
   await findAllProducts(opts);
-  return redisFns.set.mock.calls[0][0] as string;
+  // calls: [0] = versao, [1] = cacheKey
+  return redisFns.get.mock.calls[1][0] as string;
 }
 
 describe('cache — hit e miss', () => {
-  it('HIT: get devolve valor cacheado -> retorna sem consultar o banco', async () => {
-    const cachedResult = { data: [{ name: 'DoCache' }], page: 1, limit: 20, total: 1, totalPages: 1 };
-    redisFns.get
-      .mockResolvedValueOnce('0')
-      .mockResolvedValueOnce(JSON.stringify(cachedResult));
+  it('HIT: retorna o cacheado SEM consultar o banco', async () => {
+    // Spies no Mongo: provam que o hit nao toca o banco (achado do review).
+    const findSpy = jest.spyOn(Product, 'find');
+    const countSpy = jest.spyOn(Product, 'countDocuments');
 
+    const cachedResult = { data: [{ name: 'DoCache' }], page: 1, limit: 20, total: 1, totalPages: 1 };
+    // Pre-popula o cache no store: primeiro descobrimos a chave, depois gravamos.
     await seedProducts(3);
+    const key = await keyForOptions({});
+    await redisFns.set(key, JSON.stringify(cachedResult));
+
+    findSpy.mockClear();
+    countSpy.mockClear();
+
     const result = await findAllProducts({});
 
     expect(result.data).toHaveLength(1);
     expect((result.data[0] as any).name).toBe('DoCache');
-    expect(redisFns.set).not.toHaveBeenCalled();
+    // O cerne: cache hit NAO consulta o banco.
+    expect(findSpy).not.toHaveBeenCalled();
+    expect(countSpy).not.toHaveBeenCalled();
+
+    findSpy.mockRestore();
+    countSpy.mockRestore();
   });
 
-  it('MISS: get devolve null -> busca no banco e retorna formato paginado', async () => {
-    redisFns.get.mockResolvedValue(null);
+  it('MISS: busca no banco e retorna formato paginado', async () => {
     await seedProducts(3);
     const result = await findAllProducts({});
 
@@ -66,7 +73,6 @@ describe('cache — hit e miss', () => {
   });
 
   it('MISS grava no cache com TTL (EX, 60)', async () => {
-    redisFns.get.mockResolvedValue(null);
     await seedProducts(2);
     await findAllProducts({});
 
@@ -80,9 +86,7 @@ describe('cache — hit e miss', () => {
 });
 
 describe('cache — chave', () => {
-  it('unicidade: params com delimitadores geram chaves diferentes (sem colisao)', async () => {
-    // O caso classico de colisao: se a chave concatenasse com ':', category
-    // 'a:s=b' poderia colidir com search 'b'. O array JSON evita isso.
+  it('unicidade: params com delimitadores geram chaves diferentes', async () => {
     const keyA = await keyForOptions({ category: 'a:s=b' });
     const keyB = await keyForOptions({ search: 'b' });
     expect(keyA).not.toBe(keyB);
@@ -95,30 +99,21 @@ describe('cache — chave', () => {
   });
 
   it('a versao faz parte da chave: apos invalidacao (incr), a chave muda', async () => {
-    // Versao 0 -> chave contem v0.
-    redisFns.get.mockResolvedValue(null);
-    redisFns.set.mockClear();
-    await findAllProducts({ category: 'x' });
-    const keyV0 = redisFns.set.mock.calls[0][0] as string;
+    // Store stateful: a chave reflete a versao real lida do store.
+    const keyBefore = await keyForOptions({ category: 'x' });
+    expect(keyBefore).toContain('v0');
 
-    // Simula versao incrementada: agora getCacheVersion le '1'.
-    redisFns.get.mockReset();
-    redisFns.get.mockResolvedValue(null);
-    // 1a chamada get (versao) devolve '1'; demais (cache) null.
-    redisFns.get.mockResolvedValueOnce('1');
-    redisFns.set.mockClear();
-    await findAllProducts({ category: 'x' });
-    const keyV1 = redisFns.set.mock.calls[0][0] as string;
+    // Invalida de verdade: incr na versao. O store passa a ter version=1.
+    await createProduct({ name: 'N', description: 'd', price: 10, category: 'geral' } as any);
 
-    expect(keyV0).toContain('v0');
-    expect(keyV1).toContain('v1');
-    expect(keyV0).not.toBe(keyV1);
+    const keyAfter = await keyForOptions({ category: 'x' });
+    expect(keyAfter).toContain('v1');
+    expect(keyAfter).not.toBe(keyBefore);
   });
 });
 
 describe('cache — invalidacao (INCR da versao)', () => {
-  it('createProduct chama incr (invalida o cache)', async () => {
-    redisFns.get.mockResolvedValue(null);
+  it('createProduct chama incr na chave de versao', async () => {
     await createProduct({ name: 'Novo', description: 'd', price: 10, category: 'geral' } as any);
     expect(redisFns.incr).toHaveBeenCalledWith('products:list:version');
   });
@@ -145,16 +140,15 @@ describe('cache — invalidacao (INCR da versao)', () => {
 });
 
 describe('cache — degradacao graciosa', () => {
-  it('get lanca (Redis indisponivel na leitura) -> vai ao banco, nao quebra', async () => {
+  it('get lanca (Redis indisponivel na leitura) -> vai ao banco', async () => {
     redisFns.get.mockRejectedValue(new Error('Redis down'));
     await seedProducts(2);
 
     const result = await findAllProducts({});
-    expect(result.data).toHaveLength(2); // veio do banco
+    expect(result.data).toHaveLength(2);
   });
 
-  it('set lanca (falha na escrita) -> retorna o resultado mesmo sem cachear', async () => {
-    redisFns.get.mockResolvedValue(null);
+  it('set lanca (falha na escrita) -> retorna resultado mesmo sem cachear', async () => {
     redisFns.set.mockRejectedValue(new Error('Redis down'));
     await seedProducts(2);
 
@@ -162,36 +156,32 @@ describe('cache — degradacao graciosa', () => {
     expect(result.data).toHaveLength(2);
   });
 
-  it('JSON invalido no cache -> JSON.parse lanca, cai no catch, vai ao banco', async () => {
-    redisFns.get
-      .mockResolvedValueOnce('0')             // versao
-      .mockResolvedValueOnce('{corrompido');  // cache com JSON invalido
+  it('JSON invalido no cache -> cai no catch, vai ao banco', async () => {
     await seedProducts(3);
+    // Grava lixo na chave de cache que sera lida.
+    const key = await keyForOptions({});
+    await redisFns.set(key, '{corrompido');
 
     const result = await findAllProducts({});
-    expect(result.data).toHaveLength(3); // caiu no catch e foi ao banco
+    expect(result.data).toHaveLength(3);
   });
 
-  it('getCacheVersion falha (get da versao lanca) -> usa versao 0, nao quebra', async () => {
-    // 1a chamada (versao) lanca; a leitura do cache tambem retorna null.
-    redisFns.get
-      .mockRejectedValueOnce(new Error('down'))
-      .mockResolvedValue(null);
+  it('getCacheVersion falha -> usa versao 0, nao quebra', async () => {
+    // So o primeiro get (versao) lanca; os demais seguem o default stateful.
+    redisFns.get.mockRejectedValueOnce(new Error('down'));
     await seedProducts(2);
 
     const result = await findAllProducts({});
     expect(result.data).toHaveLength(2);
   });
 
-  it('invalidacao falha (incr lanca) -> a operacao (create) completa mesmo assim', async () => {
-    redisFns.get.mockResolvedValue(null);
+  it('invalidacao falha (incr lanca) -> a operacao (create) completa', async () => {
     redisFns.incr.mockRejectedValue(new Error('Redis down'));
 
     const created = await createProduct({
       name: 'Resiliente', description: 'd', price: 10, category: 'geral',
     } as any);
 
-    // O produto foi criado apesar da invalidacao falhar.
     expect(created).toHaveProperty('_id');
     expect(created.name).toBe('Resiliente');
   });
