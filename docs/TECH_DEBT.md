@@ -6,7 +6,7 @@ correto, em vez de corrigido na hora. Não são esquecimentos — são trade-off
 
 Organizado por DESTINO (onde será resolvido). Atualizado ao final de cada bloco.
 
-Última atualização: Fase 3, Bloco 8b concluído (PR #25).
+Última atualização: Fase 3, Bloco 8c-1 e 8c-3 concluídos (PR #26 + cache/findById).
 
 ---
 
@@ -29,7 +29,7 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - ✅ authMiddleware rejeita token malformado, expirado e com segredo errado → 401 (8b — auth.middleware, correção review PR #25)
 - ✅ GET /health responde (8b — health, correção review PR #25)
 
-### inventory-service (Bloco 8a — CONCLUÍDO, exceto itens de camada HTTP → 8c)
+### inventory-service (Bloco 8a — CONCLUÍDO, exceto itens de camada HTTP → 8c-2)
 - ✅ /health responde (8a — suíte estrutura)
 - ✅ Startup falha sem DATABASE_URL (8a — suíte env)
 - ✅ INVENTORY_PORT inválido falha com erro claro (8a — suíte env)
@@ -39,14 +39,22 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - ✅ **TESTE DE CONCORRÊNCIA OBRIGATÓRIO**: duas reservas simultâneas do último item — só uma deve passar (8a — suíte concorrência, prova o lock atômico do $executeRaw)
 - ✅ setStock com quantity < reserved (8a — suíte stock.service, QUANTITY_BELOW_RESERVED)
 - ✅ Payloads inválidos: string, float, null, campos faltando, negativos (8a — suíte stock.service, validação numérica)
-- release com ownership/autorização → **PENDENTE (8c)**: lógica do `releaseStock` coberta no 8a, mas a autorização na camada de rota (ADMIN/SELLER) é teste HTTP. Ownership real (validar de quem é a reserva) é dívida do order-service (ver seção própria).
-- Mapeamento status: 400, 401, 403, 404, 409 → **PENDENTE (8c)**: o service lança os erros corretos (provado no 8a); falta provar a tradução para status HTTP na camada de rota.
+- release com ownership/autorização → **PENDENTE (8c-2)**: lógica do `releaseStock` coberta no 8a, mas a autorização na camada de rota (ADMIN/SELLER) é teste HTTP. Ownership real (validar de quem é a reserva) é dívida do order-service (ver seção própria).
+- Mapeamento status: 400, 401, 403, 404, 409 → **PENDENTE (8c-2)**: o service lança os erros corretos (provado no 8a); falta provar a tradução para status HTTP na camada de rota.
 
-### inventory.client (product-service) — integração Bloco 6 (Bloco 8c — pendente)
-- fetchAvailability: sucesso, 404, non-OK, timeout/abort, erro de rede, JSON inválido, schema inválido, `available` negativo
-- Encoding de productId na URL
-- findProductById: produto ausente (null), com availability, com availability null (inventory fora)
-- Contrato/tipo da nova resposta do detalhe do produto
+### inventory.client (product-service) — integração Bloco 6 (Bloco 8c-1 — CONCLUÍDO, PR #26)
+- ✅ fetchAvailability: sucesso, 404, non-OK, timeout/abort (com AbortSignal + fake timers), erro de rede, JSON inválido, schema inválido (8c-1 — inventory.client)
+- ✅ Encoding de productId na URL (URL exata, não substring) (8c-1)
+- ✅ Schema: campo ausente, tipo errado, quantity negativo, reserved negativo, NaN, reserved > quantity (8c-1 — casos separados por invariante)
+- Nota: `available` negativo da lista original NÃO se aplica — o código recalcula `available` (quantity - reserved) e nunca lê o valor recebido. Testado o recálculo e a regra reserved <= quantity.
+- Nota: `productId divergente do solicitado` NÃO testado — o código não compara productId retornado vs solicitado; não é invariante do contrato atual.
+
+### product.service — findProductById + cache (Bloco 8c-3 — CONCLUÍDO)
+- ✅ findProductById: produto ausente (null), inativo (null), com availability (inStock true), availability zero (inStock false), availability null / inventory fora (8c-3 — product.findById, fetchAvailability mockado)
+- ✅ Cache hit/miss: hit não consulta banco, miss mesmo formato, miss grava com TTL (EX, 60) (8c-3 — product.cache, redis instrumentado)
+- ✅ Chave: unicidade com delimitadores (array JSON evita colisão), determinismo, versão na chave (v0→v1) (8c-3)
+- ✅ Invalidação via INCR: create/update/delete chamam incr na versão; update não invalida se produto ausente (8c-3)
+- ✅ Degradação graciosa: get lança→banco, set lança→retorna, JSON inválido→banco, getCacheVersion falha→v0, incr falha→operação completa (8c-3)
 
 ---
 
@@ -66,6 +74,8 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - **Criação de índices MongoDB em produção:** via script de migração ou passo de deploy documentado, em vez de auto-indexing do Mongoose.
 - **Rate limit com store no Redis:** compartilhado entre instâncias do auth-service ao escalar horizontalmente.
 - **Logger estruturado:** substituir os console.warn do inventory.client por logger de verdade, com rate limit para não gerar ruído se o inventory ficar instável.
+- **Cache stampede / single-flight:** hoje múltiplas requisições em cache frio vão todas ao banco simultaneamente. Implementar single-flight/lock para que só uma popule o cache. Quando existir, testar concorrência em cache frio (não testado agora por ser comportamento que vai mudar).
+- **Teste de config do `redis.ts` (REDIS_URL ausente):** provar que `getRedisClient` usa o fallback `redis://127.0.0.1:6379` quando `REDIS_URL` não está definida. É teste do módulo `config/redis.ts`, não do service (o service nunca lê a env). Exige mockar o construtor do ioredis. Baixo valor/risco — natureza igual ao teste do `connectDatabase`. Fazer na rodada de robustez de testes (Fase 10).
 - **Teste de integração do `connectDatabase` (inventory-service):** provar que o `catch` chama só a saída sanitizada no `console.error` e dispara `process.exit(1)`. Exige mock de `process.exit` + spy de `console.error` + forçar `$connect` a falhar. A lógica de segurança já está coberta pela função pura `sanitizeConnectionError` (PR #24); este teste cobre apenas o encadeamento, de baixo risco de regressão. Fazer quando o `connectDatabase` ganhar lógica nova (ex.: retry) ou na rodada de robustez de testes.
 - **Fixar versão do MongoDB no `mongodb-memory-server` + cache do binário no CI (product-service):** hoje o `MongoMemoryServer.create()` baixa a versão padrão sem fixar, e sem CI ainda não há cache do binário. Quando o pipeline (Fase 10) existir, fixar a versão para reprodutibilidade entre máquinas e configurar cache para não rebaixar o binário a cada run. Levantado no review do PR #25.
 - **Rodar `npm run verify` (build + test) no CI do product-service:** o script `verify` já existe localmente (build com tsconfig.build.json + jest). Falta automatiza-lo no pipeline para que todo PR prove que o artefato de producao compila, nao so que os testes passam. Depende do CI (Fase 10). Levantado no review do PR #25.
