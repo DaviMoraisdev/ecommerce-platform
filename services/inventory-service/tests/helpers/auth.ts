@@ -1,14 +1,23 @@
 import jwt from 'jsonwebtoken';
 
-// Gera um Bearer token valido para os testes, assinado com o MESMO segredo
-// que o authMiddleware usa para verificar (process.env.JWT_SECRET, carregado
-// do .env.test pelo setup.ts). Token assinado aqui passa na verificacao real —
-// sem mock do middleware, exercitando a cadeia de auth de verdade.
+// Fail-fast: se o JWT_SECRET nao estiver no ambiente (ex: CI sem a env, ou
+// .env.test incompleto), falha AQUI com mensagem clara — em vez de assinar com
+// undefined e fazer os testes de autorizacao quebrarem com um 401 obscuro.
+const secret = process.env.JWT_SECRET;
+if (!secret) {
+  throw new Error(
+    'JWT_SECRET ausente no ambiente de teste. Configure no .env.test ' +
+    '(veja .env.test.example) ou nas variaveis do CI.'
+  );
+}
+
+// Gera um Bearer token valido, assinado com o MESMO segredo que o authMiddleware
+// usa para verificar. Token assinado aqui passa na verificacao real — sem mock
+// do middleware, exercitando a cadeia de auth de verdade.
 export function authHeader(role: 'ADMIN' | 'SELLER' | 'BUYER'): string {
-  const secret = process.env.JWT_SECRET as string;
   const token = jwt.sign(
     { id: 'test-user-id', email: 'teste@exemplo.com', role },
-    secret,
+    secret as string,
     { expiresIn: '15m' }
   );
   return `Bearer ${token}`;
