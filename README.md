@@ -1,14 +1,20 @@
 # E-Commerce Platform
 
+
 Plataforma de e-commerce completa construída com arquitetura de microserviços, criada como projeto educacional de portfólio para praticar desenvolvimento de software de ponta a ponta.
+
 
 O objetivo do projeto é simular uma aplicação real de comércio eletrônico, separando os principais domínios do negócio em serviços independentes, cada um com responsabilidades, banco de dados e fluxo de comunicação próprios.
 
-> **Status:** projeto em desenvolvimento. Este README separa o que já faz parte da fundação do projeto do que será implementado nas próximas fases.
+
+> **Status:** projeto em desenvolvimento ativo. Fases 1 a 3 concluídas — a fundação, o serviço de autenticação e o núcleo comercial (catálogo + estoque) já estão implementados e testados. Este README separa o que já foi construído do que será implementado nas próximas fases.
+
 
 ---
 
+
 ## Sumário
+
 
 - [Visão geral](#visão-geral)
 - [Objetivos de aprendizado](#objetivos-de-aprendizado)
@@ -24,21 +30,30 @@ O objetivo do projeto é simular uma aplicação real de comércio eletrônico, 
 - [Documentação](#documentação)
 - [Propósito do projeto](#propósito-do-projeto)
 
+
 ---
+
 
 ## Visão geral
 
+
 Este projeto representa uma plataforma de e-commerce moderna, organizada em uma arquitetura baseada em microserviços.
+
 
 A aplicação foi pensada para evoluir de forma incremental, começando por uma fundação local com Docker e serviços isolados, até chegar a uma estrutura mais completa com autenticação, catálogo, estoque, carrinho, pedidos, pagamentos, notificações, gateway, frontend web, painel administrativo, testes e CI/CD.
 
+
 A proposta principal não é apenas construir uma loja virtual, mas entender os conceitos técnicos por trás de aplicações distribuídas.
+
 
 ---
 
+
 ## Objetivos de aprendizado
 
+
 Durante o desenvolvimento deste projeto, os principais pontos de estudo são:
+
 
 - Construção de APIs REST com Node.js e Express.js.
 - Organização de serviços independentes por domínio de negócio.
@@ -53,13 +68,18 @@ Durante o desenvolvimento deste projeto, os principais pontos de estudo são:
 - Aplicação de boas práticas de segurança, documentação e versionamento.
 - Automação de testes e pipelines com GitHub Actions.
 
+
 ---
+
 
 ## Arquitetura
 
+
 A arquitetura segue o modelo de microserviços, onde cada domínio do negócio é separado em um serviço independente.
 
+
 Cada serviço deve possuir sua própria responsabilidade, sua própria base de dados quando necessário e uma interface clara de comunicação com os demais serviços.
+
 
 ```txt
 Cliente
@@ -77,7 +97,9 @@ API Gateway / Nginx
   └── notification-service  RabbitMQ Consumer
 ```
 
+
 ### Fluxo geral da aplicação
+
 
 ```txt
 Frontend
@@ -91,24 +113,35 @@ Banco de dados próprio / cache / mensageria
 Resposta ao cliente ou publicação de evento
 ```
 
+
 ### Comunicação
 
+
 A comunicação entre os serviços será dividida em dois modelos:
+
 
 | Tipo | Uso previsto |
 |---|---|
 | REST | Operações síncronas que precisam de resposta imediata |
 | RabbitMQ | Eventos assíncronos, como pedido criado, pagamento aprovado e envio de notificação |
 
+
 ---
 
-## Serviços planejados
 
-### `auth-service`
+## Serviços
+
+Os serviços marcados com ✅ já estão implementados e testados. Os demais são planejados para as próximas fases.
+
+
+### `auth-service` ✅ Implementado (Fase 2)
+
 
 Responsável pela autenticação dos usuários.
 
+
 Principais responsabilidades:
+
 
 - Registro de usuários com hash de senha via bcrypt.
 - Login com geração de access token e refresh token (JWT).
@@ -119,62 +152,93 @@ Principais responsabilidades:
 - Seed idempotente para criação do administrador inicial.
 - Integração futura com OAuth2.
 
+
 Banco previsto: **PostgreSQL**.
+
 
 ---
 
+
 ### `user-service`
+
 
 Responsável pelos dados de perfil dos usuários.
 
+
 Principais responsabilidades:
+
 
 - Cadastro de informações pessoais.
 - Consulta e atualização de perfil.
 - Gerenciamento de endereços.
 - Integração com pedidos e autenticação.
 
+
 Banco previsto: **PostgreSQL**.
+
 
 ---
 
-### `product-service`
+
+### `product-service` ✅ Implementado (Fase 3)
+
 
 Responsável pelo catálogo de produtos.
 
-Principais responsabilidades:
 
-- Cadastro de produtos.
-- Listagem e busca de produtos.
-- Organização por categorias.
-- Armazenamento de descrições, imagens, atributos e preços.
-- Exposição de dados para o frontend e painel administrativo.
+Funcionalidades já implementadas:
 
-Banco previsto: **MongoDB**.
+
+- CRUD de produtos com autorização por papel (ADMIN/SELLER escrevem; leitura pública).
+- Listagem com busca por texto, filtro por categoria e paginação validada.
+- Soft delete (produtos inativados, não apagados).
+- Allowlist de campos no update (impede alterar campos sensíveis via corpo cru).
+- Integração com o `inventory-service` para exibir disponibilidade no detalhe do produto.
+- Cache de listagens com Redis (invalidação por versão, TTL de 60s).
+- Cobertura de testes: 10 suítes / 87 testes automatizados.
+
+
+Banco: **MongoDB** (via Mongoose).
+
 
 ---
 
-### `inventory-service`
+
+### `inventory-service` ✅ Implementado (Fase 3)
+
 
 Responsável pelo controle de estoque.
 
-Principais responsabilidades:
 
-- Controle de quantidade disponível.
-- Reserva de estoque durante o processo de compra.
-- Baixa de estoque após confirmação do pedido.
-- Reposição e ajustes manuais.
-- Comunicação com pedidos e catálogo.
+Funcionalidades já implementadas:
 
-Banco previsto: **PostgreSQL**.
+
+- Controle de quantidade disponível e reservada por produto (disponível = quantity − reserved).
+- Reserva **atômica** de estoque (UPDATE condicional em SQL bruto) — segura sob concorrência.
+- Liberação de reserva (restrita a ADMIN/SELLER).
+- Constraints CHECK no banco (quantity ≥ 0, reserved ≥ 0, reserved ≤ quantity) contra estado impossível.
+- Consulta pública de disponibilidade, consumida pelo `product-service`.
+- Cobertura de testes: 6 suítes / 54 testes, incluindo teste de concorrência.
+
+
+> Nota: a baixa de estoque após confirmação do pedido e o ownership real da reserva
+> (amarrar cada reserva a um pedido/usuário) serão implementados na Fase 4, com o `order-service`.
+
+
+Banco: **PostgreSQL** (via Prisma).
+
 
 ---
 
+
 ### `cart-service`
+
 
 Responsável pelo carrinho de compras.
 
+
 Principais responsabilidades:
+
 
 - Adicionar produtos ao carrinho.
 - Remover produtos do carrinho.
@@ -182,15 +246,21 @@ Principais responsabilidades:
 - Calcular subtotal.
 - Manter estado temporário da compra.
 
+
 Armazenamento previsto: **Redis**.
+
 
 ---
 
+
 ### `order-service`
+
 
 Responsável pelo ciclo de vida dos pedidos.
 
+
 Principais responsabilidades:
+
 
 - Criação de pedidos.
 - Consulta de pedidos por usuário.
@@ -198,15 +268,21 @@ Principais responsabilidades:
 - Integração com estoque.
 - Publicação de eventos para pagamento e notificações.
 
+
 Banco previsto: **PostgreSQL**.
+
 
 ---
 
+
 ### `payment-service`
+
 
 Responsável pelo processamento de pagamentos.
 
+
 Principais responsabilidades:
+
 
 - Receber solicitações de pagamento.
 - Simular ou integrar pagamentos.
@@ -214,26 +290,36 @@ Principais responsabilidades:
 - Publicar eventos de pagamento aprovado ou recusado.
 - Comunicar falhas para o fluxo de pedidos.
 
+
 Banco previsto: **PostgreSQL**.
+
 
 ---
 
+
 ### `notification-service`
+
 
 Responsável pelo envio de notificações assíncronas.
 
+
 Principais responsabilidades:
+
 
 - Consumir eventos do RabbitMQ.
 - Enviar notificações de pedido criado.
 - Enviar notificações de pagamento aprovado ou recusado.
 - Enviar mensagens futuras por e-mail ou outros canais.
 
+
 Este serviço atua principalmente como **consumer** de eventos.
+
 
 ---
 
+
 ## Tecnologias
+
 
 | Camada | Tecnologia |
 |---|---|
@@ -249,11 +335,15 @@ Este serviço atua principalmente como **consumer** de eventos.
 | Containerização | Docker + Docker Compose |
 | CI/CD | GitHub Actions |
 
+
 ---
+
 
 ## Estrutura de pastas
 
+
 Estrutura planejada do repositório:
+
 
 ```txt
 ecommerce-platform/
@@ -281,9 +371,12 @@ ecommerce-platform/
 └── README.md
 ```
 
+
 ### Organização esperada de cada serviço
 
+
 Cada serviço deve seguir uma estrutura própria e previsível:
+
 
 ```txt
 service-name/
@@ -302,15 +395,21 @@ service-name/
 └── README.md
 ```
 
+
 Essa organização pode evoluir conforme o projeto amadurecer.
+
 
 ---
 
+
 ## Como rodar localmente
+
 
 ### Pré-requisitos
 
+
 Antes de iniciar, é necessário ter instalado:
+
 
 - Docker Desktop.
 - WSL2 com Ubuntu, no caso de ambiente Windows.
@@ -318,125 +417,171 @@ Antes de iniciar, é necessário ter instalado:
 - Git configurado com SSH.
 - Docker Compose habilitado.
 
+
 ---
 
+
 ### 1. Clonar o repositório
+
 
 ```bash
 git clone git@github.com:DaviMoraisdev/ecommerce-platform.git
 cd ecommerce-platform
 ```
 
+
 ---
 
+
 ### 2. Configurar variáveis de ambiente
+
 
 ```bash
 cp .env.example .env
 ```
 
+
 Depois, edite o arquivo `.env` com as credenciais locais do ambiente de desenvolvimento.
+
 
 ---
 
+
 ### 3. Subir a infraestrutura
+
 
 ```bash
 docker compose up -d
 ```
 
+
 ---
 
+
 ### 4. Verificar os containers
+
 
 ```bash
 docker compose ps
 ```
 
+
 ---
 
+
 ### 5. Visualizar logs
+
 
 ```bash
 docker compose logs -f
 ```
 
+
 Para visualizar logs de um serviço específico:
+
 
 ```bash
 docker compose logs -f nome-do-servico
 ```
 
+
 ---
 
+
 ### 6. Encerrar os containers
+
 
 ```bash
 docker compose down
 ```
 
+
 Para remover também volumes locais:
+
 
 ```bash
 docker compose down -v
 ```
 
+
 > Use `down -v` com cuidado, pois os dados locais dos bancos podem ser apagados.
+
 
 ---
 
+
 ## Variáveis de ambiente
+
 
 Exemplo de variáveis esperadas no arquivo `.env`:
 
+
 ```env
 NODE_ENV=development
+
 
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=ecommerce
 
+
 MONGO_INITDB_ROOT_USERNAME=mongo
 MONGO_INITDB_ROOT_PASSWORD=mongo
+
 
 REDIS_HOST=redis
 REDIS_PORT=6379
 
+
 RABBITMQ_DEFAULT_USER=guest
 RABBITMQ_DEFAULT_PASS=guest
+
 
 JWT_SECRET=local-development-secret
 JWT_EXPIRES_IN=1d
 ```
 
+
 Regras importantes:
+
 
 - Arquivos `.env` reais não devem ser versionados.
 - Apenas `.env.example` deve ser mantido no repositório.
 - Segredos de produção não devem ser usados no ambiente local.
 - Valores sensíveis devem ser substituídos por secrets em ambientes reais.
 
+
 ---
+
 
 ## Comunicação entre serviços
 
+
 ### REST
+
 
 A comunicação REST será usada quando um serviço precisar de resposta imediata de outro serviço.
 
+
 Exemplos:
+
 
 - O gateway encaminha uma requisição de login para o `auth-service`.
 - O frontend solicita produtos ao `product-service`.
 - O `order-service` consulta informações necessárias antes de criar um pedido.
 
+
 ---
+
 
 ### RabbitMQ
 
+
 A mensageria será usada para eventos que não precisam bloquear a resposta principal da aplicação.
 
+
 Exemplos de eventos:
+
 
 ```txt
 order.created
@@ -447,7 +592,9 @@ inventory.released
 notification.requested
 ```
 
+
 Exemplo de fluxo assíncrono:
+
 
 ```txt
 order-service
@@ -458,13 +605,18 @@ order-service
   → notification-service envia notificação
 ```
 
+
 ---
+
 
 ## Segurança
 
+
 A segurança será aplicada de forma incremental, acompanhando a evolução do projeto.
 
+
 ### Práticas previstas
+
 
 - Uso de JWT para autenticação.
 - Separação entre rotas públicas e privadas.
@@ -479,7 +631,9 @@ A segurança será aplicada de forma incremental, acompanhando a evolução do p
 - Validação de permissões por tipo de usuário.
 - Separação entre ambiente local, desenvolvimento e produção.
 
+
 ### Pontos que devem receber atenção especial
+
 
 - Autenticação e renovação de tokens.
 - Proteção contra acesso indevido a dados de outros usuários.
@@ -488,17 +642,21 @@ A segurança será aplicada de forma incremental, acompanhando a evolução do p
 - Logs sem exposição de dados sensíveis.
 - Segurança entre serviços internos.
 
+
 ---
+
 
 ## Roadmap
 
+
 O projeto será desenvolvido em fases para evitar acúmulo de complexidade e permitir revisão técnica ao final de cada etapa.
+
 
 | Fase | Status | Objetivo |
 |---|---:|---|
 | Fase 1 | Concluída | Fundação do projeto e ambiente local |
 | Fase 2 | Concluída | Serviço de autenticação |
-| Fase 3 | Em andamento | Catálogo de produtos e estoque |
+| Fase 3 | Concluída | Catálogo de produtos e estoque |
 | Fase 4 | Pendente | Carrinho e pedidos |
 | Fase 5 | Pendente | Pagamentos |
 | Fase 6 | Pendente | Notificações assíncronas |
@@ -507,13 +665,18 @@ O projeto será desenvolvido em fases para evitar acúmulo de complexidade e per
 | Fase 9 | Pendente | Admin dashboard |
 | Fase 10 | Pendente | CI/CD, testes e documentação final |
 
+
 ---
+
 
 ## Documentação
 
+
 A pasta `docs/` será usada para registrar decisões, arquitetura e revisões de fase.
 
+
 Documentos planejados:
+
 
 ```txt
 docs/
@@ -530,9 +693,12 @@ docs/
 └── roadmap.md
 ```
 
+
 ### Objetivo da documentação
 
+
 A documentação deve explicar:
+
 
 - O motivo das decisões técnicas.
 - O funcionamento dos serviços.
@@ -541,11 +707,15 @@ A documentação deve explicar:
 - As melhorias planejadas.
 - O que foi aprendido em cada fase.
 
+
 ---
+
 
 ## Boas práticas do projeto
 
+
 Durante o desenvolvimento, este projeto deve seguir algumas regras:
+
 
 - Criar commits pequenos e descritivos.
 - Documentar alterações importantes.
@@ -558,18 +728,26 @@ Durante o desenvolvimento, este projeto deve seguir algumas regras:
 - Evitar hardcoded secrets.
 - Manter o README atualizado conforme o projeto evoluir.
 
+
 ---
+
 
 ## Propósito do projeto
 
+
 Este projeto foi criado como um laboratório prático de desenvolvimento full-stack e arquitetura backend.
+
 
 A intenção é aprender construindo uma aplicação mais próxima de um cenário real, com desafios técnicos que aparecem em sistemas maiores: autenticação, comunicação entre serviços, persistência, cache, mensageria, segurança, infraestrutura e documentação.
 
+
 Cada fase deve gerar uma entrega funcional, revisável e documentada, permitindo que o projeto seja usado como material de estudo, portfólio técnico e base para discussões em entrevistas.
+
 
 ---
 
+
 ## Autor
+
 
 Desenvolvido por **Davi Morais** como projeto educacional de portfólio em desenvolvimento de software.
