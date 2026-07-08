@@ -114,8 +114,7 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 
 - Testes de integração end-to-end com Supertest, incluindo o 429 do rate limit
 - Paginação no endpoint /admin/users do auth-service
-- Login social via OAuth2 com Google
-
-
+- Login social via OAuth2 com Google\n
 ## FERRAMENTAL / BUILD (transversal) — TS 6
-- **`tsconfig.json` base sem `rootDir` quebra `npm run dev` (TS5011):** no TypeScript 6 o `ts-node-dev` falha com `error TS5011` porque o `tsconfig.json` base nao define `rootDir` e o diretorio-fonte comum fica ambiguo. Afeta auth, product e inventory (mesmo padrao de tsconfig). NAO afeta `build` (usa `tsconfig.build.json`, que ja tem `rootDir`) nem `test` (ts-jest). Ja corrigido no cart-service com `"rootDir": "."`. Destino: PR dedicado `fix/tsconfig-rootdir-ts6`, antes ou em paralelo ao Bloco 2.
+- **`tsconfig.json` base sem `rootDir` quebra `npm run dev` (TS5011):** confirmado neste PR no cart-service, onde ja foi corrigido com `"rootDir": "."`. O mesmo padrao de `tsconfig.json` existe em auth, product e inventory; impacto nesses servicos foi observado manualmente (`npm run dev` no product falhou com TS5011), mas NAO faz parte do diff deste PR. Destino: PR dedicado `fix/tsconfig-rootdir-ts6` que aplica e evidencia a correcao nos demais servicos.
+- **Health check do Redis sem timeout explicito:** o `/health` do cart faz `getRedisClient().ping()` sem timeout por comando; sob Redis/rede lentos o endpoint pode demorar. Falta tambem teste de ping pendente/lento. Consolidar junto do hardening de Redis (timeout estrito + circuit breaker) — Fase 7/10.
