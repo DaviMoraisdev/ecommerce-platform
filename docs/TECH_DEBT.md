@@ -115,3 +115,7 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - Testes de integração end-to-end com Supertest, incluindo o 429 do rate limit
 - Paginação no endpoint /admin/users do auth-service
 - Login social via OAuth2 com Google
+
+
+## FERRAMENTAL / BUILD (transversal) — TS 6
+- **`tsconfig.json` base sem `rootDir` quebra `npm run dev` (TS5011):** no TypeScript 6 o `ts-node-dev` falha com `error TS5011` porque o `tsconfig.json` base nao define `rootDir` e o diretorio-fonte comum fica ambiguo. Afeta auth, product e inventory (mesmo padrao de tsconfig). NAO afeta `build` (usa `tsconfig.build.json`, que ja tem `rootDir`) nem `test` (ts-jest). Ja corrigido no cart-service com `"rootDir": "."`. Destino: PR dedicado `fix/tsconfig-rootdir-ts6`, antes ou em paralelo ao Bloco 2.
