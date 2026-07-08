@@ -2,12 +2,8 @@ import request from 'supertest';
 import app from '../src/app';
 import { getRedisClient } from '../src/config/redis';
 
-// Mocka o modulo do Redis: nenhum teste abre conexao real (sem handles
-// abertos travando o Jest) e controlamos a resposta do ping.
 jest.mock('../src/config/redis');
 
-// jest.mocked() envolve a funcao ja mockada e devolve os tipos corretos
-// dos metodos de mock, sem precisar de cast com generic.
 const mockedGetRedisClient = jest.mocked(getRedisClient);
 
 describe('GET /health', () => {
@@ -29,6 +25,21 @@ describe('GET /health', () => {
   it('retorna 503 e redis "down" quando o ping falha', async () => {
     mockedGetRedisClient.mockReturnValue({
       ping: jest.fn().mockRejectedValue(new Error('conexao recusada')),
+    } as any);
+
+    const res = await request(app).get('/health');
+
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({
+      status: 'error',
+      service: 'cart-service',
+      redis: 'down',
+    });
+  });
+
+  it('retorna 503 quando o ping responde algo diferente de PONG', async () => {
+    mockedGetRedisClient.mockReturnValue({
+      ping: jest.fn().mockResolvedValue('ALGO_ERRADO'),
     } as any);
 
     const res = await request(app).get('/health');
