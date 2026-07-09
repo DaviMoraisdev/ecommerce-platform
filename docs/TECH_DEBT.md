@@ -115,6 +115,6 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - Testes de integração end-to-end com Supertest, incluindo o 429 do rate limit
 - Paginação no endpoint /admin/users do auth-service
 - Login social via OAuth2 com Google\n
-## FERRAMENTAL / BUILD (transversal) — TS 6
-- **`tsconfig.json` base sem `rootDir` quebra `npm run dev` (TS5011):** confirmado neste PR no cart-service, onde ja foi corrigido com `"rootDir": "."`. O mesmo padrao de `tsconfig.json` existe em auth, product e inventory; impacto nesses servicos foi observado manualmente (`npm run dev` no product falhou com TS5011), mas NAO faz parte do diff deste PR. Destino: PR dedicado `fix/tsconfig-rootdir-ts6` que aplica e evidencia a correcao nos demais servicos.
+## FERRAMENTAL / BUILD (transversal)
+- **[RESOLVIDO — PR fix/tsconfig-rootdir-ts6] `npm run dev` quebrava com TS5011 (TS 6):** a causa era product e cart usarem o `tsconfig.json` base no dev, sem `rootDir` explicito. Resolvido alinhando os dois ao padrao `tsconfig.dev.json` que auth/inventory ja usavam (inclui so `src`, `rootDir: "./src"`, exclui `tests`); o contorno antigo de `rootDir` no base do cart foi removido. auth/inventory nao precisavam de mudanca.
 - **Health check do Redis sem timeout explicito:** o `/health` do cart faz `getRedisClient().ping()` sem timeout por comando; sob Redis/rede lentos o endpoint pode demorar. Falta tambem teste de ping pendente/lento. Consolidar junto do hardening de Redis (timeout estrito + circuit breaker) — Fase 7/10.
