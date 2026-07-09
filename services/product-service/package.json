@@ -4,7 +4,7 @@
   "description": "Servico de catalogo de produtos da plataforma e-commerce",
   "main": "dist/server.js",
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.dev.json src/server.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "test" : "jest --ci",
