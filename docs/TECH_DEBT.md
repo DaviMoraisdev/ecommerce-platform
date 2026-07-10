@@ -118,3 +118,6 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 ## FERRAMENTAL / BUILD (transversal)
 - **[RESOLVIDO — PR fix/tsconfig-rootdir-ts6] `npm run dev` quebrava com TS5011 (TS 6):** a causa era product e cart usarem o `tsconfig.json` base no dev, sem `rootDir` explicito. Resolvido alinhando os dois ao padrao `tsconfig.dev.json` que auth/inventory ja usavam (inclui so `src`, `rootDir: "./src"`, exclui `tests`); o contorno antigo de `rootDir` no base do cart foi removido. auth/inventory nao precisavam de mudanca.
 - **Health check do Redis sem timeout explicito:** o `/health` do cart faz `getRedisClient().ping()` sem timeout por comando; sob Redis/rede lentos o endpoint pode demorar. Falta tambem teste de ping pendente/lento. Consolidar junto do hardening de Redis (timeout estrito + circuit breaker) — Fase 7/10.
+
+## CART-SERVICE (Fase 4)
+- **Sem error handler central:** erros inesperados nas rotas do cart caem no handler padrao do Express (resposta HTML de 500). Adicionar middleware de erro que padronize resposta JSON (`{ error }`) e logue. Pode esperar. Levantado no Bloco 2.
