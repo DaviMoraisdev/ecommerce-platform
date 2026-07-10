@@ -53,12 +53,22 @@ describe('cart routes', () => {
     expect(mockedService.addItem).not.toHaveBeenCalled();
   });
 
-  it('POST /cart/items 400 com quantity acima do maximo', async () => {
+  it('POST /cart/items 200 no limite (quantity 10000)', async () => {
+    mockedService.addItem.mockResolvedValue([{ productId: 'p1', quantity: 10000 }]);
     const res = await request(app)
       .post('/cart/items')
       .set(authH())
-      .send({ productId: 'p1', quantity: 999999 });
+      .send({ productId: 'p1', quantity: 10000 });
+    expect(res.status).toBe(200);
+  });
+
+  it('POST /cart/items 400 acima do limite (quantity 10001)', async () => {
+    const res = await request(app)
+      .post('/cart/items')
+      .set(authH())
+      .send({ productId: 'p1', quantity: 10001 });
     expect(res.status).toBe(400);
+    expect(mockedService.addItem).not.toHaveBeenCalled();
   });
 
   it('POST /cart/items 400 com productId vazio', async () => {
@@ -66,6 +76,15 @@ describe('cart routes', () => {
       .post('/cart/items')
       .set(authH())
       .send({ productId: '   ', quantity: 2 });
+    expect(res.status).toBe(400);
+    expect(mockedService.addItem).not.toHaveBeenCalled();
+  });
+
+  it('POST /cart/items 400 com productId acima de 128 chars', async () => {
+    const res = await request(app)
+      .post('/cart/items')
+      .set(authH())
+      .send({ productId: 'p'.repeat(129), quantity: 1 });
     expect(res.status).toBe(400);
     expect(mockedService.addItem).not.toHaveBeenCalled();
   });

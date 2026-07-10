@@ -44,8 +44,16 @@ describe('authMiddleware', () => {
     expect(res.status).toBe(401);
   });
 
-  it('401 quando o token e valido mas nao tem id', async () => {
+  it('401 quando o token nao tem id', async () => {
     const token = jwt.sign({ email: 'a@b.c', role: 'CUSTOMER' }, SECRET);
+    const res = await request(buildApp())
+      .get('/protegido')
+      .set('Authorization', 'Bearer ' + token);
+    expect(res.status).toBe(401);
+  });
+
+  it('401 quando o id e so espacos', async () => {
+    const token = jwt.sign({ id: '   ', role: 'CUSTOMER' }, SECRET);
     const res = await request(buildApp())
       .get('/protegido')
       .set('Authorization', 'Bearer ' + token);

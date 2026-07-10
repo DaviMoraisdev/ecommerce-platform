@@ -2,14 +2,14 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { loadConfig } from '../config/env';
 
+// Apenas id e obrigatorio (e o unico validado e usado). email/role sao
+// opcionais para o tipo refletir a validacao real (evita undefined tipado como string).
 interface TokenPayload {
   id: string;
-  email: string;
-  role: string;
+  email?: string;
+  role?: string;
 }
 
-// Valida estruturalmente o payload: precisa ser objeto e ter id string nao-vazia.
-// Sem isso, um token assinado mas sem id passaria e viraria cart:undefined.
 function isValidPayload(p: unknown): p is TokenPayload {
   return (
     typeof p === 'object' &&
@@ -31,8 +31,6 @@ export function authMiddleware(
       return;
     }
     const token = authHeader.split(' ')[1];
-    // Usa o segredo validado no boot (loadConfig), nao process.env cru:
-    // fonte unica de verdade para o JWT_SECRET.
     const payload = jwt.verify(token, loadConfig().jwtSecret);
     if (!isValidPayload(payload)) {
       res.status(401).json({ error: 'Token sem claims obrigatorias' });

@@ -6,6 +6,13 @@ export interface AppConfig {
   nodeEnv: string;
 }
 
+const WEAK_JWT_SECRETS = [
+  'troque_este_segredo',
+  'dev_jwt_secret_troque_em_producao',
+  'changeme',
+  'secret',
+];
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const nodeEnv = env.NODE_ENV ?? 'development';
   const isDevOrTest = nodeEnv === 'development' || nodeEnv === 'test';
@@ -15,11 +22,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('REDIS_URL e obrigatoria fora de development/test');
   }
 
-  // JWT_SECRET valida tokens emitidos pelo auth-service. DEVE ser o mesmo
-  // segredo do auth-service, senao a verificacao falha. Obrigatorio em prod.
+  // JWT_SECRET e SEMPRE obrigatoria: sem fallback executavel conhecido.
+  // Assim, um deploy sem NODE_ENV=production nao pode usar um segredo publico.
   const jwtSecret = env.JWT_SECRET;
-  if (!jwtSecret && !isDevOrTest) {
-    throw new Error('JWT_SECRET e obrigatoria fora de development/test');
+  if (!jwtSecret || jwtSecret.trim() === '') {
+    throw new Error('JWT_SECRET e obrigatoria');
+  }
+  // Em producao, recusa placeholders conhecidos e segredos curtos.
+  if (nodeEnv === 'production') {
+    if (WEAK_JWT_SECRETS.includes(jwtSecret) || jwtSecret.length < 16) {
+      throw new Error('JWT_SECRET fraca ou placeholder — defina um segredo forte');
+    }
   }
 
   const rawPort = env.CART_PORT;
@@ -28,8 +41,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error('CART_PORT invalido: ' + String(rawPort));
   }
 
-  // TTL do carrinho: expiracao deslizante, renovada a cada escrita.
-  // Default 7 dias. Carrinho abandonado morre; carrinho ativo persiste.
   const rawTtl = env.CART_TTL_SECONDS;
   const cartTtlSeconds = rawTtl ? Number(rawTtl) : 604800;
   if (!Number.isInteger(cartTtlSeconds) || cartTtlSeconds < 1) {
@@ -39,7 +50,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     port,
     redisUrl: redisUrl ?? 'redis://127.0.0.1:6379',
-    jwtSecret: jwtSecret ?? 'dev_jwt_secret_troque_em_producao',
+    jwtSecret,
     cartTtlSeconds,
     nodeEnv,
   };
