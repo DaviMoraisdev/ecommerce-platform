@@ -7,6 +7,7 @@ jest.mock('../src/services/cart.service');
 const mockedService = cartService as jest.Mocked<typeof cartService>;
 
 const SECRET = 'test_secret';
+const OLD_SECRET = process.env.JWT_SECRET;
 let token: string;
 
 beforeAll(() => {
@@ -14,8 +15,13 @@ beforeAll(() => {
   token = jwt.sign({ id: 'u1', email: 'a@b.c', role: 'CUSTOMER' }, SECRET);
 });
 
+afterAll(() => {
+  process.env.JWT_SECRET = OLD_SECRET;
+});
+
 beforeEach(() => jest.clearAllMocks());
 
+const authH = () => ({ Authorization: 'Bearer ' + token });
 
 describe('cart routes', () => {
   it('401 sem token', async () => {
@@ -25,31 +31,74 @@ describe('cart routes', () => {
 
   it('GET /cart retorna itens', async () => {
     mockedService.getCart.mockResolvedValue([{ productId: 'p1', quantity: 2 }]);
-    const res = await request(app)
-      .get('/cart')
-      .set('Authorization', 'Bearer ' + token);
+    const res = await request(app).get('/cart').set(authH());
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ items: [{ productId: 'p1', quantity: 2 }] });
     expect(mockedService.getCart).toHaveBeenCalledWith('u1');
   });
 
-  it('POST /cart/items 400 com quantity invalida', async () => {
+  it('GET /cart -> 500 JSON quando o servico falha', async () => {
+    mockedService.getCart.mockRejectedValue(new Error('redis down'));
+    const res = await request(app).get('/cart').set(authH());
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Erro interno' });
+  });
+
+  it('POST /cart/items 400 com quantity zero', async () => {
     const res = await request(app)
       .post('/cart/items')
-      .set('Authorization', 'Bearer ' + token)
+      .set(authH())
       .send({ productId: 'p1', quantity: 0 });
     expect(res.status).toBe(400);
     expect(mockedService.addItem).not.toHaveBeenCalled();
   });
 
-  it('POST /cart/items 200 adiciona', async () => {
+  it('POST /cart/items 400 com quantity acima do maximo', async () => {
+    const res = await request(app)
+      .post('/cart/items')
+      .set(authH())
+      .send({ productId: 'p1', quantity: 999999 });
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /cart/items 400 com productId vazio', async () => {
+    const res = await request(app)
+      .post('/cart/items')
+      .set(authH())
+      .send({ productId: '   ', quantity: 2 });
+    expect(res.status).toBe(400);
+    expect(mockedService.addItem).not.toHaveBeenCalled();
+  });
+
+  it('POST /cart/items 200 adiciona (productId normalizado)', async () => {
     mockedService.addItem.mockResolvedValue([{ productId: 'p1', quantity: 3 }]);
     const res = await request(app)
       .post('/cart/items')
-      .set('Authorization', 'Bearer ' + token)
-      .send({ productId: 'p1', quantity: 3 });
+      .set(authH())
+      .send({ productId: '  p1  ', quantity: 3 });
     expect(res.status).toBe(200);
     expect(mockedService.addItem).toHaveBeenCalledWith('u1', 'p1', 3);
+  });
+
+  it('PATCH /cart/items/:id 200 atualiza', async () => {
+    mockedService.updateQuantity.mockResolvedValue([
+      { productId: 'p1', quantity: 7 },
+    ]);
+    const res = await request(app)
+      .patch('/cart/items/p1')
+      .set(authH())
+      .send({ quantity: 7 });
+    expect(res.status).toBe(200);
+    expect(mockedService.updateQuantity).toHaveBeenCalledWith('u1', 'p1', 7);
+  });
+
+  it('PATCH /cart/items/:id 400 com quantity invalida', async () => {
+    const res = await request(app)
+      .patch('/cart/items/p1')
+      .set(authH())
+      .send({ quantity: -1 });
+    expect(res.status).toBe(400);
+    expect(mockedService.updateQuantity).not.toHaveBeenCalled();
   });
 
   it('PATCH /cart/items/:id 404 quando item nao existe', async () => {
@@ -58,25 +107,21 @@ describe('cart routes', () => {
     );
     const res = await request(app)
       .patch('/cart/items/p9')
-      .set('Authorization', 'Bearer ' + token)
+      .set(authH())
       .send({ quantity: 5 });
     expect(res.status).toBe(404);
   });
 
   it('DELETE /cart/items/:id remove', async () => {
     mockedService.removeItem.mockResolvedValue([]);
-    const res = await request(app)
-      .delete('/cart/items/p1')
-      .set('Authorization', 'Bearer ' + token);
+    const res = await request(app).delete('/cart/items/p1').set(authH());
     expect(res.status).toBe(200);
     expect(mockedService.removeItem).toHaveBeenCalledWith('u1', 'p1');
   });
 
   it('DELETE /cart esvazia (204)', async () => {
     mockedService.clearCart.mockResolvedValue(undefined);
-    const res = await request(app)
-      .delete('/cart')
-      .set('Authorization', 'Bearer ' + token);
+    const res = await request(app).delete('/cart').set(authH());
     expect(res.status).toBe(204);
     expect(mockedService.clearCart).toHaveBeenCalledWith('u1');
   });

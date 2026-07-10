@@ -10,9 +10,10 @@ function cartKey(userId: string): string {
   return 'cart:' + userId;
 }
 
-// Renova a expiracao a cada escrita (TTL deslizante).
 async function refreshTtl(key: string): Promise<void> {
   const { cartTtlSeconds } = loadConfig();
+  // EXPIRE em chave inexistente e no-op (retorna 0), entao chamar apos remocao
+  // que esvaziou o carrinho e seguro.
   await getRedisClient().expire(key, cartTtlSeconds);
 }
 
@@ -24,7 +25,6 @@ export async function getCart(userId: string): Promise<CartItem[]> {
   }));
 }
 
-// Soma quantidade de forma ATOMICA (HINCRBY). Cria o item se nao existir.
 export async function addItem(
   userId: string,
   productId: string,
@@ -36,7 +36,6 @@ export async function addItem(
   return getCart(userId);
 }
 
-// Define quantidade ABSOLUTA. Exige que o item ja exista (semantica PATCH).
 export async function updateQuantity(
   userId: string,
   productId: string,
@@ -52,12 +51,14 @@ export async function updateQuantity(
   return getCart(userId);
 }
 
-// Remove um item. Idempotente: nao falha se o item ja nao estiver la.
 export async function removeItem(
   userId: string,
   productId: string
 ): Promise<CartItem[]> {
-  await getRedisClient().hdel(cartKey(userId), productId);
+  const key = cartKey(userId);
+  await getRedisClient().hdel(key, productId);
+  // Remocao tambem e escrita: renova o TTL deslizante. No-op se esvaziou.
+  await refreshTtl(key);
   return getCart(userId);
 }
 

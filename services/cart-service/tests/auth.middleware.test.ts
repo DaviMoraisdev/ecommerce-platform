@@ -5,7 +5,6 @@ import { authMiddleware } from '../src/middlewares/auth.middleware';
 
 const SECRET = 'test_secret';
 
-// App minimo so para exercitar o middleware numa rota protegida.
 function buildApp() {
   const app = express();
   app.get('/protegido', authMiddleware, (req: Request, res: Response) => {
@@ -31,10 +30,25 @@ describe('authMiddleware', () => {
     expect(res.status).toBe(401);
   });
 
+  it('401 quando o header e malformado (sem token)', async () => {
+    const res = await request(buildApp())
+      .get('/protegido')
+      .set('Authorization', 'Bearer ');
+    expect(res.status).toBe(401);
+  });
+
   it('401 quando o token e invalido', async () => {
     const res = await request(buildApp())
       .get('/protegido')
       .set('Authorization', 'Bearer token_invalido');
+    expect(res.status).toBe(401);
+  });
+
+  it('401 quando o token e valido mas nao tem id', async () => {
+    const token = jwt.sign({ email: 'a@b.c', role: 'CUSTOMER' }, SECRET);
+    const res = await request(buildApp())
+      .get('/protegido')
+      .set('Authorization', 'Bearer ' + token);
     expect(res.status).toBe(401);
   });
 

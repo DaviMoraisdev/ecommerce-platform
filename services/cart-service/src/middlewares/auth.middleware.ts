@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { loadConfig } from '../config/env';
 
 interface TokenPayload {
   id: string;
@@ -7,8 +8,17 @@ interface TokenPayload {
   role: string;
 }
 
-// Valida o JWT emitido pelo auth-service e injeta userId/userRole na request.
-// Le JWT_SECRET em runtime (nao no topo do modulo) — mesma licao da Fase 3.
+// Valida estruturalmente o payload: precisa ser objeto e ter id string nao-vazia.
+// Sem isso, um token assinado mas sem id passaria e viraria cart:undefined.
+function isValidPayload(p: unknown): p is TokenPayload {
+  return (
+    typeof p === 'object' &&
+    p !== null &&
+    typeof (p as { id?: unknown }).id === 'string' &&
+    (p as { id: string }).id.trim() !== ''
+  );
+}
+
 export function authMiddleware(
   req: Request,
   res: Response,
@@ -21,10 +31,13 @@ export function authMiddleware(
       return;
     }
     const token = authHeader.split(' ')[1];
-    const payload = jwt.verify(
-      token,
-      process.env.JWT_SECRET as string
-    ) as TokenPayload;
+    // Usa o segredo validado no boot (loadConfig), nao process.env cru:
+    // fonte unica de verdade para o JWT_SECRET.
+    const payload = jwt.verify(token, loadConfig().jwtSecret);
+    if (!isValidPayload(payload)) {
+      res.status(401).json({ error: 'Token sem claims obrigatorias' });
+      return;
+    }
     (req as any).userId = payload.id;
     (req as any).userRole = payload.role;
     next();

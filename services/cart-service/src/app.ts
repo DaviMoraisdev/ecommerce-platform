@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import { getRedisClient } from './config/redis';
 import cartRoutes from './routes/cart.routes';
@@ -30,5 +30,13 @@ app.get('/health', async (req: Request, res: Response) => {
 });
 
 app.use('/cart', cartRoutes);
+
+// Error handler central: resposta JSON generica, sem vazar detalhe interno
+// (ex.: mensagem do Redis) ao cliente. Loga do lado do servidor.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('[cart] erro inesperado:', err instanceof Error ? err.message : err);
+  res.status(500).json({ error: 'Erro interno' });
+});
 
 export default app;

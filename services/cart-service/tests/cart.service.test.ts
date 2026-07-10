@@ -42,6 +42,14 @@ describe('cart.service', () => {
     expect(cart).toEqual([{ productId: 'p2', quantity: 1 }]);
   });
 
+  it('removeItem renova o TTL do carrinho', async () => {
+    await cartService.addItem('u1', 'p1', 2);
+    await cartService.addItem('u1', 'p2', 1);
+    const expireSpy = jest.spyOn(mock.client, 'expire');
+    await cartService.removeItem('u1', 'p1');
+    expect(expireSpy).toHaveBeenCalledWith('cart:u1', 604800);
+  });
+
   it('clearCart esvazia o carrinho', async () => {
     await cartService.addItem('u1', 'p1', 2);
     await cartService.clearCart('u1');
