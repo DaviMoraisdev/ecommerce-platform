@@ -1,16 +1,12 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import { getRedisClient } from './config/redis';
+import cartRoutes from './routes/cart.routes';
 
-// Cria e configura o app Express SEM efeitos colaterais:
-// nao valida env, nao conecta nada, nao chama listen.
-// Isso o torna importavel em testes (Supertest) sem subir servidor.
 const app = express();
 app.use(helmet());
 app.use(express.json());
 
-// Health check ATIVO: pinga o Redis. No cart-service o Redis e a fonte da
-// verdade, entao "saudavel" significa "consigo falar com o Redis".
 app.get('/health', async (req: Request, res: Response) => {
   try {
     const pong = await getRedisClient().ping();
@@ -31,6 +27,16 @@ app.get('/health', async (req: Request, res: Response) => {
       timestamp: new Date().toISOString(),
     });
   }
+});
+
+app.use('/cart', cartRoutes);
+
+// Error handler central: resposta JSON generica, sem vazar detalhe interno
+// (ex.: mensagem do Redis) ao cliente. Loga do lado do servidor.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error('[cart] erro inesperado:', err instanceof Error ? err.message : err);
+  res.status(500).json({ error: 'Erro interno' });
 });
 
 export default app;
