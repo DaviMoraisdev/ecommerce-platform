@@ -1,7 +1,3 @@
-// Client REST para o product-service. O cart NAO acessa Mongo nem inventory:
-// consome a API publica GET /products/:id, que ja vem enriquecida com
-// disponibilidade (availability) pelo proprio product-service.
-
 const TIMEOUT_MS = 3000;
 
 export interface ProductInfo {
@@ -11,14 +7,24 @@ export interface ProductInfo {
   availability: { available: number; inStock: boolean } | null;
 }
 
-// Resultado em 3 estados — diferente do inventory.client da Fase 3 (que
-// retornava null): aqui precisamos distinguir "produto nao existe" (404 ->
-// rejeitar) de "servico indisponivel" (timeout/erro -> rejeitar no add,
-// degradar na leitura). Um null unico perderia essa distincao.
 export type ProductResult =
   | { status: 'ok'; product: ProductInfo }
   | { status: 'not_found' }
   | { status: 'unavailable' };
+
+// available deve ser inteiro >= 0 (contagem de estoque); inStock booleano.
+// Rejeita NaN/Infinity/negativo/decimais — senao NaN faria desiredQty > NaN
+// ser sempre falso, furando a checagem de estoque.
+function isValidAvailability(a: unknown): a is { available: number; inStock: boolean } {
+  if (typeof a !== 'object' || a === null) return false;
+  const av = a as Record<string, unknown>;
+  return (
+    typeof av.available === 'number' &&
+    Number.isInteger(av.available) &&
+    av.available >= 0 &&
+    typeof av.inStock === 'boolean'
+  );
+}
 
 function isValidProduct(data: unknown): data is {
   _id: string;
@@ -28,11 +34,7 @@ function isValidProduct(data: unknown): data is {
 } {
   if (typeof data !== 'object' || data === null) return false;
   const d = data as Record<string, unknown>;
-  const availabilityOk =
-    d.availability === null ||
-    (typeof d.availability === 'object' &&
-      d.availability !== null &&
-      typeof (d.availability as Record<string, unknown>).available === 'number');
+  const availabilityOk = d.availability === null || isValidAvailability(d.availability);
   return (
     typeof d._id === 'string' &&
     typeof d.name === 'string' &&
@@ -47,13 +49,14 @@ export async function fetchProduct(productId: string): Promise<ProductResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
-    // Resolve a URL aqui (nao no topo do modulo): garante que o dotenv ja
-    // carregou quando a funcao e chamada.
     const productUrl = process.env.PRODUCT_SERVICE_URL || 'http://localhost:3003';
     const url = productUrl + '/products/' + encodeURIComponent(productId);
     const response = await fetch(url, { signal: controller.signal });
 
-    if (response.status === 404) {
+    // 404 = nao existe; 400 = id malformado (CastError do product-service).
+    // Ambos sao "produto invalido/inexistente" do ponto de vista do cart,
+    // NAO indisponibilidade do servico (que esta saudavel respondendo 400).
+    if (response.status === 404 || response.status === 400) {
       return { status: 'not_found' };
     }
     if (!response.ok) {

@@ -17,10 +17,16 @@ export interface CartItemDetailed extends CartItem {
 export interface DetailedCart {
   items: CartItemDetailed[];
   total: number;
+  partial: boolean;
 }
 
 function cartKey(userId: string): string {
   return 'cart:' + userId;
+}
+
+// Arredonda para 2 casas (paliativo de float; solucao real = centavos, em divida).
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 async function refreshTtl(key: string): Promise<void> {
@@ -53,9 +59,6 @@ export async function getCart(userId: string): Promise<CartItem[]> {
   }));
 }
 
-// Carrinho enriquecido para leitura: nome, preco, subtotal e disponivel.
-// Chamadas ao product-service em PARALELO. Degrada por item se o produto
-// sumiu ou o servico esta fora (campos null).
 export async function getCartDetailed(userId: string): Promise<DetailedCart> {
   const items = await getCart(userId);
   const detailed = await Promise.all(
@@ -77,13 +80,15 @@ export async function getCartDetailed(userId: string): Promise<DetailedCart> {
         quantity: item.quantity,
         name,
         price,
-        subtotal: price * item.quantity,
+        subtotal: round2(price * item.quantity),
         available: availability ? availability.available : null,
       };
     })
   );
-  const total = detailed.reduce((sum, i) => sum + (i.subtotal ?? 0), 0);
-  return { items: detailed, total };
+  // partial = algum item nao pode ser precificado -> total e apenas parcial.
+  const partial = detailed.some((i) => i.subtotal === null);
+  const total = round2(detailed.reduce((sum, i) => sum + (i.subtotal ?? 0), 0));
+  return { items: detailed, total, partial };
 }
 
 export async function addItem(

@@ -77,6 +77,12 @@ describe('cart.service', () => {
     expect(cart).toEqual([{ productId: 'p1', quantity: 999 }]);
   });
 
+  it('addItem renova o TTL (mecanismo)', async () => {
+    const expireSpy = jest.spyOn(mock.client, 'expire');
+    await cartService.addItem('u1', 'p1', 1);
+    expect(expireSpy).toHaveBeenCalledWith('cart:u1', 604800);
+  });
+
   it('updateQuantity define valor absoluto', async () => {
     await cartService.addItem('u1', 'p1', 2);
     const cart = await cartService.updateQuantity('u1', 'p1', 10);
@@ -140,6 +146,20 @@ describe('cart.service', () => {
       available: null,
     });
     expect(cart.total).toBe(0);
+  });
+
+  it('getCartDetailed marca partial=true quando um item nao precifica', async () => {
+    await cartService.addItem('u1', 'p1', 2);
+    mockedFetchProduct.mockResolvedValue({ status: 'unavailable' });
+    const cart = await cartService.getCartDetailed('u1');
+    expect(cart.partial).toBe(true);
+    expect(cart.total).toBe(0);
+  });
+
+  it('getCartDetailed marca partial=false quando tudo precifica', async () => {
+    await cartService.addItem('u1', 'p1', 2);
+    const cart = await cartService.getCartDetailed('u1');
+    expect(cart.partial).toBe(false);
   });
 
   it('clearCart esvazia o carrinho', async () => {

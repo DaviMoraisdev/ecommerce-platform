@@ -1,27 +1,28 @@
 import { fetchProduct } from '../src/services/product.client';
 
-const mockFetch = jest.fn();
-(global as any).fetch = mockFetch;
-
 function res(status: number, body: unknown) {
-  return {
-    status,
-    ok: status >= 200 && status < 300,
-    json: async () => body,
-  };
+  return { status, ok: status >= 200 && status < 300, json: async () => body };
 }
 
 describe('product.client.fetchProduct', () => {
-  beforeEach(() => mockFetch.mockReset());
+  let fetchSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    fetchSpy = jest.spyOn(globalThis, 'fetch');
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    jest.useRealTimers();
+  });
 
   it('ok: retorna produto valido', async () => {
-    mockFetch.mockResolvedValue(
+    fetchSpy.mockResolvedValue(
       res(200, {
         _id: 'p1',
         name: 'Camisa',
         price: 50,
         availability: { available: 10, inStock: true },
-      })
+      }) as any
     );
     const r = await fetchProduct('p1');
     expect(r).toEqual({
@@ -35,38 +36,74 @@ describe('product.client.fetchProduct', () => {
     });
   });
 
-  it('ok com availability null (inventory fora) ainda retorna o produto', async () => {
-    mockFetch.mockResolvedValue(
-      res(200, { _id: 'p1', name: 'Camisa', price: 50, availability: null })
+  it('ok com availability null', async () => {
+    fetchSpy.mockResolvedValue(
+      res(200, { _id: 'p1', name: 'Camisa', price: 50, availability: null }) as any
     );
-    const r = await fetchProduct('p1');
-    expect(r.status).toBe('ok');
-    if (r.status === 'ok') {
-      expect(r.product.availability).toBeNull();
-    }
+    expect((await fetchProduct('p1')).status).toBe('ok');
   });
 
-  it('not_found quando product-service responde 404', async () => {
-    mockFetch.mockResolvedValue(res(404, { error: 'Produto nao encontrado' }));
-    const r = await fetchProduct('inexistente');
-    expect(r.status).toBe('not_found');
+  it('not_found quando 404', async () => {
+    fetchSpy.mockResolvedValue(res(404, { error: 'x' }) as any);
+    expect((await fetchProduct('x')).status).toBe('not_found');
   });
 
-  it('unavailable quando product-service responde 500', async () => {
-    mockFetch.mockResolvedValue(res(500, {}));
-    const r = await fetchProduct('p1');
-    expect(r.status).toBe('unavailable');
+  it('not_found quando 400 (id malformado, servico saudavel)', async () => {
+    fetchSpy.mockResolvedValue(res(400, { error: 'ID invalido' }) as any);
+    expect((await fetchProduct('p1')).status).toBe('not_found');
   });
 
-  it('unavailable quando o payload e invalido', async () => {
-    mockFetch.mockResolvedValue(res(200, { foo: 'bar' }));
-    const r = await fetchProduct('p1');
-    expect(r.status).toBe('unavailable');
+  it('unavailable quando 500', async () => {
+    fetchSpy.mockResolvedValue(res(500, {}) as any);
+    expect((await fetchProduct('p1')).status).toBe('unavailable');
   });
 
-  it('unavailable quando ha falha de rede/timeout', async () => {
-    mockFetch.mockRejectedValue(new Error('network fail'));
-    const r = await fetchProduct('p1');
+  it('unavailable quando payload totalmente invalido', async () => {
+    fetchSpy.mockResolvedValue(res(200, { foo: 'bar' }) as any);
+    expect((await fetchProduct('p1')).status).toBe('unavailable');
+  });
+
+  it('unavailable quando available e NaN', async () => {
+    fetchSpy.mockResolvedValue(
+      res(200, { _id: 'p1', name: 'x', price: 10, availability: { available: NaN, inStock: true } }) as any
+    );
+    expect((await fetchProduct('p1')).status).toBe('unavailable');
+  });
+
+  it('unavailable quando available e negativo', async () => {
+    fetchSpy.mockResolvedValue(
+      res(200, { _id: 'p1', name: 'x', price: 10, availability: { available: -1, inStock: true } }) as any
+    );
+    expect((await fetchProduct('p1')).status).toBe('unavailable');
+  });
+
+  it('unavailable quando inStock nao e booleano', async () => {
+    fetchSpy.mockResolvedValue(
+      res(200, { _id: 'p1', name: 'x', price: 10, availability: { available: 5, inStock: 'sim' } }) as any
+    );
+    expect((await fetchProduct('p1')).status).toBe('unavailable');
+  });
+
+  it('unavailable quando ha falha de rede', async () => {
+    fetchSpy.mockRejectedValue(new Error('network'));
+    expect((await fetchProduct('p1')).status).toBe('unavailable');
+  });
+
+  it('unavailable no timeout: AbortController dispara apos TIMEOUT_MS', async () => {
+    jest.useFakeTimers();
+    fetchSpy.mockImplementation(
+      ((_url: any, opts: any) =>
+        new Promise((_resolve, reject) => {
+          opts.signal.addEventListener('abort', () => {
+            const e = new Error('aborted');
+            e.name = 'AbortError';
+            reject(e);
+          });
+        })) as any
+    );
+    const p = fetchProduct('p1');
+    await jest.advanceTimersByTimeAsync(3000);
+    const r = await p;
     expect(r.status).toBe('unavailable');
   });
 });

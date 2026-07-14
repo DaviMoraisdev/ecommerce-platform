@@ -42,6 +42,7 @@ describe('cart routes', () => {
         },
       ],
       total: 20,
+      partial: false,
     });
     const res = await request(app).get('/cart').set(authH());
     expect(res.status).toBe(200);
@@ -177,6 +178,24 @@ describe('cart routes', () => {
       .post('/cart/items')
       .set(authH())
       .send({ productId: 'p1', quantity: 1 });
+    expect(res.status).toBe(503);
+  });
+
+  it('PATCH /cart/items/:id 404 quando o produto nao existe', async () => {
+    mockedService.updateQuantity.mockRejectedValue(new Error('PRODUTO_NAO_ENCONTRADO'));
+    const res = await request(app).patch('/cart/items/p1').set(authH()).send({ quantity: 2 });
+    expect(res.status).toBe(404);
+  });
+
+  it('PATCH /cart/items/:id 409 quando o estoque e insuficiente', async () => {
+    mockedService.updateQuantity.mockRejectedValue(new Error('ESTOQUE_INSUFICIENTE'));
+    const res = await request(app).patch('/cart/items/p1').set(authH()).send({ quantity: 2 });
+    expect(res.status).toBe(409);
+  });
+
+  it('PATCH /cart/items/:id 503 quando o product-service esta fora', async () => {
+    mockedService.updateQuantity.mockRejectedValue(new Error('PRODUTO_SERVICE_INDISPONIVEL'));
+    const res = await request(app).patch('/cart/items/p1').set(authH()).send({ quantity: 2 });
     expect(res.status).toBe(503);
   });
 
