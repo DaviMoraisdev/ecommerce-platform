@@ -121,5 +121,6 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - **Health check do Redis sem timeout explicito:** o `/health` do cart faz `getRedisClient().ping()` sem timeout por comando; sob Redis/rede lentos o endpoint pode demorar. Falta tambem teste de ping pendente/lento. Consolidar junto do hardening de Redis (timeout estrito + circuit breaker) — Fase 7/10.
 
 ## CART-SERVICE (Fase 4)
+- **GET /cart faz N chamadas ao product-service (sem batch):** o enriquecimento chama fetchProduct por item (em paralelo, mas N requisicoes). Para carrinhos grandes, criar endpoint batch no product-service (ex.: GET /products?ids=...) e reduzir a uma chamada. Pode esperar.
 - **Atomicidade escrita+TTL e corrida no PATCH:** addItem/updateQuantity fazem escrita e EXPIRE em comandos separados (se o EXPIRE falhar, item fica sem TTL); e updateQuantity faz HEXISTS e depois HSET (janela de corrida: item removido entre os dois e recriado pelo HSET). Resolver com MULTI/EXEC ou script Lua e adicionar testes de concorrencia. Destino: pass de hardening de concorrencia (Fase 7/10). Baixa probabilidade/baixo impacto no estagio atual. Levantado no review do PR #33.
 - **Erros de dominio como string:** updateQuantity lanca Error('ITEM_NAO_ENCONTRADO') e o controller compara por texto. Migrar para classe/codigo tipado (junto da divida transversal de erros de dominio).
