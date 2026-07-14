@@ -29,16 +29,29 @@ describe('cart routes', () => {
     expect(res.status).toBe(401);
   });
 
-  it('GET /cart retorna itens', async () => {
-    mockedService.getCart.mockResolvedValue([{ productId: 'p1', quantity: 2 }]);
+  it('GET /cart retorna carrinho enriquecido', async () => {
+    mockedService.getCartDetailed.mockResolvedValue({
+      items: [
+        {
+          productId: 'p1',
+          quantity: 2,
+          name: 'Camisa',
+          price: 10,
+          subtotal: 20,
+          available: 5,
+        },
+      ],
+      total: 20,
+    });
     const res = await request(app).get('/cart').set(authH());
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ items: [{ productId: 'p1', quantity: 2 }] });
-    expect(mockedService.getCart).toHaveBeenCalledWith('u1');
+    expect(res.body.total).toBe(20);
+    expect(res.body.items[0]).toMatchObject({ productId: 'p1', name: 'Camisa', subtotal: 20 });
+    expect(mockedService.getCartDetailed).toHaveBeenCalledWith('u1');
   });
 
   it('GET /cart -> 500 JSON quando o servico falha', async () => {
-    mockedService.getCart.mockRejectedValue(new Error('redis down'));
+    mockedService.getCartDetailed.mockRejectedValue(new Error('redis down'));
     const res = await request(app).get('/cart').set(authH());
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'Erro interno' });
@@ -136,6 +149,35 @@ describe('cart routes', () => {
     const res = await request(app).delete('/cart/items/p1').set(authH());
     expect(res.status).toBe(200);
     expect(mockedService.removeItem).toHaveBeenCalledWith('u1', 'p1');
+  });
+
+  it('POST /cart/items 404 quando o produto nao existe', async () => {
+    mockedService.addItem.mockRejectedValue(new Error('PRODUTO_NAO_ENCONTRADO'));
+    const res = await request(app)
+      .post('/cart/items')
+      .set(authH())
+      .send({ productId: 'p1', quantity: 1 });
+    expect(res.status).toBe(404);
+  });
+
+  it('POST /cart/items 409 quando o estoque e insuficiente', async () => {
+    mockedService.addItem.mockRejectedValue(new Error('ESTOQUE_INSUFICIENTE'));
+    const res = await request(app)
+      .post('/cart/items')
+      .set(authH())
+      .send({ productId: 'p1', quantity: 1 });
+    expect(res.status).toBe(409);
+  });
+
+  it('POST /cart/items 503 quando o product-service esta fora', async () => {
+    mockedService.addItem.mockRejectedValue(
+      new Error('PRODUTO_SERVICE_INDISPONIVEL')
+    );
+    const res = await request(app)
+      .post('/cart/items')
+      .set(authH())
+      .send({ productId: 'p1', quantity: 1 });
+    expect(res.status).toBe(503);
   });
 
   it('DELETE /cart esvazia (204)', async () => {

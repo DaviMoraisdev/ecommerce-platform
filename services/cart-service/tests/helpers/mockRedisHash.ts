@@ -8,6 +8,11 @@ export function createMockRedis() {
       const h = store.get(key);
       return h ? Object.fromEntries(h) : {};
     },
+    async hget(key: string, field: string): Promise<string | null> {
+      const h = store.get(key);
+      const v = h ? h.get(field) : undefined;
+      return v === undefined ? null : v;
+    },
     async hincrby(key: string, field: string, incr: number): Promise<number> {
       let h = store.get(key);
       if (!h) {

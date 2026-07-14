@@ -20,7 +20,6 @@ function validateQuantity(quantity: unknown): string | null {
   return null;
 }
 
-// Normaliza (trim) e valida presenca/tamanho. Retorna o id limpo ou null.
 function normalizeProductId(productId: unknown): string | null {
   if (typeof productId !== 'string') return null;
   const trimmed = productId.trim();
@@ -28,9 +27,30 @@ function normalizeProductId(productId: unknown): string | null {
   return trimmed;
 }
 
+// Traduz erro de dominio -> HTTP. Retorna true se tratou.
+function mapCartError(e: unknown, res: Response): boolean {
+  if (!(e instanceof Error)) return false;
+  switch (e.message) {
+    case 'PRODUTO_NAO_ENCONTRADO':
+      res.status(404).json({ error: 'Produto nao encontrado' });
+      return true;
+    case 'ITEM_NAO_ENCONTRADO':
+      res.status(404).json({ error: 'Item nao encontrado no carrinho' });
+      return true;
+    case 'ESTOQUE_INSUFICIENTE':
+      res.status(409).json({ error: 'Estoque insuficiente' });
+      return true;
+    case 'PRODUTO_SERVICE_INDISPONIVEL':
+      res.status(503).json({ error: 'Servico de produto indisponivel' });
+      return true;
+    default:
+      return false;
+  }
+}
+
 export async function getCart(req: Request, res: Response): Promise<void> {
-  const items = await cartService.getCart(getUserId(req));
-  res.status(200).json({ items });
+  const cart = await cartService.getCartDetailed(getUserId(req));
+  res.status(200).json(cart);
 }
 
 export async function addItem(req: Request, res: Response): Promise<void> {
@@ -44,8 +64,12 @@ export async function addItem(req: Request, res: Response): Promise<void> {
     res.status(400).json({ error: qtyErr });
     return;
   }
-  const items = await cartService.addItem(getUserId(req), productId, req.body.quantity);
-  res.status(200).json({ items });
+  try {
+    const items = await cartService.addItem(getUserId(req), productId, req.body.quantity);
+    res.status(200).json({ items });
+  } catch (e: unknown) {
+    if (!mapCartError(e, res)) throw e;
+  }
 }
 
 export async function updateItem(req: Request, res: Response): Promise<void> {
@@ -67,11 +91,7 @@ export async function updateItem(req: Request, res: Response): Promise<void> {
     );
     res.status(200).json({ items });
   } catch (e: unknown) {
-    if (e instanceof Error && e.message === 'ITEM_NAO_ENCONTRADO') {
-      res.status(404).json({ error: 'Item nao encontrado no carrinho' });
-      return;
-    }
-    throw e;
+    if (!mapCartError(e, res)) throw e;
   }
 }
 
