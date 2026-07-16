@@ -100,6 +100,8 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 
 ## ORDER-SERVICE (Fase 4) — quando existir
 
+- **Mensageria (ao reutilizar o padrao do demo RabbitMQ, Bloco 8):** o demo valida so sintaxe (JSON) + shape minimo. No order-service exigir: schema/contrato explicito dos eventos (type/orderId/total/at), testes automatizados (config ausente, retry/esgotamento, evento valido, JSON malformado, schema incorreto, ack/nack, publisher sem consumer), dead-letter queue para invalidos, encerramento gracioso (try/finally + SIGINT/SIGTERM) e retry que distingue falha transitoria de permanente. Levantado nos reviews do PR #35.
+
 - **Release de estoque com ownership real:** amarrar cada reserva a um ID de pedido/usuário e validar posse antes de liberar. Hoje release está restrito a ADMIN/SELLER como mitigação, mas não valida de quem é a reserva.
 
 ---
