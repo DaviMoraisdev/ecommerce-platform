@@ -126,3 +126,6 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - **GET /cart faz N chamadas ao product-service (sem batch):** o enriquecimento chama fetchProduct por item (em paralelo, mas N requisicoes). Para carrinhos grandes, criar endpoint batch no product-service (ex.: GET /products?ids=...) e reduzir a uma chamada. Pode esperar.
 - **Atomicidade escrita+TTL e corrida no PATCH:** addItem/updateQuantity fazem escrita e EXPIRE em comandos separados (se o EXPIRE falhar, item fica sem TTL); e updateQuantity faz HEXISTS e depois HSET (janela de corrida: item removido entre os dois e recriado pelo HSET). Resolver com MULTI/EXEC ou script Lua e adicionar testes de concorrencia. Destino: pass de hardening de concorrencia (Fase 7/10). Baixa probabilidade/baixo impacto no estagio atual. Levantado no review do PR #33.
 - **Erros de dominio como string:** updateQuantity lanca Error('ITEM_NAO_ENCONTRADO') e o controller compara por texto. Migrar para classe/codigo tipado (junto da divida transversal de erros de dominio).
+
+## INFRA (transversal)
+- **Portas de dev publicadas em 0.0.0.0:** postgres/mongo/redis publicam em todas as interfaces no docker-compose. O rabbitmq foi restrito a 127.0.0.1 no PR #35; aplicar o mesmo aos demais e usar credenciais fortes por ambiente. Dev-only, baixa.
