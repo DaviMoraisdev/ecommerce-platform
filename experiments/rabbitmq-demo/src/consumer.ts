@@ -4,6 +4,26 @@ dotenv.config();
 import { connect } from './connection';
 import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY } from './topology';
 
+// Remove caracteres de controle (evita injecao no terminal/log) e trunca.
+function sanitizeForLog(s: string): string {
+  let out = '';
+  for (const ch of s) {
+    const code = ch.charCodeAt(0);
+    out += code < 32 || code === 127 ? '?' : ch;
+  }
+  return out.length > 200 ? out.slice(0, 200) + '...' : out;
+}
+
+// Guard minimo: precisa ser objeto com type string. O contrato completo do
+// evento (orderId/total/at) fica para o order-service (Bloco 8).
+function hasEventShape(v: unknown): boolean {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    typeof (v as { type?: unknown }).type === 'string'
+  );
+}
+
 async function main() {
   const conn = await connect();
   const channel = await conn.createChannel();
@@ -19,17 +39,27 @@ async function main() {
     if (!msg) return;
     const routingKey = msg.fields.routingKey;
     const raw = msg.content.toString();
+
+    let event: unknown;
     try {
-      const event = JSON.parse(raw);
-      console.log('[consumer] recebida (' + routingKey + '): ' + JSON.stringify(event));
-      // ack so APOS processar com sucesso.
-      channel.ack(msg);
+      event = JSON.parse(raw);
     } catch {
-      // Payload invalido: nack sem requeue (evita loop). Numa app real iria
-      // para uma dead-letter queue.
-      console.error('[consumer] payload invalido descartado: ' + raw);
+      console.error(
+        '[consumer] payload nao-JSON descartado (' + raw.length + ' bytes, key ' + routingKey + ')'
+      );
       channel.nack(msg, false, false);
+      return;
     }
+
+    if (!hasEventShape(event)) {
+      console.error('[consumer] evento sem shape valido, nack: ' + sanitizeForLog(raw));
+      channel.nack(msg, false, false);
+      return;
+    }
+
+    // ack so APOS validar (sintaxe + shape minimo).
+    console.log('[consumer] recebida (' + routingKey + '): ' + sanitizeForLog(JSON.stringify(event)));
+    channel.ack(msg);
   });
 }
 

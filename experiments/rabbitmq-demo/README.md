@@ -8,7 +8,8 @@ O order-service (Blocos 5-8) vai reusar este padrao de conexao/publish.
 1. Na raiz do repo: `docker compose up -d rabbitmq` (aguarde ficar healthy:
    `docker compose ps rabbitmq`).
 2. Aqui: `cp .env.example .env` e ajuste a senha do RABBITMQ_URL para bater
-   com RABBITMQ_PASSWORD do `.env` da raiz.
+   com RABBITMQ_PASSWORD do `.env` da raiz. Se a senha tiver
+   caracteres reservados (@ : / #), aplique percent-encoding na URL.
 3. `npm install`
 4. `npm run check` (valida a conexao antes de tudo).
 5. Terminal 1: `npm run consume`  |  Terminal 2: `npm run publish`
