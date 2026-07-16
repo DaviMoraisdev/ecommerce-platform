@@ -1,0 +1,23 @@
+{
+  "name": "rabbitmq-demo",
+  "version": "1.0.0",
+  "description": "Demo isolado de RabbitMQ (Bloco 4, Fase 4)",
+  "private": true,
+  "scripts": {
+    "check": "ts-node src/check.ts",
+    "publish": "ts-node src/publisher.ts",
+    "consume": "ts-node src/consumer.ts"
+  },
+  "author": "DaviMoraisdev",
+  "license": "ISC",
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.5",
+    "@types/node": "^25.9.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}

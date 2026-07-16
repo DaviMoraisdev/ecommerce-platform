@@ -100,6 +100,8 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 
 ## ORDER-SERVICE (Fase 4) — quando existir
 
+- **Mensageria (ao reutilizar o padrao do demo RabbitMQ, Bloco 8):** o demo valida so sintaxe (JSON) + shape minimo. No order-service exigir: schema/contrato explicito dos eventos (type/orderId/total/at), testes automatizados (config ausente, retry/esgotamento, evento valido, JSON malformado, schema incorreto, ack/nack, publisher sem consumer), dead-letter queue para invalidos, encerramento gracioso (try/finally + SIGINT/SIGTERM) e retry que distingue falha transitoria de permanente. Levantado nos reviews do PR #35.
+
 - **Release de estoque com ownership real:** amarrar cada reserva a um ID de pedido/usuário e validar posse antes de liberar. Hoje release está restrito a ADMIN/SELLER como mitigação, mas não valida de quem é a reserva.
 
 ---
@@ -126,3 +128,6 @@ Legenda: ✅ concluído · (sem marca) pendente · sufixo (8a/8b/8c) indica o su
 - **GET /cart faz N chamadas ao product-service (sem batch):** o enriquecimento chama fetchProduct por item (em paralelo, mas N requisicoes). Para carrinhos grandes, criar endpoint batch no product-service (ex.: GET /products?ids=...) e reduzir a uma chamada. Pode esperar.
 - **Atomicidade escrita+TTL e corrida no PATCH:** addItem/updateQuantity fazem escrita e EXPIRE em comandos separados (se o EXPIRE falhar, item fica sem TTL); e updateQuantity faz HEXISTS e depois HSET (janela de corrida: item removido entre os dois e recriado pelo HSET). Resolver com MULTI/EXEC ou script Lua e adicionar testes de concorrencia. Destino: pass de hardening de concorrencia (Fase 7/10). Baixa probabilidade/baixo impacto no estagio atual. Levantado no review do PR #33.
 - **Erros de dominio como string:** updateQuantity lanca Error('ITEM_NAO_ENCONTRADO') e o controller compara por texto. Migrar para classe/codigo tipado (junto da divida transversal de erros de dominio).
+
+## INFRA (transversal)
+- **Portas de dev publicadas em 0.0.0.0:** postgres/mongo/redis publicam em todas as interfaces no docker-compose. O rabbitmq foi restrito a 127.0.0.1 no PR #35; aplicar o mesmo aos demais e usar credenciais fortes por ambiente. Dev-only, baixa.
