@@ -11,6 +11,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Falha ao conectar:', err.message);
+  console.error('Falha ao conectar:', err instanceof Error ? err.message : err);
   process.exit(1);
 });

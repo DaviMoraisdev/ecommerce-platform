@@ -2,17 +2,19 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { connect } from './connection';
+import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY } from './topology';
 
-const EXCHANGE = 'orders';
-const EXCHANGE_TYPE = 'topic';
 const ROUTING_KEY = 'order.created';
 
 async function main() {
   const conn = await connect();
-  // Confirm channel: permite esperar o broker confirmar o recebimento.
   const channel = await conn.createConfirmChannel();
 
+  // Declara a topologia COMPLETA antes de publicar: assim a mensagem e
+  // roteavel mesmo se o consumer ainda nao subiu — a fila duravel a retem.
   await channel.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
+  await channel.assertQueue(QUEUE, { durable: true });
+  await channel.bindQueue(QUEUE, EXCHANGE, BINDING_KEY);
 
   const event = {
     type: 'order.created',
@@ -20,21 +22,20 @@ async function main() {
     total: 100,
     at: new Date().toISOString(),
   };
-  const payload = Buffer.from(JSON.stringify(event));
 
-  // Publica na EXCHANGE com a routing key (nunca direto numa fila).
-  // persistent: a mensagem sobrevive a restart do broker.
-  channel.publish(EXCHANGE, ROUTING_KEY, payload, { persistent: true });
-  // Espera a confirmacao antes de fechar (senao a mensagem pode se perder no buffer).
+  channel.publish(EXCHANGE, ROUTING_KEY, Buffer.from(JSON.stringify(event)), {
+    persistent: true,
+  });
   await channel.waitForConfirms();
 
-  console.log('[publisher] publicado em ' + EXCHANGE + ' (' + ROUTING_KEY + '): ' + JSON.stringify(event));
-
+  console.log(
+    '[publisher] publicado em ' + EXCHANGE + ' (' + ROUTING_KEY + '): ' + JSON.stringify(event)
+  );
   await channel.close();
   await conn.close();
 }
 
 main().catch((err) => {
-  console.error('[publisher] erro:', err.message);
+  console.error('[publisher] erro:', err instanceof Error ? err.message : err);
   process.exit(1);
 });
