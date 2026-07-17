@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrderStatus {
+  PENDENTE
+  PAGO
+  ENVIADO
+  ENTREGUE
+  CANCELADO
+}
+
+model Order {
+  id        String      @id @default(uuid())
+  userId    String
+  status    OrderStatus @default(PENDENTE)
+  total     Decimal     @db.Decimal(12, 2)
+  items     OrderItem[]
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String   @id @default(uuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  quantity  Int
+  unitPrice Decimal  @db.Decimal(12, 2)
+  subtotal  Decimal  @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+
+  // Constraints CHECK via migration: quantity > 0, unitPrice >= 0,
+  // subtotal >= 0 (aqui) e total >= 0 (em orders).
+  @@map("order_items")
+}
