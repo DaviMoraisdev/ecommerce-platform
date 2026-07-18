@@ -1,5 +1,4 @@
 import dotenv from 'dotenv';
-// Carrega as variaveis ANTES de instanciar o PrismaClient.
 dotenv.config();
 
 import { PrismaClient } from '@prisma/client';
@@ -12,7 +11,7 @@ export async function connectDatabase(): Promise<void> {
     await prisma.$connect();
     console.log('Conectado ao PostgreSQL (order_db)');
   } catch (error) {
-    console.error(sanitizeConnectionError(error));
-    process.exit(1);
+    // Lanca erro ja sanitizado; process.exit fica no ponto de entrada.
+    throw new Error(sanitizeConnectionError(error));
   }
 }

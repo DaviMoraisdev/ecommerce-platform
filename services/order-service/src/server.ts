@@ -6,7 +6,7 @@ import { connectDatabase } from './config/database';
 import { validateRequiredEnv, resolvePort } from './config/env';
 
 async function startServer() {
-  // Valida env no ponto de entrada; process.exit fica so aqui.
+  // process.exit fica SO aqui, no ponto de entrada.
   let port: number;
   try {
     validateRequiredEnv();
@@ -15,7 +15,12 @@ async function startServer() {
     console.error(err instanceof Error ? err.message : 'Erro de configuracao');
     process.exit(1);
   }
-  await connectDatabase();
+  try {
+    await connectDatabase();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : 'Erro de conexao');
+    process.exit(1);
+  }
   app.listen(port, () => {
     console.log('Order service rodando na porta ' + port);
   });

@@ -39,5 +39,6 @@ model OrderItem {
 
   // Constraints CHECK via migration: quantity > 0, unitPrice >= 0,
   // subtotal >= 0 (aqui) e total >= 0 (em orders).
+  @@index([orderId])
   @@map("order_items")
 }
