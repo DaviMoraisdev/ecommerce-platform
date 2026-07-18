@@ -1,17 +1,25 @@
 import { prisma } from '../src/config/database';
 
-// Guard: JAMAIS rodar contra um banco que nao seja de teste.
+// Guard triplo antes de qualquer deleteMany: nome EXATO do banco (via pathname),
+// NODE_ENV=test, e opt-in explicito. Qualquer um faltando -> aborta.
 beforeAll(() => {
-  const url = process.env.DATABASE_URL || '';
-  if (!url.includes('order_test_db')) {
+  const raw = process.env.DATABASE_URL || '';
+  let dbName = '';
+  try {
+    dbName = new URL(raw).pathname.replace(/^\//, '');
+  } catch {
+    dbName = '';
+  }
+  const isTestEnv = process.env.NODE_ENV === 'test';
+  const optIn = process.env.ALLOW_TEST_DB_RESET === 'true';
+  if (dbName !== 'order_test_db' || !isTestEnv || !optIn) {
     throw new Error(
-      'Integracao exige order_test_db; DATABASE_URL atual nao e de teste — abortado.'
+      'Guard: integracao exige DATABASE_URL=.../order_test_db, NODE_ENV=test e ALLOW_TEST_DB_RESET=true — abortado.'
     );
   }
 });
 
 afterEach(async () => {
-  // Cascade remove os itens ao apagar as orders.
   await prisma.order.deleteMany();
 });
 
@@ -20,12 +28,13 @@ afterAll(async () => {
 });
 
 describe('schema / migrations (Postgres real)', () => {
-  it('order nasce com status PENDENTE e Decimal exato', async () => {
+  it('order nasce PENDENTE e preserva o decimal (2 casas)', async () => {
     const order = await prisma.order.create({
       data: { userId: 'u1', total: '31.50' },
     });
     expect(order.status).toBe('PENDENTE');
-    expect(Number(order.total)).toBe(31.5);
+    // toFixed(2) preserva a semantica decimal (nao converte para float).
+    expect(order.total.toFixed(2)).toBe('31.50');
   });
 
   it('cascade: apagar a order remove os itens', async () => {
@@ -45,27 +54,27 @@ describe('schema / migrations (Postgres real)', () => {
     expect(items).toHaveLength(0);
   });
 
-  it('rejeita quantity <= 0 (constraint quantity_positiva)', async () => {
+  it('rejeita quantity <= 0 pela constraint quantity_positiva', async () => {
     const order = await prisma.order.create({ data: { userId: 'u1', total: '0.00' } });
     await expect(
       prisma.orderItem.create({
         data: { orderId: order.id, productId: 'p1', quantity: 0, unitPrice: '10.00', subtotal: '0.00' },
       })
-    ).rejects.toThrow();
+    ).rejects.toThrow(/quantity_positiva/);
   });
 
-  it('rejeita subtotal inconsistente (subtotal != unitPrice*quantity)', async () => {
+  it('rejeita subtotal inconsistente pela constraint subtotal_consistente', async () => {
     const order = await prisma.order.create({ data: { userId: 'u1', total: '0.00' } });
     await expect(
       prisma.orderItem.create({
         data: { orderId: order.id, productId: 'p1', quantity: 2, unitPrice: '10.00', subtotal: '99.00' },
       })
-    ).rejects.toThrow();
+    ).rejects.toThrow(/subtotal_consistente/);
   });
 
-  it('rejeita total negativo (constraint total_nao_negativo)', async () => {
+  it('rejeita total negativo pela constraint total_nao_negativo', async () => {
     await expect(
       prisma.order.create({ data: { userId: 'u1', total: '-1.00' } })
-    ).rejects.toThrow();
+    ).rejects.toThrow(/total_nao_negativo/);
   });
 });
