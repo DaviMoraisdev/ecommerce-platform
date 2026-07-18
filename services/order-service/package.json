@@ -7,7 +7,8 @@
     "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.dev.json src/server.ts",
     "build": "tsc --project tsconfig.build.json",
     "start": "node dist/server.js",
-    "test": "jest --ci"
+    "test": "jest --ci",
+    "test:integration": "jest --ci --config jest.integration.config.ts"
   },
   "author": "DaviMoraisdev",
   "license": "ISC",
