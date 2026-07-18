@@ -10,6 +10,8 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 
 ## FASE 4 — ORDER-SERVICE (Blocos 5–8, em andamento)
 
+- **Invariante `total = soma(subtotais)` + criacao transacional do pedido:** o CHECK garante `subtotal = unitPrice*quantity` por item, mas a soma agregada no `orders.total` exige logica transacional. Calcular no servidor e persistir pedido+itens numa unica transacao. Destino: order-service (Bloco 7). Levantado no review do PR #36.
+
 - **Release de estoque com ownership real:** amarrar cada reserva a um ID de pedido/usuário e validar posse antes de liberar. Hoje `release` está restrito a ADMIN/SELLER como mitigação, mas não valida de quem é a reserva. Destino: order-service (Bloco 7).
 - **Mensageria do order-service (Bloco 8):** o demo RabbitMQ valida só sintaxe (JSON) + shape mínimo. Ao reutilizar o padrão no order-service, exigir: schema/contrato explícito dos eventos (`type/orderId/total/at`), testes automatizados (config ausente, retry/esgotamento, evento válido, JSON malformado, schema incorreto, ack/nack, publisher sem consumer), dead-letter queue para inválidos, encerramento gracioso (`try/finally` + SIGINT/SIGTERM) e retry que distingue falha transitória de permanente. Levantado nos reviews do PR #35.
 
@@ -56,6 +58,7 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 
 ## REFATORAÇÃO TRANSVERSAL — destino: pass de refatoração de qualidade junto ao hardening da Fase 7
 
+- **Alinhar `database.ts` do inventory ao padrao do order:** hoje o `connectDatabase` do inventory chama `process.exit` na camada de banco (o order passou a lancar erro sanitizado e centralizar o exit no `server.ts`). Baixa.
 - **Erros de domínio como classes/enums** em vez de strings (`error.message === 'INSUFFICIENT_STOCK'` / `'ITEM_NAO_ENCONTRADO'`). Afeta inventory, product e cart.
 - **Estender o tipo Request do Express** com interface de usuário autenticado, eliminando `(req as any).userId/userRole` em todos os serviços.
 - **DTO explícito `ProductWithAvailability`** para o retorno enriquecido do findProductById (hoje é objeto inline sem tipo nomeado).
