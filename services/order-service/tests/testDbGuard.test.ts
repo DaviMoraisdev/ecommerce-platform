@@ -12,10 +12,20 @@ function setEnv(url: string, nodeEnv?: string, optIn?: string) {
   else process.env.ALLOW_TEST_DB_RESET = optIn;
 }
 
+// process.env.X = undefined vira a STRING 'undefined' no Node — a variavel nao
+// some. Restauracao correta exige delete quando o valor original era ausente.
+function restore(key: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
+
 afterEach(() => {
-  process.env.DATABASE_URL = OLD_URL;
-  process.env.NODE_ENV = OLD_ENV;
-  process.env.ALLOW_TEST_DB_RESET = OLD_OPT;
+  restore('DATABASE_URL', OLD_URL);
+  restore('NODE_ENV', OLD_ENV);
+  restore('ALLOW_TEST_DB_RESET', OLD_OPT);
 });
 
 const OK = 'postgresql://u:p@h:5432/order_test_db';

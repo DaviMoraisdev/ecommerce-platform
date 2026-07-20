@@ -110,6 +110,13 @@ describe('updateOrderStatus', () => {
     expect(await getStatusHistory(order.id)).toHaveLength(0);
   });
 
+  it('normaliza changedBy aparando espacos nas extremidades', async () => {
+    const order = await novoPedido();
+    await updateOrderStatus(order.id, OrderStatus.PAGO, '  admin1  ');
+    const hist = await getStatusHistory(order.id);
+    expect(hist[0].changedBy).toBe('admin1');
+  });
+
   it('rejeita changedBy longo demais', async () => {
     const order = await novoPedido();
     await expect(
