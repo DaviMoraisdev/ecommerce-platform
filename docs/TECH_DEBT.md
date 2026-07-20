@@ -10,6 +10,9 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 
 ## FASE 4 — ORDER-SERVICE (Blocos 5–8, em andamento)
 
+- **Teste de rollback quando a 2a escrita da transacao falha:** provar que, se a gravacao do historico falhar apos o update do status, nada persiste. Forcar essa falha hoje exigiria constraint artificial (app e banco concordam, nao ha brecha) ou mock intrusivo do proxy `tx` do Prisma. A atomicidade vem da semantica do `$transaction`, e o caminho "valida antes de escrever" ja e testado. Destino: rodada de robustez de testes (Fase 10) ou quando o servico ganhar ponto de injecao de falha. Levantado no review do PR #38.
+- **Origem autenticada de `changedBy`:** o servico valida formato (nao-vazio, <=128) e documenta que a identidade deve vir de contexto autenticado, mas hoje e parametro do chamador. A rota do Bloco 7 passara `req.userId` do JWT. Destino: Bloco 7.
+
 - **Invariante `total = soma(subtotais)` + criacao transacional do pedido:** o CHECK garante `subtotal = unitPrice*quantity` por item, mas a soma agregada no `orders.total` exige logica transacional. Calcular no servidor e persistir pedido+itens numa unica transacao. Destino: order-service (Bloco 7). Levantado no review do PR #36.
 
 - **Release de estoque com ownership real:** amarrar cada reserva a um ID de pedido/usuário e validar posse antes de liberar. Hoje `release` está restrito a ADMIN/SELLER como mitigação, mas não valida de quem é a reserva. Destino: order-service (Bloco 7).
