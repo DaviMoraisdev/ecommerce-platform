@@ -6,8 +6,12 @@ const config: Config = {
   roots: ['<rootDir>/tests'],
   clearMocks: true,
   setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
-  testMatch: ['**/schema.integration.test.ts'],
+  testMatch: ['**/*.integration.test.ts'],
   testPathIgnorePatterns: ['/node_modules/'],
+  // Os arquivos de integracao compartilham o MESMO order_test_db. Em paralelo,
+  // o afterEach (deleteMany) de um arquivo apaga os dados de outro em pleno voo.
+  // Serie garante isolamento entre arquivos.
+  maxWorkers: 1,
   transform: {
     '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json' }],
   },
