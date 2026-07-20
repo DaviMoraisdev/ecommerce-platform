@@ -6,13 +6,10 @@ import {
   allowedTransitions,
 } from '../src/domain/order-status';
 
-const TODOS: OrderStatus[] = [
-  OrderStatus.PENDENTE,
-  OrderStatus.PAGO,
-  OrderStatus.ENVIADO,
-  OrderStatus.ENTREGUE,
-  OrderStatus.CANCELADO,
-];
+// Derivado do enum: um status novo entra AUTOMATICAMENTE na varredura,
+// forcando o teste a se posicionar sobre ele (a lista VALIDAS segue manual,
+// para permanecer independente da implementacao).
+const TODOS: OrderStatus[] = Object.values(OrderStatus);
 
 // Fonte de verdade DO TESTE, escrita de forma independente da implementacao:
 // se o teste apenas reimportasse a matriz, nao provaria nada.

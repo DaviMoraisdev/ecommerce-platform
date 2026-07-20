@@ -45,15 +45,26 @@ model OrderItem {
 }
 
 model OrderStatusHistory {
-  id         String      @id @default(uuid())
-  orderId    String
-  order      Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  id String @id @default(uuid())
+
+  // Sequencia monotonica: desempata transicoes gravadas no mesmo milissegundo.
+  // createdAt e TIMESTAMP(3); ordenar so por ele deixa empates em ordem indefinida.
+  seq Int @unique @default(autoincrement())
+
+  orderId String
+
+  // Cascade e DELIBERADO: a aplicacao NUNCA faz hard delete de pedido —
+  // cancelar e transicao de status. Hard delete so ocorre em purga
+  // administrativa, onde remover a trilha junto e intencional.
+  // Politica coberta por teste de integracao.
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
   fromStatus OrderStatus
   toStatus   OrderStatus
   changedBy  String
   createdAt  DateTime    @default(now())
 
-  // CHECK via migration: fromStatus <> toStatus (transicao para si mesmo e invalida).
+  // CHECK via migration: fromStatus <> toStatus.
   @@index([orderId])
   @@map("order_status_history")
 }

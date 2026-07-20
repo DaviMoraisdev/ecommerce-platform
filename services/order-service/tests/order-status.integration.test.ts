@@ -85,9 +85,68 @@ describe('updateOrderStatus', () => {
       updateOrderStatus(order.id, OrderStatus.PAGO, 'u2'),
     ]);
 
-    expect(resultados.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
-    expect(resultados.filter((r) => r.status === 'rejected')).toHaveLength(1);
-    // E o historico registra exatamente UMA transicao.
+    const vencedores = resultados.filter((r) => r.status === 'fulfilled');
+    const perdedores = resultados.filter((r) => r.status === 'rejected');
+    expect(vencedores).toHaveLength(1);
+    expect(perdedores).toHaveLength(1);
+
+    // O motivo da rejeicao tem que ser um dos dois esperados (por CODIGO).
+    const motivo = (perdedores[0] as PromiseRejectedResult).reason;
+    expect(['CONFLITO_DE_ESTADO', 'TRANSICAO_INVALIDA']).toContain(motivo.code);
+
+    // Estado final e trilha coerentes com UMA unica transicao vencedora.
+    const final = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(final.status).toBe(OrderStatus.PAGO);
+    const hist = await getStatusHistory(order.id);
+    expect(hist).toHaveLength(1);
+    expect(['u1', 'u2']).toContain(hist[0].changedBy);
+  });
+
+  it('rejeita changedBy vazio ou so espacos', async () => {
+    const order = await novoPedido();
+    await expect(
+      updateOrderStatus(order.id, OrderStatus.PAGO, '   ')
+    ).rejects.toThrow('AUTOR_INVALIDO');
+    expect(await getStatusHistory(order.id)).toHaveLength(0);
+  });
+
+  it('rejeita changedBy longo demais', async () => {
+    const order = await novoPedido();
+    await expect(
+      updateOrderStatus(order.id, OrderStatus.PAGO, 'x'.repeat(129))
+    ).rejects.toThrow('AUTOR_INVALIDO');
+  });
+
+  it('ordena por sequencia mesmo com createdAt identico', async () => {
+    const order = await novoPedido();
+    const t = new Date();
+    await prisma.orderStatusHistory.create({
+      data: { orderId: order.id, fromStatus: OrderStatus.PENDENTE, toStatus: OrderStatus.PAGO, changedBy: 'a', createdAt: t },
+    });
+    await prisma.orderStatusHistory.create({
+      data: { orderId: order.id, fromStatus: OrderStatus.PAGO, toStatus: OrderStatus.ENVIADO, changedBy: 'b', createdAt: t },
+    });
+    const hist = await getStatusHistory(order.id);
+    expect(hist.map((h) => [h.fromStatus, h.toStatus])).toEqual([
+      [OrderStatus.PENDENTE, OrderStatus.PAGO],
+      [OrderStatus.PAGO, OrderStatus.ENVIADO],
+    ]);
+  });
+
+  it('banco rejeita historico com fromStatus == toStatus', async () => {
+    const order = await novoPedido();
+    await expect(
+      prisma.orderStatusHistory.create({
+        data: { orderId: order.id, fromStatus: OrderStatus.PAGO, toStatus: OrderStatus.PAGO, changedBy: 'a' },
+      })
+    ).rejects.toThrow(/historico_status_diferente/);
+  });
+
+  it('politica deliberada: apagar o pedido remove a trilha (cascade)', async () => {
+    const order = await novoPedido();
+    await updateOrderStatus(order.id, OrderStatus.PAGO, 'admin1');
     expect(await getStatusHistory(order.id)).toHaveLength(1);
+    await prisma.order.delete({ where: { id: order.id } });
+    expect(await getStatusHistory(order.id)).toHaveLength(0);
   });
 });

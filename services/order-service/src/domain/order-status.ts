@@ -1,4 +1,5 @@
 import { OrderStatus } from '@prisma/client';
+import { DomainError } from './errors';
 
 // Matriz de transicoes: para cada status, os destinos permitidos.
 // ENTREGUE e CANCELADO sao terminais (lista vazia).
@@ -17,7 +18,7 @@ export function canTransition(from: OrderStatus, to: OrderStatus): boolean {
 
 export function assertTransition(from: OrderStatus, to: OrderStatus): void {
   if (!canTransition(from, to)) {
-    throw new Error('TRANSICAO_INVALIDA');
+    throw new DomainError('TRANSICAO_INVALIDA');
   }
 }
 
