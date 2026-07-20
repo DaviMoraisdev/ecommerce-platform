@@ -16,13 +16,14 @@ enum OrderStatus {
 }
 
 model Order {
-  id        String      @id @default(uuid())
-  userId    String
-  status    OrderStatus @default(PENDENTE)
-  total     Decimal     @db.Decimal(12, 2)
-  items     OrderItem[]
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+  id            String               @id @default(uuid())
+  userId        String
+  status        OrderStatus          @default(PENDENTE)
+  total         Decimal              @db.Decimal(12, 2)
+  items         OrderItem[]
+  statusHistory OrderStatusHistory[]
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
 
   @@map("orders")
 }
@@ -41,4 +42,18 @@ model OrderItem {
   // subtotal >= 0 (aqui) e total >= 0 (em orders).
   @@index([orderId])
   @@map("order_items")
+}
+
+model OrderStatusHistory {
+  id         String      @id @default(uuid())
+  orderId    String
+  order      Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromStatus OrderStatus
+  toStatus   OrderStatus
+  changedBy  String
+  createdAt  DateTime    @default(now())
+
+  // CHECK via migration: fromStatus <> toStatus (transicao para si mesmo e invalida).
+  @@index([orderId])
+  @@map("order_status_history")
 }
