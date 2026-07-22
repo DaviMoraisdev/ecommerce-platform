@@ -15,7 +15,7 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 
 - **Invariante `total = soma(subtotais)` + criacao transacional do pedido:** o CHECK garante `subtotal = unitPrice*quantity` por item, mas a soma agregada no `orders.total` exige logica transacional. Calcular no servidor e persistir pedido+itens numa unica transacao. Destino: order-service (Bloco 7). Levantado no review do PR #36.
 
-- **Release de estoque com ownership real:** amarrar cada reserva a um ID de pedido/usuário e validar posse antes de liberar. Hoje `release` está restrito a ADMIN/SELLER como mitigação, mas não valida de quem é a reserva. Destino: order-service (Bloco 7).
+- **[PARCIAL — PR 7a] Ownership serviço-a-serviço da reserva:** a posse ESTRUTURAL foi paga no 7a (tabela `reservations` amarrada ao `orderId`; `release(orderId)` só toca reservas daquele pedido). Falta a camada de AUTORIZACAO: hoje qualquer ADMIN/SELLER autenticado libera qualquer `orderId`. A garantia "so o order-service (ou o dono do pedido) libera" exige autenticacao servico-a-servico (token interno/mTLS) — Fase 7. O 7b usara um token de servico como ponte.
 - **Mensageria do order-service (Bloco 8):** o demo RabbitMQ valida só sintaxe (JSON) + shape mínimo. Ao reutilizar o padrão no order-service, exigir: schema/contrato explícito dos eventos (`type/orderId/total/at`), testes automatizados (config ausente, retry/esgotamento, evento válido, JSON malformado, schema incorreto, ack/nack, publisher sem consumer), dead-letter queue para inválidos, encerramento gracioso (`try/finally` + SIGINT/SIGTERM) e retry que distingue falha transitória de permanente. Levantado nos reviews do PR #35.
 
 ---
