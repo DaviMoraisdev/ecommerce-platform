@@ -120,6 +120,37 @@ describe('stock.service - logica de estoque', () => {
     });
   });
 
+    it('idempotente: reservar o mesmo pedido+produto de novo retorna a existente', async () => {
+      const id = novoId();
+      const oid = novoOrderId();
+      await setStock(id, 10);
+      const primeira = await reserveStock(id, 3, oid);
+      const segunda = await reserveStock(id, 3, oid);
+      expect(segunda.reservationId).toBe(primeira.reservationId);
+      const av = await getAvailability(id);
+      expect(av?.reserved).toBe(3); // nao debitou 2x
+      const ativas = (await getReservations(oid)).filter((r) => r.status === 'ACTIVE');
+      expect(ativas).toHaveLength(1);
+    });
+    it('rejeita amount string (INVALID_AMOUNT)', async () => {
+      const id = novoId();
+      await setStock(id, 10);
+      await expect(reserveStock(id, '3' as any, novoOrderId())).rejects.toThrow('INVALID_AMOUNT');
+    });
+    it('rejeita orderId nao-string ou longo demais (INVALID_ORDER_ID)', async () => {
+      const id = novoId();
+      await setStock(id, 10);
+      await expect(reserveStock(id, 3, 123 as any)).rejects.toThrow('INVALID_ORDER_ID');
+      await expect(reserveStock(id, 3, 'x'.repeat(200))).rejects.toThrow('INVALID_ORDER_ID');
+    });
+    it('normaliza orderId (trim) ao reservar', async () => {
+      const id = novoId();
+      const oid = novoOrderId();
+      await setStock(id, 10);
+      await reserveStock(id, 2, '  ' + oid + '  ');
+      expect(await getReservations(oid)).toHaveLength(1);
+    });
+
   describe('releaseByOrder', () => {
     it('libera todas as reservas do pedido e devolve o estoque', async () => {
       const id = novoId();

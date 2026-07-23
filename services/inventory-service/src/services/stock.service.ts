@@ -63,10 +63,29 @@ export async function reserveStock(
   if (typeof orderId !== 'string' || orderId.trim() === '') {
     throw new Error('INVALID_ORDER_ID');
   }
+  const oid = orderId.trim();
+  if (oid.length > 128) {
+    throw new Error('INVALID_ORDER_ID');
+  }
 
   return prisma.$transaction(async (tx) => {
-    // Incremento ATOMICO do reserved (guard available >= amount). Se outra
-    // reserva concorrente esvaziou o estoque, este UPDATE afeta 0 linhas.
+    // IDEMPOTENCIA: se ja existe reserva ACTIVE para este pedido+produto,
+    // retorna a existente SEM debitar de novo (retry por timeout e seguro).
+    const existente = await tx.reservation.findFirst({
+      where: { orderId: oid, productId, status: 'ACTIVE' },
+    });
+    if (existente) {
+      const inv = await tx.inventory.findUniqueOrThrow({ where: { productId } });
+      return {
+        reservationId: existente.id,
+        productId,
+        quantity: inv.quantity,
+        reserved: inv.reserved,
+        available: inv.quantity - inv.reserved,
+      };
+    }
+
+    // Debito ATOMICO (guard contra corrida no proprio WHERE).
     const affected = await tx.$executeRaw`
       UPDATE inventory
       SET reserved = reserved + ${amount}, "updatedAt" = NOW()
@@ -81,9 +100,11 @@ export async function reserveStock(
       throw new Error('INSUFFICIENT_STOCK');
     }
 
-    // A reserva so nasce se o estoque foi debitado — as duas na mesma transacao.
+    // A unique PARCIAL (orderId, productId) WHERE ACTIVE protege contra corrida:
+    // dois reserves simultaneos do mesmo pedido+produto -> um cria, o outro
+    // falha o create e reverte a transacao inteira (o debito volta).
     const reservation = await tx.reservation.create({
-      data: { productId, quantity: amount, orderId, status: 'ACTIVE' },
+      data: { productId, quantity: amount, orderId: oid, status: 'ACTIVE' },
     });
 
     const inv = await tx.inventory.findUniqueOrThrow({ where: { productId } });
@@ -101,35 +122,46 @@ export async function releaseByOrder(orderId: string) {
   if (typeof orderId !== 'string' || orderId.trim() === '') {
     throw new Error('INVALID_ORDER_ID');
   }
+  const oid = orderId.trim();
+  if (oid.length > 128) {
+    throw new Error('INVALID_ORDER_ID');
+  }
 
   return prisma.$transaction(async (tx) => {
-    // Posse estrutural: so tocamos reservas ATIVAS DESTE pedido.
-    const ativas = await tx.reservation.findMany({
-      where: { orderId, status: 'ACTIVE' },
-    });
+    // CLAIM ATOMICO: transicao condicional ACTIVE -> RELEASED, retornando
+    // apenas as linhas que ESTA transacao reivindicou. Uma release concorrente
+    // do mesmo pedido nao reivindica de novo (ja nao ha ACTIVE) -> sem duplo debito.
+    const claimed = await tx.$queryRaw<Array<{ productId: string; quantity: number }>>`
+      UPDATE reservations
+      SET status = 'RELEASED'::"ReservationStatus", "releasedAt" = NOW()
+      WHERE "orderId" = ${oid} AND status = 'ACTIVE'::"ReservationStatus"
+      RETURNING "productId", quantity
+    `;
 
-    for (const r of ativas) {
-      // Devolve o estoque (guard reserved >= quantity como rede de seguranca).
-      await tx.$executeRaw`
+    // Ordem deterministica de lock (evita deadlock entre releases concorrentes
+    // de pedidos que compartilham produtos).
+    claimed.sort((a, b) => a.productId.localeCompare(b.productId));
+
+    for (const r of claimed) {
+      const affected = await tx.$executeRaw`
         UPDATE inventory
         SET reserved = reserved - ${r.quantity}, "updatedAt" = NOW()
-        WHERE "productId" = ${r.productId}
-          AND reserved >= ${r.quantity}
+        WHERE "productId" = ${r.productId} AND reserved >= ${r.quantity}
       `;
-      await tx.reservation.update({
-        where: { id: r.id },
-        data: { status: 'RELEASED', releasedAt: new Date() },
-      });
+      // Se o estoque NAO pode ser devolvido, aborta TUDO (o claim tambem reverte).
+      // Nao ha mais "sucesso falso" com a reserva marcada RELEASED sem devolucao.
+      if (affected !== 1) {
+        throw new Error('INCONSISTENCIA_RESERVA');
+      }
     }
 
-    // Idempotente: sem reservas ativas -> released: 0, sem erro.
-    return { orderId, released: ativas.length };
+    return { orderId: oid, released: claimed.length };
   });
 }
 
 export async function getReservations(orderId: string) {
   return prisma.reservation.findMany({
-    where: { orderId },
+    where: { orderId: orderId.trim() },
     orderBy: { createdAt: 'asc' },
   });
 }
