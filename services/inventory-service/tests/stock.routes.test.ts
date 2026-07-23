@@ -115,6 +115,36 @@ describe('POST /stock/reserve (reserve) — autenticado (qualquer papel logado)'
   });
 });
 
+describe('POST /stock/reserve — idempotencia e conflitos (409)', () => {
+  it('retry apos liberar -> 409 (RESERVA_JA_LIBERADA)', async () => {
+    const productId = pid('re-lib');
+    const orderId = novoOrderId();
+    await seedStockOk(productId, 10);
+    await reserveStockOk(productId, 3, orderId);
+    const rel = await request(app)
+      .post('/stock/release')
+      .set('Authorization', authHeader('ADMIN'))
+      .send({ orderId });
+    expect(rel.status).toBe(200);
+    const res = await request(app)
+      .post('/stock/reserve')
+      .set('Authorization', authHeader('BUYER'))
+      .send({ productId, amount: 3, orderId });
+    expect(res.status).toBe(409);
+  });
+  it('retry com quantidade divergente -> 409 (RESERVA_QUANTIDADE_DIVERGENTE)', async () => {
+    const productId = pid('re-div');
+    const orderId = novoOrderId();
+    await seedStockOk(productId, 10);
+    await reserveStockOk(productId, 3, orderId);
+    const res = await request(app)
+      .post('/stock/reserve')
+      .set('Authorization', authHeader('BUYER'))
+      .send({ productId, amount: 5, orderId });
+    expect(res.status).toBe(409);
+  });
+});
+
 describe('POST /stock/release (release por orderId) — ADMIN/SELLER', () => {
   it('sem token -> 401', async () => {
     const res = await request(app).post('/stock/release').send({ orderId: novoOrderId() });
