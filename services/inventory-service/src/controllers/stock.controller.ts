@@ -34,6 +34,14 @@ function handleError(error: any, res: Response): void {
     res.status(409).json({ error: 'Liberacao invalida: reserva inexistente ou menor que o solicitado' });
     return;
   }
+  if (error.message === 'RESERVA_JA_LIBERADA') {
+    res.status(409).json({ error: 'Reserva ja foi liberada; nao pode ser refeita' });
+    return;
+  }
+  if (error.message === 'RESERVA_QUANTIDADE_DIVERGENTE') {
+    res.status(409).json({ error: 'Reserva ja existe com quantidade diferente' });
+    return;
+  }
   if (error.message === 'INCONSISTENCIA_RESERVA') {
     res.status(500).json({ error: 'Inconsistencia ao liberar reserva' });
     return;

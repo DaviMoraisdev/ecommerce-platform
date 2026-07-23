@@ -132,6 +132,26 @@ describe('stock.service - logica de estoque', () => {
       const ativas = (await getReservations(oid)).filter((r) => r.status === 'ACTIVE');
       expect(ativas).toHaveLength(1);
     });
+    it('P1: retry APOS liberar rejeita e NAO re-debita (RESERVA_JA_LIBERADA)', async () => {
+      const id = novoId();
+      const oid = novoOrderId();
+      await setStock(id, 10);
+      await reserveStock(id, 3, oid);
+      await releaseByOrder(oid);
+      await expect(reserveStock(id, 3, oid)).rejects.toThrow('RESERVA_JA_LIBERADA');
+      const av = await getAvailability(id);
+      expect(av?.reserved).toBe(0); // liberado continua liberado, sem re-debito
+    });
+    it('P2: retry com quantidade diferente e rejeitado sem alterar (RESERVA_QUANTIDADE_DIVERGENTE)', async () => {
+      const id = novoId();
+      const oid = novoOrderId();
+      await setStock(id, 10);
+      await reserveStock(id, 3, oid);
+      await expect(reserveStock(id, 5, oid)).rejects.toThrow('RESERVA_QUANTIDADE_DIVERGENTE');
+      const av = await getAvailability(id);
+      expect(av?.reserved).toBe(3); // mantem 3, nao vira 5 nem soma
+    });
+
     it('rejeita amount string (INVALID_AMOUNT)', async () => {
       const id = novoId();
       await setStock(id, 10);

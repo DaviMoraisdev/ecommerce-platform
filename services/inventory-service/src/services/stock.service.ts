@@ -69,12 +69,21 @@ export async function reserveStock(
   }
 
   return prisma.$transaction(async (tx) => {
-    // IDEMPOTENCIA: se ja existe reserva ACTIVE para este pedido+produto,
-    // retorna a existente SEM debitar de novo (retry por timeout e seguro).
+    // IDEMPOTENCIA por identidade logica (orderId, productId) — QUALQUER status.
+    // A reserva de um produto num pedido e uma operacao de uma vez so.
     const existente = await tx.reservation.findFirst({
-      where: { orderId: oid, productId, status: 'ACTIVE' },
+      where: { orderId: oid, productId },
     });
     if (existente) {
+      // P1: retry APOS liberar nao pode re-debitar — o ciclo ja se encerrou.
+      if (existente.status === 'RELEASED') {
+        throw new Error('RESERVA_JA_LIBERADA');
+      }
+      // P2: idempotente so se a quantidade bate; divergencia e conflito
+      // (nao devolve sucesso silencioso com quantidade menor).
+      if (existente.quantity !== amount) {
+        throw new Error('RESERVA_QUANTIDADE_DIVERGENTE');
+      }
       const inv = await tx.inventory.findUniqueOrThrow({ where: { productId } });
       return {
         reservationId: existente.id,
