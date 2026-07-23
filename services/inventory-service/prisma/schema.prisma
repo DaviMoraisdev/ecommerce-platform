@@ -19,3 +19,23 @@ model Inventory {
   // quantity >= 0, reserved >= 0, reserved <= quantity
   @@map("inventory")
 }
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+}
+
+model Reservation {
+  id         String            @id @default(uuid())
+  productId  String
+  quantity   Int
+  orderId    String
+  status     ReservationStatus @default(ACTIVE)
+  createdAt  DateTime          @default(now())
+  releasedAt DateTime?
+
+  // CHECK via migration: quantity > 0.
+  @@index([orderId])
+  @@index([productId])
+  @@map("reservations")
+}

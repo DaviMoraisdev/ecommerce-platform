@@ -14,6 +14,10 @@ function handleError(error: any, res: Response): void {
     res.status(400).json({ error: 'productId invalido' });
     return;
   }
+  if (error.message === 'INVALID_ORDER_ID') {
+    res.status(400).json({ error: 'orderId invalido' });
+    return;
+  }
   if (error.message === 'QUANTITY_BELOW_RESERVED') {
     res.status(409).json({ error: 'A nova quantidade e menor que o estoque ja reservado' });
     return;
@@ -28,6 +32,18 @@ function handleError(error: any, res: Response): void {
   }
   if (error.message === 'INVALID_RELEASE') {
     res.status(409).json({ error: 'Liberacao invalida: reserva inexistente ou menor que o solicitado' });
+    return;
+  }
+  if (error.message === 'RESERVA_JA_LIBERADA') {
+    res.status(409).json({ error: 'Reserva ja foi liberada; nao pode ser refeita' });
+    return;
+  }
+  if (error.message === 'RESERVA_QUANTIDADE_DIVERGENTE') {
+    res.status(409).json({ error: 'Reserva ja existe com quantidade diferente' });
+    return;
+  }
+  if (error.message === 'INCONSISTENCIA_RESERVA') {
+    res.status(500).json({ error: 'Inconsistencia ao liberar reserva' });
     return;
   }
   res.status(500).json({ error: 'Erro interno do servidor' });
@@ -63,12 +79,12 @@ export async function getAvailability(req: Request, res: Response): Promise<void
 
 export async function reserve(req: Request, res: Response): Promise<void> {
   try {
-    const { productId, amount } = req.body;
-    if (!productId || amount === undefined) {
-      res.status(400).json({ error: 'productId e amount sao obrigatorios' });
+    const { productId, amount, orderId } = req.body;
+    if (!productId || amount === undefined || !orderId) {
+      res.status(400).json({ error: 'productId, amount e orderId sao obrigatorios' });
       return;
     }
-    const result = await stockService.reserveStock(productId, amount);
+    const result = await stockService.reserveStock(productId, amount, orderId);
     res.status(200).json(result);
   } catch (error: any) {
     handleError(error, res);
@@ -77,12 +93,12 @@ export async function reserve(req: Request, res: Response): Promise<void> {
 
 export async function release(req: Request, res: Response): Promise<void> {
   try {
-    const { productId, amount } = req.body;
-    if (!productId || amount === undefined) {
-      res.status(400).json({ error: 'productId e amount sao obrigatorios' });
+    const { orderId } = req.body;
+    if (!orderId) {
+      res.status(400).json({ error: 'orderId e obrigatorio' });
       return;
     }
-    const result = await stockService.releaseStock(productId, amount);
+    const result = await stockService.releaseByOrder(orderId);
     res.status(200).json(result);
   } catch (error: any) {
     handleError(error, res);
