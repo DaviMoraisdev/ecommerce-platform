@@ -105,57 +105,15 @@ describe('stock.service - logica de estoque', () => {
       await setStock(id, 10);
       await expect(reserveStock(id, 0, novoOrderId())).rejects.toThrow('INVALID_AMOUNT');
     });
-    it('rejeita orderId vazio (INVALID_ORDER_ID)', async () => {
-      const id = novoId();
-      await setStock(id, 10);
-      await expect(reserveStock(id, 3, '   ')).rejects.toThrow('INVALID_ORDER_ID');
-    });
-    it('falha na reserva NAO deixa estoque debitado (transacao atomica)', async () => {
-      const id = novoId();
-      await setStock(id, 5);
-      await expect(reserveStock(id, 10, novoOrderId())).rejects.toThrow();
-      const av = await getAvailability(id);
-      expect(av?.reserved).toBe(0);
-      expect(av?.available).toBe(5);
-    });
-  });
-
-    it('idempotente: reservar o mesmo pedido+produto de novo retorna a existente', async () => {
-      const id = novoId();
-      const oid = novoOrderId();
-      await setStock(id, 10);
-      const primeira = await reserveStock(id, 3, oid);
-      const segunda = await reserveStock(id, 3, oid);
-      expect(segunda.reservationId).toBe(primeira.reservationId);
-      const av = await getAvailability(id);
-      expect(av?.reserved).toBe(3); // nao debitou 2x
-      const ativas = (await getReservations(oid)).filter((r) => r.status === 'ACTIVE');
-      expect(ativas).toHaveLength(1);
-    });
-    it('P1: retry APOS liberar rejeita e NAO re-debita (RESERVA_JA_LIBERADA)', async () => {
-      const id = novoId();
-      const oid = novoOrderId();
-      await setStock(id, 10);
-      await reserveStock(id, 3, oid);
-      await releaseByOrder(oid);
-      await expect(reserveStock(id, 3, oid)).rejects.toThrow('RESERVA_JA_LIBERADA');
-      const av = await getAvailability(id);
-      expect(av?.reserved).toBe(0); // liberado continua liberado, sem re-debito
-    });
-    it('P2: retry com quantidade diferente e rejeitado sem alterar (RESERVA_QUANTIDADE_DIVERGENTE)', async () => {
-      const id = novoId();
-      const oid = novoOrderId();
-      await setStock(id, 10);
-      await reserveStock(id, 3, oid);
-      await expect(reserveStock(id, 5, oid)).rejects.toThrow('RESERVA_QUANTIDADE_DIVERGENTE');
-      const av = await getAvailability(id);
-      expect(av?.reserved).toBe(3); // mantem 3, nao vira 5 nem soma
-    });
-
     it('rejeita amount string (INVALID_AMOUNT)', async () => {
       const id = novoId();
       await setStock(id, 10);
       await expect(reserveStock(id, '3' as any, novoOrderId())).rejects.toThrow('INVALID_AMOUNT');
+    });
+    it('rejeita orderId vazio (INVALID_ORDER_ID)', async () => {
+      const id = novoId();
+      await setStock(id, 10);
+      await expect(reserveStock(id, 3, '   ')).rejects.toThrow('INVALID_ORDER_ID');
     });
     it('rejeita orderId nao-string ou longo demais (INVALID_ORDER_ID)', async () => {
       const id = novoId();
@@ -170,6 +128,46 @@ describe('stock.service - logica de estoque', () => {
       await reserveStock(id, 2, '  ' + oid + '  ');
       expect(await getReservations(oid)).toHaveLength(1);
     });
+    it('falha na reserva NAO deixa estoque debitado (transacao atomica)', async () => {
+      const id = novoId();
+      await setStock(id, 5);
+      await expect(reserveStock(id, 10, novoOrderId())).rejects.toThrow();
+      const av = await getAvailability(id);
+      expect(av?.reserved).toBe(0);
+      expect(av?.available).toBe(5);
+    });
+    it('idempotente: reservar o mesmo pedido+produto de novo retorna a existente', async () => {
+      const id = novoId();
+      const oid = novoOrderId();
+      await setStock(id, 10);
+      const primeira = await reserveStock(id, 3, oid);
+      const segunda = await reserveStock(id, 3, oid);
+      expect(segunda.reservationId).toBe(primeira.reservationId);
+      const av = await getAvailability(id);
+      expect(av?.reserved).toBe(3);
+      const ativas = (await getReservations(oid)).filter((r) => r.status === 'ACTIVE');
+      expect(ativas).toHaveLength(1);
+    });
+    it('P1: retry APOS liberar rejeita e NAO re-debita (RESERVA_JA_LIBERADA)', async () => {
+      const id = novoId();
+      const oid = novoOrderId();
+      await setStock(id, 10);
+      await reserveStock(id, 3, oid);
+      await releaseByOrder(oid);
+      await expect(reserveStock(id, 3, oid)).rejects.toThrow('RESERVA_JA_LIBERADA');
+      const av = await getAvailability(id);
+      expect(av?.reserved).toBe(0);
+    });
+    it('P2: retry com quantidade diferente e rejeitado sem alterar (RESERVA_QUANTIDADE_DIVERGENTE)', async () => {
+      const id = novoId();
+      const oid = novoOrderId();
+      await setStock(id, 10);
+      await reserveStock(id, 3, oid);
+      await expect(reserveStock(id, 5, oid)).rejects.toThrow('RESERVA_QUANTIDADE_DIVERGENTE');
+      const av = await getAvailability(id);
+      expect(av?.reserved).toBe(3);
+    });
+  });
 
   describe('releaseByOrder', () => {
     it('libera todas as reservas do pedido e devolve o estoque', async () => {
@@ -186,7 +184,6 @@ describe('stock.service - logica de estoque', () => {
       const reservas = await getReservations(oid);
       expect(reservas[0].status).toBe('RELEASED');
     });
-
     it('posse: release do pedido A nao toca as reservas do pedido B', async () => {
       const id = novoId();
       const orderA = novoOrderId();
@@ -194,14 +191,11 @@ describe('stock.service - logica de estoque', () => {
       await setStock(id, 10);
       await reserveStock(id, 3, orderA);
       await reserveStock(id, 2, orderB);
-
       await releaseByOrder(orderA);
-
       const av = await getAvailability(id);
-      expect(av?.reserved).toBe(2); // so os 2 de B seguem reservados
+      expect(av?.reserved).toBe(2);
       expect(av?.available).toBe(8);
     });
-
     it('idempotente: release de pedido ja liberado retorna released 0', async () => {
       const id = novoId();
       const oid = novoOrderId();
@@ -210,12 +204,10 @@ describe('stock.service - logica de estoque', () => {
       await releaseByOrder(oid);
       expect(await releaseByOrder(oid)).toEqual({ orderId: oid, released: 0 });
     });
-
     it('release de pedido sem reservas retorna released 0 (sem erro)', async () => {
       const result = await releaseByOrder('order-inexistente-' + Date.now());
       expect(result.released).toBe(0);
     });
-
     it('rejeita orderId vazio (INVALID_ORDER_ID)', async () => {
       await expect(releaseByOrder('  ')).rejects.toThrow('INVALID_ORDER_ID');
     });
