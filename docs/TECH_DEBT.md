@@ -10,6 +10,10 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 
 ## FASE 4 — ORDER-SERVICE (Blocos 5–8, em andamento)
 
+- **[EXCECAO DE SEGURANCA ACEITA — Fase 7] Token de servico do order-service (role ADMIN):** o order assina um token ADMIN com o segredo compartilhado para chamar reserve/release do inventory. NAO e "divida paga" — e mitigacao aceita. O segredo compartilhado JA permite forjar qualquer token, entao o order usar ADMIN nao amplia o raio de ataque existente. Correcao real: identidade por servico (chaves assimetricas/mTLS) + issuer/audience/scopes (ex.: inventory:reserve). Fase 7. Levantado no review do PR #41.
+- **[Fase 10] Processor de reconciliacao das compensacoes:** a persistencia durável (tabela `pending_compensations`) foi feita no 7b; falta o job que reprocessa o `release` onde `resolvedAt` e null, com retry/backoff idempotente, metricas e alerta.
+- **[Fase 7] Limpeza do carrinho por versao/CAS:** hoje o checkout remove SO os itens comprados por productId (item-level — produtos novos adicionados durante o checkout sobrevivem). Um CAS por versao preservaria tambem mudancas de QUANTIDADE. Exige versionamento no cart-service.
+
 - **Reconciliacao de compensacao da saga (createOrder):** se o `release` de compensacao falhar, o pedido nao e criado mas as reservas podem ficar presas (a falha e logada e o erro original propagado — decisao 2A). Como o `release` e idempotente, um job de limpeza/retry (ou reprocessamento por evento) reconcilia. Destino: Fase 10 (resiliencia/jobs). Tambem: falha ao limpar o carrinho apos o pedido criado e apenas logada (efeito menor).
 
 - **Teste de rollback quando a 2a escrita da transacao falha:** provar que, se a gravacao do historico falhar apos o update do status, nada persiste. Forcar essa falha hoje exigiria constraint artificial (app e banco concordam, nao ha brecha) ou mock intrusivo do proxy `tx` do Prisma. A atomicidade vem da semantica do `$transaction`, e o caminho "valida antes de escrever" ja e testado. Destino: rodada de robustez de testes (Fase 10) ou quando o servico ganhar ponto de injecao de falha. Levantado no review do PR #38.

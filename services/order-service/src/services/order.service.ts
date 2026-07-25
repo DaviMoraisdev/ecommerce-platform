@@ -1,4 +1,4 @@
-import { Order, OrderStatus } from '@prisma/client';
+import { Order, OrderStatus, Prisma } from '@prisma/client';
 import { prisma } from '../config/database';
 import { assertTransition } from '../domain/order-status';
 import { randomUUID } from 'node:crypto';
@@ -76,19 +76,42 @@ interface ItemPedido {
 // Valida o carrinho e monta os itens do pedido, recalculando o subtotal e o
 // total NO SERVIDOR (nunca confia num total pronto). Rejeita carrinho vazio ou
 // com item sem preco (parcial) — nao da para cobrar sem preco.
+function ehItemValido(i: any): boolean {
+  return (
+    typeof i === 'object' &&
+    i !== null &&
+    typeof i.productId === 'string' &&
+    i.productId.trim() !== '' &&
+    Number.isInteger(i.quantity) &&
+    i.quantity > 0 &&
+    typeof i.price === 'number' &&
+    Number.isFinite(i.price) &&
+    i.price >= 0
+  );
+}
+
+// Valida a resposta do cart-service em RUNTIME (o cast do TS nao garante nada).
+// Recalcula subtotal/total no servidor. Item estruturalmente invalido =
+// contrato quebrado da dependencia (CARRINHO_INVALIDO -> 502).
 function montarItens(cart: cartClient.DetailedCart): {
   itens: ItemPedido[];
   total: number;
 } {
+  if (!cart || !Array.isArray(cart.items)) {
+    throw new DomainError('CARRINHO_INVALIDO');
+  }
   if (cart.items.length === 0) {
     throw new DomainError('CARRINHO_VAZIO');
   }
   if (cart.partial) {
     throw new DomainError('CARRINHO_SEM_PRECO');
   }
-  const itens = cart.items.map((i) => {
-    if (i.price === null) {
+  const itens = cart.items.map((i: any) => {
+    if (i && i.price === null) {
       throw new DomainError('CARRINHO_SEM_PRECO');
+    }
+    if (!ehItemValido(i)) {
+      throw new DomainError('CARRINHO_INVALIDO');
     }
     const subtotal = Math.round(i.price * i.quantity * 100) / 100;
     return {
@@ -108,66 +131,118 @@ function montarItens(cart: cartClient.DetailedCart): {
 //   4. cria order+itens numa transacao  5. limpa o carrinho
 // Falhou depois de reservar? -> release(orderId) desfaz. release do inventory
 // e idempotente, entao seguro reexecutar.
-export async function createOrder(userId: string, userToken: string) {
-  const orderId = randomUUID();
+export async function createOrder(
+  userId: string,
+  userToken: string,
+  idempotencyKey: string
+) {
+  // Idempotencia (chave estavel do cliente): retry retorna o pedido existente,
+  // sem reservar nem criar de novo.
+  const existente = await prisma.order.findUnique({
+    where: { idempotencyKey },
+    include: { items: true },
+  });
+  if (existente) return existente;
 
-  // 2. Carrinho (token do USUARIO) + validacao/total no servidor.
+  const orderId = randomUUID();
   const cart = await cartClient.getCart(userToken);
   const { itens, total } = montarItens(cart);
 
-  // 3. Reserva por item, amarrada ao orderId (token de SERVICO no client).
-  //    Se qualquer reserva falhar, compensa e propaga.
-  const reservados: string[] = [];
   try {
     for (const item of itens) {
       await inventoryClient.reserve(item.productId, item.quantity, orderId);
-      reservados.push(item.productId);
     }
 
-    // 4. Persiste order + itens na MESMA transacao (total do servidor).
-    const order = await prisma.$transaction(async (tx) => {
-      return tx.order.create({
+    let order;
+    try {
+      order = await prisma.order.create({
         data: {
           id: orderId,
           userId,
           status: 'PENDENTE',
           total,
+          idempotencyKey,
           items: { create: itens },
         },
         include: { items: true },
       });
-    });
-
-    // 5. Limpa o carrinho. Falha aqui NAO desfaz o pedido (ja pago/reservado);
-    //    o pior caso e um carrinho nao esvaziado, corrigivel depois.
-    try {
-      await cartClient.clearCart(userToken);
-    } catch {
-      console.warn('[order] pedido ' + orderId + ' criado, mas limpar o carrinho falhou');
+    } catch (e) {
+      // Concorrencia com a MESMA chave: outro request criou primeiro.
+      // Compensa as reservas DESTE perdedor e devolve o pedido vencedor.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        await compensar(orderId, e);
+        const vencedor = await prisma.order.findUnique({
+          where: { idempotencyKey },
+          include: { items: true },
+        });
+        if (vencedor) return vencedor;
+      }
+      throw e;
     }
 
+    // Remove SO os itens comprados: o que o usuario adicionou durante o
+    // checkout sobrevive. Falha aqui e apenas logada.
+    await removerItensComprados(userToken, itens);
     return order;
   } catch (err) {
-    // COMPENSACAO: desfaz as reservas ja feitas.
     await compensar(orderId, err);
     throw err;
   }
 }
 
-// Compensa liberando as reservas. Se o proprio release falhar, loga o
-// incidente (reservas presas) e NAO mascara o erro original. Reconciliacao
-// (retry/job) fica como divida — release e idempotente.
+async function removerItensComprados(
+  userToken: string,
+  itens: ItemPedido[]
+): Promise<void> {
+  for (const item of itens) {
+    try {
+      await cartClient.removeItem(item.productId, userToken);
+    } catch {
+      console.warn('[order] falha ao remover ' + item.productId + ' do carrinho');
+    }
+  }
+}
+
+// Registro DURAVEL: se o release de compensacao falhar, persiste a pendencia
+// (sobrevive a restart). Um job (Fase 10) reprocessa onde resolvedAt e null.
+async function registrarCompensacaoPendente(orderId: string, reason: string): Promise<void> {
+  try {
+    await prisma.pendingCompensation.create({ data: { orderId, reason } });
+  } catch {
+    console.error('[order] falha ate ao registrar compensacao pendente de ' + orderId);
+  }
+}
+
 async function compensar(orderId: string, erroOriginal: unknown): Promise<void> {
   try {
     await inventoryClient.release(orderId);
   } catch (releaseErr) {
-    const motivo = releaseErr instanceof Error ? releaseErr.message : releaseErr;
-    const orig = erroOriginal instanceof Error ? erroOriginal.message : erroOriginal;
-    console.error(
-      '[order] COMPENSACAO FALHOU para ' + orderId +
-      ' (reservas podem ficar presas). release=' + motivo + ' erroOriginal=' + orig
-    );
+    const motivo = releaseErr instanceof Error ? releaseErr.message : String(releaseErr);
+    const orig = erroOriginal instanceof Error ? erroOriginal.message : String(erroOriginal);
+    console.error('[order] COMPENSACAO FALHOU para ' + orderId + ' release=' + motivo + ' erroOriginal=' + orig);
+    await registrarCompensacaoPendente(orderId, 'release_falhou:' + motivo);
   }
+}
+
+// Orquestra a mudanca de status: aplica a transicao (Bloco 6) e, se CANCELADO,
+// libera as reservas no inventory. O status e a fonte da verdade; se o release
+// falhar, loga para reconciliacao (o release e idempotente).
+export async function changeOrderStatus(
+  orderId: string,
+  newStatus: OrderStatus,
+  changedBy: string
+) {
+  const order = await updateOrderStatus(orderId, newStatus, changedBy);
+  if (newStatus === OrderStatus.CANCELADO) {
+    try {
+      await inventoryClient.release(orderId);
+    } catch (e) {
+      const motivo = e instanceof Error ? e.message : String(e);
+      console.error('[order] cancelamento de ' + orderId + ' nao liberou o estoque: ' + motivo);
+      await registrarCompensacaoPendente(orderId, 'cancel_release_falhou:' + motivo);
+    }
+  }
+  return order;
 }
 
 export async function getOrderById(orderId: string) {

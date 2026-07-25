@@ -45,17 +45,29 @@ export async function getCart(userToken: string): Promise<DetailedCart> {
   if (!res.ok) {
     throw new DomainError('CART_INDISPONIVEL');
   }
-  return (await res.json()) as DetailedCart;
+  try {
+    return (await res.json()) as DetailedCart;
+  } catch {
+    // JSON malformado do cart = contrato quebrado -> indisponibilidade.
+    throw new DomainError('CART_INDISPONIVEL');
+  }
 }
 
-export async function clearCart(userToken: string): Promise<void> {
-  let res: Response;
+export async function removeItem(productId: string, userToken: string): Promise<void> {
+  const base = process.env.CART_SERVICE_URL || 'http://localhost:3005';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
-    res = await callCart('DELETE', userToken);
-  } catch {
+    const res = await fetch(base + '/cart/items/' + encodeURIComponent(productId), {
+      method: 'DELETE',
+      headers: { Authorization: userToken },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new DomainError('CART_LIMPEZA_FALHOU');
+  } catch (e) {
+    if (e instanceof DomainError) throw e;
     throw new DomainError('CART_LIMPEZA_FALHOU');
-  }
-  if (!res.ok) {
-    throw new DomainError('CART_LIMPEZA_FALHOU');
+  } finally {
+    clearTimeout(timeout);
   }
 }
