@@ -1,18 +1,22 @@
-/*
-  Warnings:
-
-  - The `status` column on the `idempotency_records` table would be dropped and recreated. This will lead to data loss if there is data in the column.
-
-*/
 -- CreateEnum
 CREATE TYPE "IdempotencyStatus" AS ENUM ('PROCESSING', 'COMPLETED', 'FAILED');
 
--- AlterTable
-ALTER TABLE "idempotency_records" DROP COLUMN "status",
-ADD COLUMN     "status" "IdempotencyStatus" NOT NULL DEFAULT 'PROCESSING';
+-- AlterTable: CONVERTE a coluna preservando os valores (nao dropa/recria).
+-- Todos os valores atuais ('PROCESSING'/'COMPLETED'/'FAILED') sao rotulos validos do enum.
+ALTER TABLE "idempotency_records" ALTER COLUMN "status" DROP DEFAULT;
+ALTER TABLE "idempotency_records"
+  ALTER COLUMN "status" TYPE "IdempotencyStatus" USING "status"::"IdempotencyStatus";
+ALTER TABLE "idempotency_records" ALTER COLUMN "status" SET DEFAULT 'PROCESSING';
 
--- CreateIndex
-CREATE INDEX "idempotency_records_status_idx" ON "idempotency_records"("status");
+-- Consolida pendencias abertas duplicadas ANTES do indice unico (mantem a mais
+-- recente por pedido) — evita que o CREATE UNIQUE INDEX falhe em dados legados.
+DELETE FROM "pending_compensations" a
+USING "pending_compensations" b
+WHERE a."resolvedAt" IS NULL
+  AND b."resolvedAt" IS NULL
+  AND a."orderId" = b."orderId"
+  AND (a."createdAt" < b."createdAt"
+       OR (a."createdAt" = b."createdAt" AND a."id" < b."id"));
 
 -- Dedup ATOMICO: no maximo UMA pendencia aberta por pedido.
 CREATE UNIQUE INDEX "pending_compensations_open_key"
