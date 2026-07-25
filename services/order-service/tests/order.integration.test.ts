@@ -14,6 +14,7 @@ const mockedInv = inventoryClient as jest.Mocked<typeof inventoryClient>;
 
 beforeAll(() => assertTestDatabase());
 afterEach(async () => {
+  await prisma.idempotencyRecord.deleteMany();
   await prisma.pendingCompensation.deleteMany();
   await prisma.order.deleteMany();
   jest.clearAllMocks();
@@ -59,6 +60,48 @@ describe('createOrder (saga)', () => {
     const b = await createOrder('u1', 'Bearer tok', k);
     expect(b.id).toBe(a.id);
     expect(mockedInv.reserve).toHaveBeenCalledTimes(1);
+  });
+
+  it('concorrente: mesma chave nao reserva duas vezes (claim atomico)', async () => {
+    mockedCart.getCart.mockResolvedValue(
+      cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
+    );
+    mockedInv.reserve.mockResolvedValue(undefined);
+    mockedInv.release.mockResolvedValue(undefined);
+    mockedCart.removeItem.mockResolvedValue(undefined);
+    const k = key();
+    await Promise.allSettled([
+      createOrder('u1', 'Bearer tok', k),
+      createOrder('u1', 'Bearer tok', k),
+    ]);
+    // So o vencedor reservou; o perdedor foi barrado no claim atomico.
+    expect(mockedInv.reserve).toHaveBeenCalledTimes(1);
+    expect(await prisma.order.count()).toBe(1);
+  });
+
+  it('mesma chave por usuarios diferentes: pedidos separados, sem vazamento', async () => {
+    mockedCart.getCart.mockResolvedValue(
+      cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
+    );
+    mockedInv.reserve.mockResolvedValue(undefined);
+    mockedCart.removeItem.mockResolvedValue(undefined);
+    const k = 'shared-' + Date.now();
+    const oA = await createOrder('userA', 'Bearer tokA', k);
+    const oB = await createOrder('userB', 'Bearer tokB', k);
+    expect(oA.id).not.toBe(oB.id);
+    expect(oA.userId).toBe('userA');
+    expect(oB.userId).toBe('userB');
+  });
+
+  it('retry de checkout que falhou -> CHECKOUT_JA_FALHOU', async () => {
+    mockedCart.getCart.mockResolvedValue(
+      cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 0 }])
+    );
+    mockedInv.reserve.mockRejectedValue(new DomainError('ESTOQUE_INSUFICIENTE'));
+    mockedInv.release.mockResolvedValue(undefined);
+    const k = key();
+    await expect(createOrder('u1', 'Bearer tok', k)).rejects.toThrow('ESTOQUE_INSUFICIENTE');
+    await expect(createOrder('u1', 'Bearer tok', k)).rejects.toThrow('CHECKOUT_JA_FALHOU');
   });
 
   it('rejeita carrinho vazio sem reservar', async () => {

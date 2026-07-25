@@ -39,6 +39,12 @@ function mapOrderError(e: unknown, res: Response): boolean {
     case 'ITEM_NAO_ENCONTRADO':
       res.status(404).json({ error: 'Recurso nao encontrado' });
       return true;
+    case 'IDEMPOTENCIA_EM_ANDAMENTO':
+      res.status(409).json({ error: 'Requisicao ja em processamento; tente de novo' });
+      return true;
+    case 'CHECKOUT_JA_FALHOU':
+      res.status(409).json({ error: 'Este checkout falhou; use uma nova Idempotency-Key' });
+      return true;
     case 'CONFLITO_DE_ESTADO':
       res.status(409).json({ error: 'Conflito de concorrencia; tente de novo' });
       return true;

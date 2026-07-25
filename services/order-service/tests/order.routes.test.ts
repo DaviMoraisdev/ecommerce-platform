@@ -5,6 +5,7 @@ import jwt from 'jsonwebtoken';
 import app from '../src/app';
 import * as orderService from '../src/services/order.service';
 import { DomainError } from '../src/domain/errors';
+import { prisma } from '../src/config/database';
 
 const mocked = orderService as jest.Mocked<typeof orderService>;
 
@@ -16,6 +17,9 @@ function idem(): string {
 }
 
 beforeEach(() => jest.clearAllMocks());
+afterAll(async () => {
+  await prisma.$disconnect();
+});
 
 describe('POST /orders', () => {
   it('401 sem token', async () => {

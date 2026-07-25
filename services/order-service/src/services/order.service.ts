@@ -136,58 +136,75 @@ export async function createOrder(
   userToken: string,
   idempotencyKey: string
 ) {
-  // Idempotencia (chave estavel do cliente): retry retorna o pedido existente,
-  // sem reservar nem criar de novo.
-  const existente = await prisma.order.findUnique({
-    where: { idempotencyKey },
-    include: { items: true },
-  });
-  if (existente) return existente;
-
   const orderId = randomUUID();
-  const cart = await cartClient.getCart(userToken);
-  const { itens, total } = montarItens(cart);
+
+  // 1. REIVINDICA a chave atomicamente, ANTES de qualquer efeito externo.
+  //    Escopo por usuario (userId, key) — nao cruza contas. O registro guarda
+  //    o orderId, entao serve tambem de estado DURAVEL da saga (reconciliavel).
+  let record;
+  try {
+    record = await prisma.idempotencyRecord.create({
+      data: { userId, key: idempotencyKey, orderId, status: 'PROCESSING' },
+    });
+  } catch (e) {
+    // Unico unique da tabela: (userId, key). P2002 aqui = chave ja reivindicada.
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      return await resolverIdempotencia(userId, idempotencyKey);
+    }
+    throw e;
+  }
 
   try {
+    const cart = await cartClient.getCart(userToken);
+    const { itens, total } = montarItens(cart);
+
     for (const item of itens) {
       await inventoryClient.reserve(item.productId, item.quantity, orderId);
     }
 
-    let order;
-    try {
-      order = await prisma.order.create({
-        data: {
-          id: orderId,
-          userId,
-          status: 'PENDENTE',
-          total,
-          idempotencyKey,
-          items: { create: itens },
-        },
-        include: { items: true },
-      });
-    } catch (e) {
-      // Concorrencia com a MESMA chave: outro request criou primeiro.
-      // Compensa as reservas DESTE perdedor e devolve o pedido vencedor.
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
-        await compensar(orderId, e);
-        const vencedor = await prisma.order.findUnique({
-          where: { idempotencyKey },
-          include: { items: true },
-        });
-        if (vencedor) return vencedor;
-      }
-      throw e;
-    }
+    const order = await prisma.order.create({
+      data: {
+        id: orderId,
+        userId,
+        status: 'PENDENTE',
+        total,
+        idempotencyKey,
+        items: { create: itens },
+      },
+      include: { items: true },
+    });
 
-    // Remove SO os itens comprados: o que o usuario adicionou durante o
-    // checkout sobrevive. Falha aqui e apenas logada.
+    await prisma.idempotencyRecord.update({
+      where: { id: record.id },
+      data: { status: 'COMPLETED' },
+    });
+
     await removerItensComprados(userToken, itens);
     return order;
   } catch (err) {
+    // Compensa e marca a chave FAILED (durável, com orderId para reconciliacao).
     await compensar(orderId, err);
+    await prisma.idempotencyRecord
+      .update({ where: { id: record.id }, data: { status: 'FAILED' } })
+      .catch(() => undefined);
     throw err;
   }
+}
+
+// Resolve uma chave ja reivindicada (retry ou concorrente), escopada ao usuario.
+async function resolverIdempotencia(userId: string, key: string) {
+  const rec = await prisma.idempotencyRecord.findUnique({
+    where: { userId_key: { userId, key } },
+  });
+  if (rec?.status === 'COMPLETED') {
+    const order = await getOrderById(rec.orderId);
+    if (order) return order; // idempotente: mesmo pedido, mesmo usuario
+  }
+  if (rec?.status === 'FAILED') {
+    throw new DomainError('CHECKOUT_JA_FALHOU');
+  }
+  // PROCESSING: outra requisicao com a mesma chave esta em andamento.
+  throw new DomainError('IDEMPOTENCIA_EM_ANDAMENTO');
 }
 
 async function removerItensComprados(
@@ -207,6 +224,11 @@ async function removerItensComprados(
 // (sobrevive a restart). Um job (Fase 10) reprocessa onde resolvedAt e null.
 async function registrarCompensacaoPendente(orderId: string, reason: string): Promise<void> {
   try {
+    // Dedup: uma unica pendencia ABERTA por pedido (evita multiplas em retries).
+    const aberta = await prisma.pendingCompensation.findFirst({
+      where: { orderId, resolvedAt: null },
+    });
+    if (aberta) return;
     await prisma.pendingCompensation.create({ data: { orderId, reason } });
   } catch {
     console.error('[order] falha ate ao registrar compensacao pendente de ' + orderId);
