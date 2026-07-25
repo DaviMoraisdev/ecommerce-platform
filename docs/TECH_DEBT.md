@@ -61,6 +61,8 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 - **Rate limit com store no Redis:** compartilhado entre instâncias do auth-service ao escalar horizontalmente.
 
 ### CI / robustez de testes (Fase 10)
+
+- **Velocidade dos testes (ts-jest):** o `ts-jest` recompila E type-checa cada arquivo a cada run, sem cache quente -- a suite unit chega a ~50s sob contencao de maquina. O type-check no jest e redundante (o build com `tsc --noEmit` ja faz a checagem completa). Ganho barato: `isolatedModules: true` no ts-jest (transpila por arquivo, sem type-check cruzado) OU trocar por `@swc/jest`/`esbuild-jest` (transpile puro) -- tipicamente 3-5x mais rapido. Aplicar em order, inventory, cart e product num PR proprio de DX/CI. Fase 10.
 - **CI precisa prover as env de teste não versionadas:** o `.env.test` do inventory-service é ignorado pelo git (DATABASE_URL, INVENTORY_PORT, JWT_SECRET de teste). O pipeline terá que setar essas variáveis — em especial `JWT_SECRET` — senão os testes de autorização falham. Vale para qualquer serviço com `.env.test` local.
 - **Teste de config do `redis.ts` (REDIS_URL ausente):** provar que `getRedisClient` usa o fallback quando `REDIS_URL` não está definida. Exige mockar o construtor do ioredis. Baixo valor/risco.
 - **Teste de integração do `connectDatabase` (inventory-service):** provar que o `catch` chama só a saída sanitizada no `console.error` e dispara `process.exit(1)`. A lógica de segurança já está coberta pela função pura `sanitizeConnectionError` (PR #24); este teste cobre só o encadeamento. Fazer quando o `connectDatabase` ganhar lógica nova (ex.: retry).
