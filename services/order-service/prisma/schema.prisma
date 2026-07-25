@@ -81,14 +81,20 @@ model PendingCompensation {
   @@map("pending_compensations")
 }
 
+enum IdempotencyStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
 model IdempotencyRecord {
-  id        String   @id @default(uuid())
+  id        String            @id @default(uuid())
   userId    String
   key       String
   orderId   String
-  status    String   @default("PROCESSING")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  status    IdempotencyStatus @default(PROCESSING)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
 
   @@unique([userId, key])
   @@index([status])

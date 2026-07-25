@@ -162,21 +162,26 @@ export async function createOrder(
       await inventoryClient.reserve(item.productId, item.quantity, orderId);
     }
 
-    const order = await prisma.order.create({
-      data: {
-        id: orderId,
-        userId,
-        status: 'PENDENTE',
-        total,
-        idempotencyKey,
-        items: { create: itens },
-      },
-      include: { items: true },
-    });
-
-    await prisma.idempotencyRecord.update({
-      where: { id: record.id },
-      data: { status: 'COMPLETED' },
+    // Pedido + COMPLETED na MESMA transacao: ou os dois, ou nenhum. Elimina a
+    // janela "pedido criado mas registro nao concluido" (que compensaria um
+    // pedido ja persistido).
+    const order = await prisma.$transaction(async (tx) => {
+      const criado = await tx.order.create({
+        data: {
+          id: orderId,
+          userId,
+          status: 'PENDENTE',
+          total,
+          idempotencyKey,
+          items: { create: itens },
+        },
+        include: { items: true },
+      });
+      await tx.idempotencyRecord.update({
+        where: { id: record.id },
+        data: { status: 'COMPLETED' },
+      });
+      return criado;
     });
 
     await removerItensComprados(userToken, itens);
@@ -224,13 +229,12 @@ async function removerItensComprados(
 // (sobrevive a restart). Um job (Fase 10) reprocessa onde resolvedAt e null.
 async function registrarCompensacaoPendente(orderId: string, reason: string): Promise<void> {
   try {
-    // Dedup: uma unica pendencia ABERTA por pedido (evita multiplas em retries).
-    const aberta = await prisma.pendingCompensation.findFirst({
-      where: { orderId, resolvedAt: null },
-    });
-    if (aberta) return;
+    // O unique parcial (orderId WHERE resolvedAt null) garante 1 pendencia
+    // aberta por pedido de forma ATOMICA (sem race entre findFirst e create).
     await prisma.pendingCompensation.create({ data: { orderId, reason } });
-  } catch {
+  } catch (e) {
+    // P2002 = ja ha pendencia aberta para este pedido -> ok.
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') return;
     console.error('[order] falha ate ao registrar compensacao pendente de ' + orderId);
   }
 }

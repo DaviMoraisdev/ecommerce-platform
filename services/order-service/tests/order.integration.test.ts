@@ -79,6 +79,19 @@ describe('createOrder (saga)', () => {
     expect(await prisma.order.count()).toBe(1);
   });
 
+  it('PROCESSING existente (concorrente) -> IDEMPOTENCIA_EM_ANDAMENTO sem reservar', async () => {
+    const k = key();
+    // Simula um checkout EM ANDAMENTO (registro PROCESSING ja gravado).
+    await prisma.idempotencyRecord.create({
+      data: { userId: 'u1', key: k, orderId: 'oid-em-andamento', status: 'PROCESSING' },
+    });
+    mockedCart.getCart.mockResolvedValue(
+      cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
+    );
+    await expect(createOrder('u1', 'Bearer tok', k)).rejects.toThrow('IDEMPOTENCIA_EM_ANDAMENTO');
+    expect(mockedInv.reserve).not.toHaveBeenCalled();
+  });
+
   it('mesma chave por usuarios diferentes: pedidos separados, sem vazamento', async () => {
     mockedCart.getCart.mockResolvedValue(
       cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
