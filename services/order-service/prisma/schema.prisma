@@ -16,14 +16,15 @@ enum OrderStatus {
 }
 
 model Order {
-  id            String               @id @default(uuid())
-  userId        String
-  status        OrderStatus          @default(PENDENTE)
-  total         Decimal              @db.Decimal(12, 2)
-  items         OrderItem[]
-  statusHistory OrderStatusHistory[]
-  createdAt     DateTime             @default(now())
-  updatedAt     DateTime             @updatedAt
+  id             String               @id @default(uuid())
+  userId         String
+  idempotencyKey String?
+  status         OrderStatus          @default(PENDENTE)
+  total          Decimal              @db.Decimal(12, 2)
+  items          OrderItem[]
+  statusHistory  OrderStatusHistory[]
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
 
   @@map("orders")
 }
@@ -67,4 +68,35 @@ model OrderStatusHistory {
   // CHECK via migration: fromStatus <> toStatus.
   @@index([orderId])
   @@map("order_status_history")
+}
+
+model PendingCompensation {
+  id         String    @id @default(uuid())
+  orderId    String
+  reason     String
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  @@index([resolvedAt])
+  @@map("pending_compensations")
+}
+
+enum IdempotencyStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model IdempotencyRecord {
+  id        String            @id @default(uuid())
+  userId    String
+  key       String
+  orderId   String
+  status    IdempotencyStatus @default(PROCESSING)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  @@unique([userId, key])
+  @@index([status])
+  @@map("idempotency_records")
 }
