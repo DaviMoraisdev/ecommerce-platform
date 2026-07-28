@@ -4,7 +4,7 @@ Plataforma de e-commerce completa construída com arquitetura de microserviços,
 
 O objetivo do projeto é simular uma aplicação real de comércio eletrônico, separando os principais domínios do negócio em serviços independentes, cada um com responsabilidades, banco de dados e fluxo de comunicação próprios.
 
-> **Status:** projeto em desenvolvimento ativo. Fases 1 a 3 concluídas — a fundação, o serviço de autenticação e o núcleo comercial (catálogo + estoque) já estão implementados e testados. Este README separa o que já foi construído do que será implementado nas próximas fases.
+> **Status:** projeto em desenvolvimento ativo. Fases 1 a 4 concluídas, além do serviço de notificações (Fase 6) — a fundação, autenticação, o núcleo comercial (catálogo + estoque), o carrinho, os pedidos e as notificações assíncronas já estão implementados. Este README separa o que já foi construído do que será implementado nas próximas fases.
 
 ---
 
@@ -71,8 +71,8 @@ flowchart TD
     GW --> User["user-service"]
     GW --> Prod["product-service ✅"]
     GW --> Inv["inventory-service ✅"]
-    GW --> Cart["cart-service"]
-    GW --> Order["order-service"]
+    GW --> Cart["cart-service ✅"]
+    GW --> Order["order-service ✅"]
     GW --> Pay["payment-service"]
 
     Auth --> AuthDB[("PostgreSQL")]
@@ -84,15 +84,17 @@ flowchart TD
     Pay --> PayDB[("PostgreSQL")]
 
     Prod -. consulta disponibilidade .-> Inv
+    Cart -. itens do carrinho .-> Order
+    Order -. reserva estoque .-> Inv
 
     Order -->|order.created| MQ{{"RabbitMQ"}}
     Pay -->|payment.approved / failed| MQ
-    MQ --> Notif["notification-service"]
+    MQ --> Notif["notification-service ✅"]
 
     classDef done fill:#1f6f43,stroke:#2ecc71,color:#ffffff;
     classDef planned fill:#2d333b,stroke:#6e7681,color:#adbac7,stroke-dasharray: 4 3;
-    class Auth,Prod,Inv done;
-    class User,Cart,Order,Pay,Notif planned;
+    class Auth,Prod,Inv,Cart,Order,Notif done;
+    class User,Pay planned;
 ```
 
 ### Fluxo geral da aplicação
@@ -514,9 +516,9 @@ O projeto será desenvolvido em fases para evitar acúmulo de complexidade e per
 | Fase 1 | Concluída | Fundação do projeto e ambiente local |
 | Fase 2 | Concluída | Serviço de autenticação |
 | Fase 3 | Concluída | Catálogo de produtos e estoque |
-| Fase 4 | Em andamento | Carrinho e pedidos |
+| Fase 4 | Concluída | Carrinho e pedidos |
 | Fase 5 | Pendente | Pagamentos |
-| Fase 6 | Pendente | Notificações assíncronas |
+| Fase 6 | Concluída | Notificações assíncronas |
 | Fase 7 | Pendente | API Gateway e segurança |
 | Fase 8 | Pendente | Frontend web |
 | Fase 9 | Pendente | Admin dashboard |
