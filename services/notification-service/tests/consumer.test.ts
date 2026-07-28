@@ -1,17 +1,16 @@
-import { parseEvent, handleEvent, sanitizeForLog } from '../src/consumer';
+import { parseEvent, decideMessage, handleEvent, sanitizeForLog } from '../src/consumer';
 
 describe('parseEvent', () => {
-  it('aceita evento valido completo', () => {
+  it('aceita order.created valido (com total)', () => {
     const raw = JSON.stringify({
-      type: 'order.created', orderId: 'o1', userId: 'u1',
-      status: 'PENDENTE', total: 30, at: '2026-01-01T00:00:00Z',
+      type: 'order.created', orderId: 'o1', userId: 'u1', total: 30, at: '2026-01-01T00:00:00Z', eventId: 'e1',
     });
-    expect(parseEvent(raw)).toMatchObject({ type: 'order.created', orderId: 'o1', total: 30 });
+    expect(parseEvent(raw)).toMatchObject({ type: 'order.created', orderId: 'o1', total: 30, eventId: 'e1' });
   });
 
-  it('aceita evento com so os obrigatorios', () => {
-    const raw = JSON.stringify({ type: 'order.created', orderId: 'o1' });
-    expect(parseEvent(raw)).toMatchObject({ type: 'order.created', orderId: 'o1' });
+  it('aceita order.status_changed valido (com status)', () => {
+    const raw = JSON.stringify({ type: 'order.status_changed', orderId: 'o1', status: 'PAGO' });
+    expect(parseEvent(raw)).toMatchObject({ type: 'order.status_changed', orderId: 'o1', status: 'PAGO' });
   });
 
   it('rejeita JSON malformado', () => {
@@ -23,7 +22,15 @@ describe('parseEvent', () => {
   });
 
   it('rejeita sem orderId', () => {
-    expect(parseEvent(JSON.stringify({ type: 'order.created' }))).toBeNull();
+    expect(parseEvent(JSON.stringify({ type: 'order.created', total: 1 }))).toBeNull();
+  });
+
+  it('rejeita order.created sem total (obrigatorio por tipo)', () => {
+    expect(parseEvent(JSON.stringify({ type: 'order.created', orderId: 'o1' }))).toBeNull();
+  });
+
+  it('rejeita order.status_changed sem status (obrigatorio por tipo)', () => {
+    expect(parseEvent(JSON.stringify({ type: 'order.status_changed', orderId: 'o1' }))).toBeNull();
   });
 
   it('rejeita schema incorreto: total como string', () => {
@@ -31,12 +38,35 @@ describe('parseEvent', () => {
   });
 
   it('rejeita schema incorreto: orderId numero', () => {
-    expect(parseEvent(JSON.stringify({ type: 'order.created', orderId: 123 }))).toBeNull();
+    expect(parseEvent(JSON.stringify({ type: 'order.created', orderId: 123, total: 1 }))).toBeNull();
   });
 
   it('rejeita nao-objeto (array e numero)', () => {
     expect(parseEvent(JSON.stringify([1, 2, 3]))).toBeNull();
     expect(parseEvent(JSON.stringify(42))).toBeNull();
+  });
+});
+
+describe('decideMessage', () => {
+  it('ack quando routing key casa com o type', () => {
+    const raw = JSON.stringify({ type: 'order.created', orderId: 'o1', total: 30 });
+    const d = decideMessage(raw, 'order.created');
+    expect(d.ack).toBe(true);
+    expect(d.event).toMatchObject({ orderId: 'o1' });
+  });
+
+  it('nack quando o payload e invalido/incompleto', () => {
+    const raw = JSON.stringify({ type: 'order.status_changed', orderId: 'o1' });
+    const d = decideMessage(raw, 'order.status_changed');
+    expect(d.ack).toBe(false);
+    expect(d.event).toBeNull();
+  });
+
+  it('nack quando routing key nao casa com o type', () => {
+    const raw = JSON.stringify({ type: 'order.created', orderId: 'o1', total: 30 });
+    const d = decideMessage(raw, 'order.status_changed');
+    expect(d.ack).toBe(false);
+    expect(d.event).toBeNull();
   });
 });
 
@@ -57,6 +87,13 @@ describe('handleEvent', () => {
   it('order.status_changed loga a mudanca de status', () => {
     handleEvent({ type: 'order.status_changed', orderId: 'o1', status: 'PAGO' });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('PAGO'));
+  });
+
+  it('sanitiza campo com caractere de controle (anti log-injection)', () => {
+    handleEvent({ type: 'order.created', orderId: 'o1' + String.fromCharCode(10) + 'FAKE', total: 1 });
+    const logged = log.mock.calls[0][0] as string;
+    expect(logged).not.toContain(String.fromCharCode(10));
+    expect(logged).toContain('o1?FAKE');
   });
 
   it('tipo desconhecido cai no default', () => {

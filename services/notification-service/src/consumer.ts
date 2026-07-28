@@ -10,6 +10,7 @@ export function sanitizeForLog(s: string): string {
 
 export interface OrderEvent {
   type: string;
+  eventId?: string;
   orderId: string;
   userId?: string;
   status?: string;
@@ -17,8 +18,9 @@ export interface OrderEvent {
   at?: string;
 }
 
-// Guard de runtime: JSON garante so a sintaxe. Validamos o contrato: obrigatorios
-// (type, orderId) e, se presentes, o TIPO de cada opcional (schema incorreto = rejeita).
+// Valida o contrato em runtime. Alem dos obrigatorios comuns (type, orderId),
+// cada tipo exige campos proprios: order.created -> total; order.status_changed
+// -> status. Campo presente com tipo errado = schema incorreto -> rejeita.
 export function parseEvent(raw: string): OrderEvent | null {
   let v: unknown;
   try {
@@ -36,6 +38,7 @@ export function parseEvent(raw: string): OrderEvent | null {
   if (typeof type !== 'string' || type.trim() === '') return null;
   if (typeof orderId !== 'string' || orderId.trim() === '') return null;
 
+  if (o.eventId !== undefined && typeof o.eventId !== 'string') return null;
   if (o.userId !== undefined && typeof o.userId !== 'string') return null;
   if (o.status !== undefined && typeof o.status !== 'string') return null;
   if (o.at !== undefined && typeof o.at !== 'string') return null;
@@ -43,8 +46,17 @@ export function parseEvent(raw: string): OrderEvent | null {
     return null;
   }
 
+  // Obrigatorios por tipo:
+  if (type === 'order.status_changed' && (typeof o.status !== 'string' || o.status.trim() === '')) {
+    return null;
+  }
+  if (type === 'order.created' && (typeof o.total !== 'number' || !Number.isFinite(o.total))) {
+    return null;
+  }
+
   return {
     type,
+    eventId: o.eventId as string | undefined,
     orderId,
     userId: o.userId as string | undefined,
     status: o.status as string | undefined,
@@ -53,19 +65,42 @@ export function parseEvent(raw: string): OrderEvent | null {
   };
 }
 
-// "Envia" a notificacao. No 8a e um stub que loga; e-mail/push ficam para depois.
+// Decide ack/nack de uma mensagem crua. Pura e testavel (sem canal real):
+// payload invalido/incompleto ou routing key incompativel com o type -> nack.
+export function decideMessage(
+  raw: string,
+  routingKey: string
+): { ack: boolean; event: OrderEvent | null; reason?: string } {
+  const event = parseEvent(raw);
+  if (!event) {
+    return { ack: false, event: null, reason: 'payload invalido ou incompleto' };
+  }
+  if (event.type !== routingKey) {
+    return {
+      ack: false,
+      event: null,
+      reason: 'routing key (' + sanitizeForLog(routingKey) + ') != type (' + sanitizeForLog(event.type) + ')',
+    };
+  }
+  return { ack: true, event };
+}
+
+// "Envia" a notificacao (stub que loga). Sanitiza TODO campo derivado do evento
+// antes de interpolar (anti log-injection); total ja e number validado.
 export function handleEvent(event: OrderEvent): void {
+  const orderId = sanitizeForLog(event.orderId);
   switch (event.type) {
     case 'order.created':
       console.log(
-        '[notificacao] pedido ' + event.orderId + ' criado' +
-          (event.userId ? ' (usuario ' + event.userId + ')' : '') +
+        '[notificacao] pedido ' + orderId + ' criado' +
+          (event.userId ? ' (usuario ' + sanitizeForLog(event.userId) + ')' : '') +
           (event.total !== undefined ? ' total ' + event.total : '')
       );
       break;
     case 'order.status_changed':
       console.log(
-        '[notificacao] pedido ' + event.orderId + ' mudou para ' + (event.status ?? '?')
+        '[notificacao] pedido ' + orderId + ' mudou para ' +
+          (event.status ? sanitizeForLog(event.status) : '?')
       );
       break;
     default:

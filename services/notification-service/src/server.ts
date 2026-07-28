@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 import { connect } from './config/connection';
 import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY } from './config/topology';
-import { parseEvent, handleEvent, sanitizeForLog } from './consumer';
+import { decideMessage, handleEvent, sanitizeForLog } from './consumer';
 
 async function start() {
   const connection = await connect();
@@ -23,18 +23,18 @@ async function start() {
     const routingKey = msg.fields.routingKey;
     const raw = msg.content.toString();
 
-    const event = parseEvent(raw);
-    if (!event) {
-      // Payload invalido = mensagem envenenada. Descarta sem requeue (nao loopa).
+    const decision = decideMessage(raw, routingKey);
+    if (!decision.ack || !decision.event) {
+      // Invalido/incompleto = mensagem envenenada. Descarta sem requeue (nao loopa).
       console.error(
-        '[notification] payload invalido descartado (key ' + routingKey + '): ' + sanitizeForLog(raw)
+        '[notification] descartado (' + routingKey + '): ' + decision.reason + ' :: ' + sanitizeForLog(raw)
       );
       channel.nack(msg, false, false);
       return;
     }
 
     try {
-      handleEvent(event);
+      handleEvent(decision.event);
       channel.ack(msg); // ack SO apos processar com sucesso
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -43,8 +43,12 @@ async function start() {
     }
   });
 
-  // Encerramento gracioso por sinal: fecha canal e conexao antes de sair.
+  // Encerramento gracioso, idempotente. A flag evita que o listener de "close"
+  // (abaixo) reporte um shutdown intencional como crash (exit 1).
+  let shuttingDown = false;
   async function shutdown(signal: string): Promise<void> {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('[notification] ' + signal + ' recebido; encerrando...');
     try {
       await channel.close();
@@ -61,8 +65,9 @@ async function start() {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  // Consumer sem conexao nao tem funcao: encerra para o supervisor reiniciar.
+  // Queda inesperada: so reinicia (exit 1) se NAO for shutdown intencional.
   connection.on('close', () => {
+    if (shuttingDown) return;
     console.error('[notification] conexao fechada; encerrando (exit 1) para reiniciar');
     process.exit(1);
   });
