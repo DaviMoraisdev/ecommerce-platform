@@ -10,6 +10,20 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 
 ## FASE 4 — ORDER-SERVICE (Blocos 5–8, em andamento)
 
+### Bloco 8 — Eventos assincronos (order.created / order.status_changed)
+
+O 8a publica eventos de forma simples (publish-apos-commit). As fragilidades
+abaixo sao conhecidas e aceitas para o 8a; o destino de cada uma esta marcado.
+
+- **[8b] Entrega at-most-once (sem outbox):** o publish acontece DEPOIS do commit, fora da transacao. Se o processo cair entre o commit e o publish — ou o publish falhar — o evento se perde. Destino 8b: outbox transacional (grava o evento na MESMA transacao do pedido; um worker publica e marca como enviado) -> at-least-once.
+- **[8b] Publisher sem auto-reconnect em runtime:** se a conexao com o broker cair APOS o boot, os handles zeram e todo evento e descartado ate reiniciar o order-service. Destino 8b/Fase 7: reconexao automatica com backoff.
+- **[8b] Consumer nao-idempotente:** handleEvent processa toda mensagem sem deduplicar. Ok no 8a (at-most-once nao reentrega), mas o at-least-once do 8b exige dedup por eventId (o campo ja viaja no payload).
+- **[Fase 10] Contrato de topologia duplicado:** EXCHANGE e routing keys estao repetidos em order-service (events/topology.ts) e notification-service (config/topology.ts). Sem pacote compartilhado, ha risco de divergencia. Destino: extrair pacote comum de contratos OU aceitar a duplicacao documentada.
+- **[Fase 10] Sem dead-letter queue:** payload invalido e descartado com nack(false,false); nao ha DLQ para inspecao/reprocessamento. Destino: configurar DLX/DLQ.
+- **[Fase 7] notification-service fora do docker-compose:** roda so via npm run dev; falta Dockerfile, entrada no compose, healthcheck e observabilidade. Destino: containerizar antes do deploy.
+- **[Fase 7] Limite de tamanho de mensagem no consumer:** o consumer faz toString()+JSON.parse sem checar msg.content.length; mensagem gigante consome CPU/memoria. O exchange e interno (so o order-service publica), risco baixo agora. Destino: cap de bytes + ACL/limite no broker (review PR #42, 3.2).
+- **[Fase 10] Ciclo de vida acoplado a efeitos globais:** start() do notification e o estado do publisher rodam no import, com process.exit embutido e estado de modulo global; dificulta testar ciclo de vida/reconexao. Destino: separar construcao/start/stop e injetar conexao/logger/exit (review PR #42, 5.2).
+
 - **[EXCECAO DE SEGURANCA ACEITA — Fase 7] Token de servico do order-service (role ADMIN):** o order assina um token ADMIN com o segredo compartilhado para chamar reserve/release do inventory. NAO e "divida paga" — e mitigacao aceita. O segredo compartilhado JA permite forjar qualquer token, entao o order usar ADMIN nao amplia o raio de ataque existente. Correcao real: identidade por servico (chaves assimetricas/mTLS) + issuer/audience/scopes (ex.: inventory:reserve). Fase 7. Levantado no review do PR #41.
 - **[Fase 10] Processor de reconciliacao:** o estado DURAVEL da saga ja existe (`idempotency_records` com orderId+status, criado ANTES das reservas; `pending_compensations` para releases falhos). Falta o JOB, que deve tratar cada caso sem liberar pedido valido:
   - `pending_compensations` aberta (resolvedAt null): reexecutar `release(orderId)` (idempotente) e marcar resolvedAt.
@@ -27,7 +41,7 @@ Organizado por DESTINO. Toda dívida pendente tem um destino de correção expl�
 
 - **[EXCECAO DE SEGURANCA ACEITA — Fase 7] Authz por dono/servico da reserva:** a posse ESTRUTURAL foi paga no 7a (reservas amarradas ao `orderId`; `release(orderId)` so toca o que e do pedido). Porem a AUTORIZACAO nao esta completa: hoje qualquer ADMIN/SELLER autenticado libera qualquer `orderId`, e qualquer papel logado reserva com `orderId` arbitrario. Isso NAO e "divida paga" — e uma exposicao conhecida e deliberadamente aceita para este estagio (sem gateway/identidade de servico). Resolucao: autenticacao servico-a-servico (token interno/mTLS) + vincular `orderId` a claims confiaveis. Destino: Fase 7. O 7b usara token de servico como ponte.
 - **[Politica documentada] Drain de `reserved` orfao na migracao do 7a:** a migration zerou `inventory.reserved` onde nao havia linha de `reservation` (o modelo antigo mantinha o contador sem reserva rastreavel). Seguro aqui porque nao ha pedidos reais. Num sistema com dados reais, a estrategia teria que ser backfill (criar reservas a partir do estado antigo), nao drain.
-- **Mensageria do order-service (Bloco 8):** o demo RabbitMQ valida só sintaxe (JSON) + shape mínimo. Ao reutilizar o padrão no order-service, exigir: schema/contrato explícito dos eventos (`type/orderId/total/at`), testes automatizados (config ausente, retry/esgotamento, evento válido, JSON malformado, schema incorreto, ack/nack, publisher sem consumer), dead-letter queue para inválidos, encerramento gracioso (`try/finally` + SIGINT/SIGTERM) e retry que distingue falha transitória de permanente. Levantado nos reviews do PR #35.
+- **Mensageria do order-service (Bloco 8) -- parcialmente paga no 8a:** PAGO no 8a: (a) guard de contrato endurecido no consumer (rejeita schema incorreto, nao so shape minimo); (b) testes automatizados -- publisher (RABBITMQ_URL ausente, no-op sem canal, publish persistente + waitForConfirms, esgotamento de retry, close idempotente) e consumer (evento valido, JSON malformado, schema incorreto, roteamento por tipo, sanitize); (c) encerramento gracioso SIGINT/SIGTERM no order-service e no notification-service. PENDENTE -> 8b (dependem do modelo de entrega robusto): dead-letter queue para invalidos, retry que distingue falha transitoria de permanente, e entrega at-least-once via outbox transacional. Levantado nos reviews do PR #35; reconciliado com o split 8a/8b.
 
 ---
 
