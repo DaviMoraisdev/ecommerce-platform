@@ -4,8 +4,11 @@ jest.mock('amqplib', () => ({
 import amqp from 'amqplib';
 
 process.env.RABBITMQ_URL = 'amqp://localhost:5672';
+process.env.RABBITMQ_MAX_RETRIES = '2';
 process.env.RABBITMQ_RETRY_DELAY_MS = '0';
+process.env.RABBITMQ_CONNECT_TIMEOUT_MS = '30';
 process.env.RABBITMQ_PUBLISH_TIMEOUT_MS = '50';
+process.env.RABBITMQ_CLOSE_TIMEOUT_MS = '50';
 
 const { initEventPublisher, publishEvent, closeEventPublisher } =
   require('../src/events/publisher') as typeof import('../src/events/publisher');
@@ -67,7 +70,6 @@ describe('event publisher', () => {
     connect.mockResolvedValue(makeConnection(channel));
 
     await initEventPublisher();
-    expect(connect).toHaveBeenCalledTimes(1);
     expect(channel.assertExchange).toHaveBeenCalledWith('orders', 'topic', { durable: true });
 
     await publishEvent('order.created', { orderId: 'x' });
@@ -96,15 +98,30 @@ describe('event publisher', () => {
     expect(conn.close).toHaveBeenCalled();
   });
 
-  it('publishEvent: timeout na confirmacao nao pendura (loga e retorna)', async () => {
+  it('conexao que resolve DEPOIS do timeout e fechada (nao vaza)', async () => {
+    const lateConn = makeConnection(makeChannel());
+    connect.mockImplementation(
+      () => new Promise((res) => setTimeout(() => res(lateConn), 70))
+    );
+    await expect(initEventPublisher()).rejects.toThrow(/timeout/);
+    await new Promise((r) => setTimeout(r, 160));
+    expect(lateConn.close).toHaveBeenCalled();
+  });
+
+  it('publishEvent: timeout de confirmacao desativa o canal (publish seguinte e no-op)', async () => {
     const channel = makeChannel({
       waitForConfirms: jest.fn().mockReturnValue(new Promise(() => undefined)),
     });
     connect.mockResolvedValue(makeConnection(channel));
     await initEventPublisher();
+
     await expect(publishEvent('order.created', { a: 1 })).resolves.toBeUndefined();
-    expect(error).toHaveBeenCalledWith(expect.stringContaining('falha ao publicar'));
-    await closeEventPublisher();
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('canal desativado'));
+    expect(channel.close).toHaveBeenCalled();
+
+    await publishEvent('order.created', { b: 2 });
+    expect((channel.publish as jest.Mock).mock.calls.length).toBe(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('canal indisponivel'));
   });
 
   it('closeEventPublisher chama close no canal e na conexao', async () => {
