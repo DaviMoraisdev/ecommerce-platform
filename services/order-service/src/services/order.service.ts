@@ -5,6 +5,11 @@ import { randomUUID } from 'node:crypto';
 import { DomainError } from '../domain/errors';
 import * as cartClient from '../clients/cart.client';
 import * as inventoryClient from '../clients/inventory.client';
+import { publishEvent } from '../events/publisher';
+import {
+  ROUTING_ORDER_CREATED,
+  ROUTING_ORDER_STATUS_CHANGED,
+} from '../events/topology';
 
 const MAX_CHANGED_BY = 128;
 
@@ -185,6 +190,19 @@ export async function createOrder(
     });
 
     await removerItensComprados(userToken, itens);
+
+    // Evento pos-commit (best-effort). publishEvent NUNCA lanca, entao uma
+    // falha aqui nao alcanca o catch/compensar — o pedido ja esta persistido.
+    await publishEvent(ROUTING_ORDER_CREATED, {
+      type: 'order.created',
+      eventId: randomUUID(),
+      orderId: order.id,
+      userId,
+      status: order.status,
+      total,
+      at: new Date().toISOString(),
+    });
+
     return order;
   } catch (err) {
     // Compensa e marca a chave FAILED (durável, com orderId para reconciliacao).
@@ -268,6 +286,18 @@ export async function changeOrderStatus(
       await registrarCompensacaoPendente(orderId, 'cancel_release_falhou:' + motivo);
     }
   }
+
+  // Evento pos-transicao (best-effort, nao-lancante).
+  await publishEvent(ROUTING_ORDER_STATUS_CHANGED, {
+    type: 'order.status_changed',
+    eventId: randomUUID(),
+    orderId: order.id,
+    userId: order.userId,
+    status: order.status,
+    total: Number(order.total),
+    at: new Date().toISOString(),
+  });
+
   return order;
 }
 
