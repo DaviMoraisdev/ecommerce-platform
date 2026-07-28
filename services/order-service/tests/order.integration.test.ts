@@ -7,6 +7,7 @@ import { assertTestDatabase } from './helpers/testDbGuard';
 import * as cartClient from '../src/clients/cart.client';
 import * as inventoryClient from '../src/clients/inventory.client';
 import { createOrder, changeOrderStatus } from '../src/services/order.service';
+import * as publisher from '../src/events/publisher';
 import { DomainError } from '../src/domain/errors';
 
 const mockedCart = cartClient as jest.Mocked<typeof cartClient>;
@@ -182,5 +183,31 @@ describe('changeOrderStatus', () => {
     await changeOrderStatus(order.id, OrderStatus.CANCELADO, 'admin1');
     const pend = await prisma.pendingCompensation.findMany({ where: { orderId: order.id } });
     expect(pend.length).toBe(1);
+  });
+});
+
+describe('emissao de eventos (8a)', () => {
+  it('createOrder emite order.created e changeOrderStatus emite order.status_changed', async () => {
+    const spy = jest.spyOn(publisher, 'publishEvent').mockResolvedValue(undefined);
+    mockedCart.getCart.mockResolvedValue(
+      cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
+    );
+    mockedInv.reserve.mockResolvedValue(undefined);
+    mockedCart.removeItem.mockResolvedValue(undefined);
+
+    const order = await createOrder('u1', 'Bearer tok', key());
+    expect(spy).toHaveBeenCalledWith(
+      'order.created',
+      expect.objectContaining({ type: 'order.created', orderId: order.id, total: 10 })
+    );
+
+    spy.mockClear();
+    await changeOrderStatus(order.id, OrderStatus.PAGO, 'admin');
+    expect(spy).toHaveBeenCalledWith(
+      'order.status_changed',
+      expect.objectContaining({ type: 'order.status_changed', orderId: order.id, status: 'PAGO' })
+    );
+
+    spy.mockRestore();
   });
 });

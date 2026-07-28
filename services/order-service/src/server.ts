@@ -22,25 +22,29 @@ async function startServer() {
     console.error(err instanceof Error ? err.message : 'Erro de conexao');
     process.exit(1);
   }
-  // Publisher de eventos: best-effort. Se o broker estiver fora, o servico
-  // AINDA sobe e atende pedidos — eventos sao a parte nao-critica (at-most-once).
-  try {
-    await initEventPublisher();
-  } catch (err) {
-    console.warn(
-      '[events] publisher indisponivel no boot, seguindo sem eventos: ' +
-        (err instanceof Error ? err.message : String(err))
-    );
-  }
-
   const server = app.listen(port, () => {
     console.log('Order service rodando na porta ' + port);
   });
 
-  // Encerramento gracioso: para de aceitar conexoes, fecha o publisher e sai.
+  // Publisher em BACKGROUND: nao bloqueia o boot. Se o broker estiver fora ou
+  // lento, o servico ja esta atendendo; eventos sao best-effort (at-most-once).
+  void initEventPublisher().catch((err) => {
+    console.warn(
+      '[events] publisher indisponivel, seguindo sem eventos: ' +
+        (err instanceof Error ? err.message : String(err))
+    );
+  });
+
+  // Encerramento gracioso: drena o HTTP (com teto), fecha o publisher e sai.
   async function shutdown(signal: string): Promise<void> {
     console.log('[order] ' + signal + ' recebido; encerrando graciosamente...');
-    server.close();
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10000);
+      server.close(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
     await closeEventPublisher();
     process.exit(0);
   }
