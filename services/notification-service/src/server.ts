@@ -27,7 +27,7 @@ async function start() {
     if (!decision.ack || !decision.event) {
       // Invalido/incompleto = mensagem envenenada. Descarta sem requeue (nao loopa).
       console.error(
-        '[notification] descartado (' + routingKey + '): ' + decision.reason + ' :: ' + sanitizeForLog(raw)
+        '[notification] descartado (' + sanitizeForLog(routingKey) + '): ' + decision.reason + ' :: ' + sanitizeForLog(raw)
       );
       channel.nack(msg, false, false);
       return;
@@ -38,7 +38,7 @@ async function start() {
       channel.ack(msg); // ack SO apos processar com sucesso
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      console.error('[notification] falha ao processar ' + routingKey + ': ' + reason);
+      console.error('[notification] falha ao processar ' + sanitizeForLog(routingKey) + ': ' + reason);
       channel.nack(msg, false, false);
     }
   });
