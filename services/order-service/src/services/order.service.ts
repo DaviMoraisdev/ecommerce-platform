@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DomainError } from '../domain/errors';
 import * as cartClient from '../clients/cart.client';
 import * as inventoryClient from '../clients/inventory.client';
-import { publishEvent } from '../events/publisher';
+import { enqueue } from '../events/outbox.repository';
 import {
   ROUTING_ORDER_CREATED,
   ROUTING_ORDER_STATUS_CHANGED,
@@ -57,7 +57,23 @@ export async function updateOrderStatus(
       },
     });
 
-    return tx.order.findUniqueOrThrow({ where: { id: orderId } });
+    const atualizado = await tx.order.findUniqueOrThrow({ where: { id: orderId } });
+    // Evento na MESMA transacao da transicao (outbox): at-least-once.
+    const eventId = randomUUID();
+    await enqueue(tx, {
+      eventId,
+      routingKey: ROUTING_ORDER_STATUS_CHANGED,
+      payload: {
+        type: 'order.status_changed',
+        eventId,
+        orderId: atualizado.id,
+        userId: atualizado.userId,
+        status: atualizado.status,
+        total: Number(atualizado.total),
+        at: new Date().toISOString(),
+      },
+    });
+    return atualizado;
   });
 }
 
@@ -186,22 +202,26 @@ export async function createOrder(
         where: { id: record.id },
         data: { status: 'COMPLETED' },
       });
+      // Evento na MESMA transacao (outbox): at-least-once. O relay publica depois.
+      const eventId = randomUUID();
+      await enqueue(tx, {
+        eventId,
+        routingKey: ROUTING_ORDER_CREATED,
+        payload: {
+          type: 'order.created',
+          eventId,
+          orderId: criado.id,
+          userId,
+          status: criado.status,
+          total,
+          at: new Date().toISOString(),
+        },
+      });
       return criado;
     });
 
     await removerItensComprados(userToken, itens);
 
-    // Evento pos-commit (best-effort). publishEvent NUNCA lanca, entao uma
-    // falha aqui nao alcanca o catch/compensar — o pedido ja esta persistido.
-    await publishEvent(ROUTING_ORDER_CREATED, {
-      type: 'order.created',
-      eventId: randomUUID(),
-      orderId: order.id,
-      userId,
-      status: order.status,
-      total,
-      at: new Date().toISOString(),
-    });
 
     return order;
   } catch (err) {
@@ -287,16 +307,6 @@ export async function changeOrderStatus(
     }
   }
 
-  // Evento pos-transicao (best-effort, nao-lancante).
-  await publishEvent(ROUTING_ORDER_STATUS_CHANGED, {
-    type: 'order.status_changed',
-    eventId: randomUUID(),
-    orderId: order.id,
-    userId: order.userId,
-    status: order.status,
-    total: Number(order.total),
-    at: new Date().toISOString(),
-  });
 
   return order;
 }

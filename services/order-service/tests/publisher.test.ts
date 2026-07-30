@@ -10,7 +10,7 @@ process.env.RABBITMQ_CONNECT_TIMEOUT_MS = '30';
 process.env.RABBITMQ_PUBLISH_TIMEOUT_MS = '50';
 process.env.RABBITMQ_CLOSE_TIMEOUT_MS = '50';
 
-const { initEventPublisher, publishEvent, closeEventPublisher } =
+const { initEventPublisher, publish, isPublisherReady, closeEventPublisher } =
   require('../src/events/publisher') as typeof import('../src/events/publisher');
 
 const connect = (amqp as unknown as { connect: jest.Mock }).connect;
@@ -44,16 +44,15 @@ describe('event publisher', () => {
     error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
   });
-  afterEach(() => {
+  afterEach(async () => {
+    await closeEventPublisher();
     warn.mockRestore();
     error.mockRestore();
     log.mockRestore();
   });
 
-  it('publishEvent sem canal e no-op (nao lanca) e avisa', async () => {
-    await expect(publishEvent('order.created', { a: 1 })).resolves.toBeUndefined();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('canal indisponivel'));
-    expect(connect).not.toHaveBeenCalled();
+  it('isPublisherReady: false quando nao ha canal', () => {
+    expect(isPublisherReady()).toBe(false);
   });
 
   it('initEventPublisher sem RABBITMQ_URL: avisa e nao conecta', async () => {
@@ -65,14 +64,15 @@ describe('event publisher', () => {
     process.env.RABBITMQ_URL = saved;
   });
 
-  it('init com sucesso: publishEvent publica persistente e espera confirmacao', async () => {
+  it('init com sucesso: ready=true e publish confirma (persistente)', async () => {
     const channel = makeChannel();
     connect.mockResolvedValue(makeConnection(channel));
-
     await initEventPublisher();
+    expect(isPublisherReady()).toBe(true);
     expect(channel.assertExchange).toHaveBeenCalledWith('orders', 'topic', { durable: true });
 
-    await publishEvent('order.created', { orderId: 'x' });
+    const ok = await publish('order.created', { orderId: 'x' });
+    expect(ok).toBe(true);
     const call = (channel.publish as jest.Mock).mock.calls[0];
     expect(call[0]).toBe('orders');
     expect(call[1]).toBe('order.created');
@@ -80,7 +80,6 @@ describe('event publisher', () => {
     expect(JSON.parse(call[2].toString())).toEqual({ orderId: 'x' });
     expect(call[3]).toMatchObject({ persistent: true });
     expect(channel.waitForConfirms).toHaveBeenCalled();
-    await closeEventPublisher();
   });
 
   it('init esgota os retries e lanca quando o broker nao conecta', async () => {
@@ -108,23 +107,26 @@ describe('event publisher', () => {
     expect(lateConn.close).toHaveBeenCalled();
   });
 
-  it('publishEvent: timeout de confirmacao desativa o canal (publish seguinte e no-op)', async () => {
+  it('publish: false quando nao ha canal', async () => {
+    expect(await publish('order.created', { a: 1 })).toBe(false);
+  });
+
+  it('publish: timeout de confirmacao retorna false e desativa o canal', async () => {
     const channel = makeChannel({
       waitForConfirms: jest.fn().mockReturnValue(new Promise(() => undefined)),
     });
     connect.mockResolvedValue(makeConnection(channel));
     await initEventPublisher();
 
-    await expect(publishEvent('order.created', { a: 1 })).resolves.toBeUndefined();
+    expect(await publish('order.created', { a: 1 })).toBe(false);
     expect(error).toHaveBeenCalledWith(expect.stringContaining('canal desativado'));
     expect(channel.close).toHaveBeenCalled();
-
-    await publishEvent('order.created', { b: 2 });
+    expect(isPublisherReady()).toBe(false);
+    expect(await publish('order.created', { b: 2 })).toBe(false);
     expect((channel.publish as jest.Mock).mock.calls.length).toBe(1);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('canal indisponivel'));
   });
 
-  it('closeEventPublisher chama close no canal e na conexao', async () => {
+  it('closeEventPublisher fecha canal e conexao e zera o estado', async () => {
     const channel = makeChannel();
     const conn = makeConnection(channel);
     connect.mockResolvedValue(conn);
@@ -132,5 +134,41 @@ describe('event publisher', () => {
     await closeEventPublisher();
     expect(channel.close).toHaveBeenCalled();
     expect(conn.close).toHaveBeenCalled();
+    expect(isPublisherReady()).toBe(false);
+  });
+
+  it('initEventPublisher e single-flight (concorrente = 1 connect)', async () => {
+    let resolveConn!: (v: unknown) => void;
+    connect.mockImplementation(
+      () => new Promise((res) => {
+        resolveConn = res;
+      })
+    );
+    const p1 = initEventPublisher();
+    const p2 = initEventPublisher();
+    resolveConn(makeConnection(makeChannel()));
+    await Promise.all([p1, p2]);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('timeout desativa canal+conexao e reconecta no init seguinte', async () => {
+    const ch1 = makeChannel({
+      waitForConfirms: jest.fn().mockReturnValue(new Promise(() => undefined)),
+    });
+    const conn1 = makeConnection(ch1);
+    const ch2 = makeChannel();
+    const conn2 = makeConnection(ch2);
+    connect.mockResolvedValueOnce(conn1).mockResolvedValueOnce(conn2);
+
+    await initEventPublisher();
+    expect(await publish('order.created', {})).toBe(false);
+    expect(ch1.close).toHaveBeenCalled();
+    expect(conn1.close).toHaveBeenCalled();
+    expect(isPublisherReady()).toBe(false);
+
+    await initEventPublisher();
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(isPublisherReady()).toBe(true);
+    expect(await publish('order.created', {})).toBe(true);
   });
 });

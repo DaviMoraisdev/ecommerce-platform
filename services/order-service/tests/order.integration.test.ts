@@ -7,7 +7,6 @@ import { assertTestDatabase } from './helpers/testDbGuard';
 import * as cartClient from '../src/clients/cart.client';
 import * as inventoryClient from '../src/clients/inventory.client';
 import { createOrder, changeOrderStatus } from '../src/services/order.service';
-import * as publisher from '../src/events/publisher';
 import { DomainError } from '../src/domain/errors';
 
 const mockedCart = cartClient as jest.Mocked<typeof cartClient>;
@@ -17,6 +16,7 @@ beforeAll(() => assertTestDatabase());
 afterEach(async () => {
   await prisma.idempotencyRecord.deleteMany();
   await prisma.pendingCompensation.deleteMany();
+  await prisma.outboxEvent.deleteMany();
   await prisma.order.deleteMany();
   jest.clearAllMocks();
 });
@@ -186,9 +186,8 @@ describe('changeOrderStatus', () => {
   });
 });
 
-describe('emissao de eventos (8a)', () => {
-  it('createOrder emite order.created e changeOrderStatus emite order.status_changed', async () => {
-    const spy = jest.spyOn(publisher, 'publishEvent').mockResolvedValue(undefined);
+describe('emissao via outbox (8b)', () => {
+  it('createOrder grava order.created e changeOrderStatus grava order.status_changed na outbox', async () => {
     mockedCart.getCart.mockResolvedValue(
       cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
     );
@@ -196,18 +195,44 @@ describe('emissao de eventos (8a)', () => {
     mockedCart.removeItem.mockResolvedValue(undefined);
 
     const order = await createOrder('u1', 'Bearer tok', key());
-    expect(spy).toHaveBeenCalledWith(
-      'order.created',
-      expect.objectContaining({ type: 'order.created', orderId: order.id, total: 10 })
-    );
+    const criado = await prisma.outboxEvent.findFirst({
+      where: { routingKey: 'order.created' },
+    });
+    expect(criado).not.toBeNull();
+    expect(criado?.status).toBe('PENDING');
+    expect(criado?.payload as Record<string, unknown>).toMatchObject({
+      type: 'order.created',
+      orderId: order.id,
+      total: 10,
+    });
 
-    spy.mockClear();
     await changeOrderStatus(order.id, OrderStatus.PAGO, 'admin');
-    expect(spy).toHaveBeenCalledWith(
-      'order.status_changed',
-      expect.objectContaining({ type: 'order.status_changed', orderId: order.id, status: 'PAGO' })
-    );
+    const mudou = await prisma.outboxEvent.findFirst({
+      where: { routingKey: 'order.status_changed' },
+    });
+    expect(mudou).not.toBeNull();
+    expect(mudou?.payload as Record<string, unknown>).toMatchObject({
+      type: 'order.status_changed',
+      orderId: order.id,
+      status: 'PAGO',
+    });
+  });
+});
 
-    spy.mockRestore();
+describe('cleanup pos-commit (4.4)', () => {
+  it('falha ao limpar o carrinho apos o commit nao afeta pedido nem outbox', async () => {
+    mockedCart.getCart.mockResolvedValue(
+      cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
+    );
+    mockedInv.reserve.mockResolvedValue(undefined);
+    mockedCart.removeItem.mockRejectedValue(new Error('cart down'));
+
+    const order = await createOrder('u1', 'Bearer tok', key());
+    expect(order.status).toBe('PENDENTE');
+
+    const evt = await prisma.outboxEvent.findFirst({ where: { routingKey: 'order.created' } });
+    expect(evt).not.toBeNull();
+    const rec = await prisma.idempotencyRecord.findFirst({ where: { orderId: order.id } });
+    expect(rec?.status).toBe('COMPLETED');
   });
 });
