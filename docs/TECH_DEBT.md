@@ -41,7 +41,7 @@ abaixo sao conhecidas e aceitas para o 8a; o destino de cada uma esta marcado.
 
 - **[EXCECAO DE SEGURANCA ACEITA — Fase 7] Authz por dono/servico da reserva:** a posse ESTRUTURAL foi paga no 7a (reservas amarradas ao `orderId`; `release(orderId)` so toca o que e do pedido). Porem a AUTORIZACAO nao esta completa: hoje qualquer ADMIN/SELLER autenticado libera qualquer `orderId`, e qualquer papel logado reserva com `orderId` arbitrario. Isso NAO e "divida paga" — e uma exposicao conhecida e deliberadamente aceita para este estagio (sem gateway/identidade de servico). Resolucao: autenticacao servico-a-servico (token interno/mTLS) + vincular `orderId` a claims confiaveis. Destino: Fase 7. O 7b usara token de servico como ponte.
 - **[Politica documentada] Drain de `reserved` orfao na migracao do 7a:** a migration zerou `inventory.reserved` onde nao havia linha de `reservation` (o modelo antigo mantinha o contador sem reserva rastreavel). Seguro aqui porque nao ha pedidos reais. Num sistema com dados reais, a estrategia teria que ser backfill (criar reservas a partir do estado antigo), nao drain.
-- **Mensageria do order-service (Bloco 8) -- parcialmente paga no 8a:** PAGO no 8a: (a) guard de contrato endurecido no consumer (rejeita schema incorreto, nao so shape minimo); (b) testes automatizados -- publisher (RABBITMQ_URL ausente, no-op sem canal, publish persistente + waitForConfirms, esgotamento de retry, close idempotente) e consumer (evento valido, JSON malformado, schema incorreto, roteamento por tipo, sanitize); (c) encerramento gracioso SIGINT/SIGTERM no order-service e no notification-service. PAGO no 8b-1: at-least-once via outbox + retry transitorio/permanente do lado produtor. PENDENTE -> 8b-2: dead-letter queue e retry transitorio/permanente no consumidor. Levantado nos reviews do PR #35; reconciliado com o split 8a/8b.
+- **Mensageria do order-service (Bloco 8) -- parcialmente paga no 8a:** PAGO no 8a: (a) guard de contrato endurecido no consumer (rejeita schema incorreto, nao so shape minimo); (b) testes automatizados -- publisher (RABBITMQ_URL ausente, no-op sem canal, publish persistente + waitForConfirms, esgotamento de retry, close idempotente) e consumer (evento valido, JSON malformado, schema incorreto, roteamento por tipo, sanitize); (c) encerramento gracioso SIGINT/SIGTERM no order-service e no notification-service. PAGO no 8b-1: at-least-once via outbox + auto-reconnect (relay) + evento nunca abandonado. PENDENTE -> 8b-2: dead-letter queue, classificacao transitorio/permanente + backoff/quarentena, e dedup no consumidor. Levantado nos reviews do PR #35; reconciliado com o split 8a/8b.
 
 ---
 
@@ -107,3 +107,19 @@ abaixo sao conhecidas e aceitas para o 8a; o destino de cada uma esta marcado.
 ## BACKLOG DE FEATURES (pós-MVP)
 
 - **Login social via OAuth2 com Google:** [herdada da Fase 2] feature de produto, sem fase definida — retomar no backlog pós-MVP.
+
+
+### Bloco 8b-1 — estado das dividas apos review do PR #43
+
+Pago e verificado no 8b-1:
+- Entrega at-least-once via outbox transacional (evento no mesmo commit do pedido).
+- Auto-reconnect do publisher (o relay reconecta a cada ciclo).
+- Falha de publicacao NAO abandona o evento (mantem PENDING; retry pelo intervalo do relay).
+- Shutdown aguarda o ciclo ativo do relay; start idempotente; ordem deterministica (createdAt, id).
+
+Aberto, com destino:
+- **[8b-2] Consumer idempotente (dedup por eventId):** a janela publish->markSent permite reentrega (natural do at-least-once). Hoje o consumer e stub que so loga (duplicata = log repetido, inofensivo). A dedup por eventId e PRE-REQUISITO OBRIGATORIO antes de o consumer executar qualquer efeito real (e-mail/push/etc.). [review PR #43, 4.2]
+- **[8b-2] Classificacao transitorio/permanente + backoff + quarentena/redrive:** publish falho hoje volta a PENDING e retenta pelo poll (sem backoff exponencial); nao ha quarentena de evento "poison" nem mecanismo de redrive. O enum FAILED existe reservado para isso. [review PR #43, 4.1]
+- **[8b-2] Dead-letter queue** no consumidor. [review PR #43]
+- **[Fase 7] Claim atomico entre instancias do relay (FOR UPDATE SKIP LOCKED / lease):** hoje roda 1 instancia; com multiplas, dois relays publicariam o mesmo evento e as marcacoes de estado poderiam se sobrepor. [review PR #43, 4.3]
+- **[Fase 10] Retencao/limpeza da outbox:** SENT/FAILED crescem sem politica e o payload guarda userId/total; definir arquivamento/cleanup e minimizar campos. [review PR #43, 3.1]
