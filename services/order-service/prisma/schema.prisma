@@ -100,3 +100,27 @@ model IdempotencyRecord {
   @@index([status])
   @@map("idempotency_records")
 }
+
+enum OutboxStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model OutboxEvent {
+  id         String       @id @default(uuid())
+  // eventId que viaja no proprio evento — unico: correlaciona e permite o
+  // consumidor deduplicar (idempotencia do 8b-2).
+  eventId    String       @unique
+  routingKey String
+  payload    Json
+  status     OutboxStatus @default(PENDING)
+  attempts   Int          @default(0)
+  lastError  String?
+  createdAt  DateTime     @default(now())
+  sentAt     DateTime?
+
+  // Polling do relay: PENDING mais antigos primeiro.
+  @@index([status, createdAt])
+  @@map("outbox_events")
+}

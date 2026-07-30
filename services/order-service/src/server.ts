@@ -5,6 +5,7 @@ import app from './app';
 import { connectDatabase } from './config/database';
 import { validateRequiredEnv, resolvePort } from './config/env';
 import { initEventPublisher, closeEventPublisher } from './events/publisher';
+import { startOutboxRelay, stopOutboxRelay } from './events/outbox.relay';
 
 async function startServer() {
   // process.exit fica SO aqui, no ponto de entrada.
@@ -35,9 +36,13 @@ async function startServer() {
     );
   });
 
+  // Relay da outbox: publica os eventos gravados na transacao (at-least-once).
+  startOutboxRelay();
+
   // Encerramento gracioso: drena o HTTP (com teto), fecha o publisher e sai.
   async function shutdown(signal: string): Promise<void> {
     console.log('[order] ' + signal + ' recebido; encerrando graciosamente...');
+    stopOutboxRelay();
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 10000);
       server.close(() => {

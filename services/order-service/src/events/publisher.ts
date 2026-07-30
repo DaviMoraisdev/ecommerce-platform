@@ -125,15 +125,17 @@ function disableChannel(broken: AmqpConfirmChannel): void {
   void closeQuietly(broken);
 }
 
-// BEST-EFFORT com deadline: se o canal estiver indisponivel ou a confirmacao
-// nao chegar a tempo, registra e retorna — e desativa o canal quebrado.
-// Nunca pendura o chamador (createOrder ja commitou). Entrega at-most-once.
-export async function publishEvent(routingKey: string, payload: object): Promise<void> {
+
+export function isPublisherReady(): boolean {
+  return channel !== null;
+}
+
+// Publica com confirmacao e deadline. Retorna true se confirmado; false se
+// falhou (canal indisponivel, erro ou timeout), desativando o canal quebrado.
+// Nao lanca: o chamador (relay) decide o retry pelo resultado.
+export async function publish(routingKey: string, payload: object): Promise<boolean> {
   const ch = channel;
-  if (!ch) {
-    console.warn('[events] canal indisponivel; evento descartado (' + routingKey + ')');
-    return;
-  }
+  if (!ch) return false;
   try {
     const body = Buffer.from(JSON.stringify(payload));
     ch.publish(EXCHANGE, routingKey, body, {
@@ -141,12 +143,14 @@ export async function publishEvent(routingKey: string, payload: object): Promise
       contentType: 'application/json',
     });
     await withTimeout(ch.waitForConfirms(), PUBLISH_TIMEOUT_MS, 'confirm ' + routingKey);
+    return true;
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.error(
       '[events] falha ao publicar ' + routingKey + ': ' + reason + ' (canal desativado)'
     );
     disableChannel(ch);
+    return false;
   }
 }
 
