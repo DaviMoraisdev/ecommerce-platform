@@ -29,6 +29,17 @@ describe('outbox.repository', () => {
     expect(rows[0].eventId).toBe('e1');
   });
 
+  it('rollback da transacao NAO persiste a outbox (atomicidade)', async () => {
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await enqueue(tx, { eventId: 'rb', routingKey: 'order.created', payload: {} });
+        throw new Error('rollback forcado');
+      })
+    ).rejects.toThrow('rollback forcado');
+    const rows = await prisma.outboxEvent.findMany({ where: { eventId: 'rb' } });
+    expect(rows).toHaveLength(0);
+  });
+
   it('fetchPending retorna os mais antigos primeiro', async () => {
     await prisma.$transaction(async (tx) => {
       await enqueue(tx, { eventId: 'a', routingKey: 'order.created', payload: {} });
@@ -52,19 +63,16 @@ describe('outbox.repository', () => {
     expect(upd.sentAt).not.toBeNull();
   });
 
-  it('markRetry incrementa attempts e vira FAILED no teto', async () => {
+  it('markRetry incrementa attempts e MANTEM PENDING (nao abandona)', async () => {
     await prisma.$transaction(async (tx) => {
       await enqueue(tx, { eventId: 'e1', routingKey: 'order.created', payload: {} });
     });
     const [row] = await fetchPending(1);
-    await markRetry(row.id, 0, 'erro x');
-    let r = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: row.id } });
-    expect(r.attempts).toBe(1);
+    await markRetry(row.id, 'erro x');
+    await markRetry(row.id, 'erro y');
+    const r = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: row.id } });
+    expect(r.attempts).toBe(2);
     expect(r.status).toBe('PENDING');
-    expect(r.lastError).toBe('erro x');
-
-    await markRetry(row.id, 9, 'erro final');
-    r = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: row.id } });
-    expect(r.status).toBe('FAILED');
+    expect(r.lastError).toBe('erro y');
   });
 });

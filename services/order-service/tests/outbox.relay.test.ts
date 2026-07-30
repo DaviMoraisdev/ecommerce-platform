@@ -2,7 +2,7 @@ jest.mock('../src/events/publisher');
 jest.mock('../src/events/outbox.repository');
 import * as publisher from '../src/events/publisher';
 import * as outbox from '../src/events/outbox.repository';
-import { tick } from '../src/events/outbox.relay';
+import { tick, startOutboxRelay, stopOutboxRelay } from '../src/events/outbox.relay';
 
 const isReady = publisher.isPublisherReady as jest.Mock;
 const doPublish = publisher.publish as jest.Mock;
@@ -11,12 +11,15 @@ const fetchPending = outbox.fetchPending as jest.Mock;
 const markSent = outbox.markSent as jest.Mock;
 const markRetry = outbox.markRetry as jest.Mock;
 
-describe('outbox.relay tick', () => {
+describe('outbox.relay', () => {
+  let log: jest.SpyInstance;
   beforeEach(() => {
     jest.clearAllMocks();
+    log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
   });
-  afterEach(() => {
+  afterEach(async () => {
+    await stopOutboxRelay();
     jest.restoreAllMocks();
   });
 
@@ -40,14 +43,51 @@ describe('outbox.relay tick', () => {
     expect(markRetry).not.toHaveBeenCalled();
   });
 
-  it('publish falha: markRetry com o attempts atual', async () => {
+  it('publish falha: markRetry mantem o evento (sem abandonar)', async () => {
     isReady.mockReturnValue(true);
     fetchPending.mockResolvedValue([
-      { id: '1', routingKey: 'order.created', payload: {}, attempts: 2 },
+      { id: '1', routingKey: 'order.created', payload: {}, attempts: 5 },
     ]);
     doPublish.mockResolvedValue(false);
     await tick();
-    expect(markRetry).toHaveBeenCalledWith('1', 2, expect.any(String));
+    expect(markRetry).toHaveBeenCalledWith('1', expect.any(String));
     expect(markSent).not.toHaveBeenCalled();
+  });
+
+  it('startOutboxRelay e idempotente (loga inicio uma vez)', async () => {
+    isReady.mockReturnValue(false);
+    doInit.mockRejectedValue(new Error('down'));
+    startOutboxRelay();
+    startOutboxRelay();
+    await new Promise((r) => setTimeout(r, 10));
+    const inicios = log.mock.calls.filter((c) => String(c[0]).includes('outbox relay iniciado'));
+    expect(inicios).toHaveLength(1);
+  });
+
+  it('stopOutboxRelay aguarda o tick em andamento', async () => {
+    isReady.mockReturnValue(true);
+    let resolvePublish!: (v: boolean) => void;
+    fetchPending.mockResolvedValue([
+      { id: '1', routingKey: 'order.created', payload: {}, attempts: 0 },
+    ]);
+    doPublish.mockReturnValue(
+      new Promise<boolean>((res) => {
+        resolvePublish = res;
+      })
+    );
+    markSent.mockResolvedValue(undefined);
+
+    startOutboxRelay();
+    await new Promise((r) => setTimeout(r, 10));
+    let done = false;
+    const stopP = stopOutboxRelay().then(() => {
+      done = true;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(done).toBe(false);
+    resolvePublish(true);
+    await stopP;
+    expect(done).toBe(true);
+    expect(markSent).toHaveBeenCalledWith('1');
   });
 });

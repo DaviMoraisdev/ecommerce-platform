@@ -42,7 +42,7 @@ async function startServer() {
   // Encerramento gracioso: drena o HTTP (com teto), fecha o publisher e sai.
   async function shutdown(signal: string): Promise<void> {
     console.log('[order] ' + signal + ' recebido; encerrando graciosamente...');
-    stopOutboxRelay();
+    await stopOutboxRelay();
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 10000);
       server.close(() => {

@@ -218,3 +218,21 @@ describe('emissao via outbox (8b)', () => {
     });
   });
 });
+
+describe('cleanup pos-commit (4.4)', () => {
+  it('falha ao limpar o carrinho apos o commit nao afeta pedido nem outbox', async () => {
+    mockedCart.getCart.mockResolvedValue(
+      cart([{ productId: 'p1', quantity: 1, name: 'X', price: 10, subtotal: 10, available: 5 }])
+    );
+    mockedInv.reserve.mockResolvedValue(undefined);
+    mockedCart.removeItem.mockRejectedValue(new Error('cart down'));
+
+    const order = await createOrder('u1', 'Bearer tok', key());
+    expect(order.status).toBe('PENDENTE');
+
+    const evt = await prisma.outboxEvent.findFirst({ where: { routingKey: 'order.created' } });
+    expect(evt).not.toBeNull();
+    const rec = await prisma.idempotencyRecord.findFirst({ where: { orderId: order.id } });
+    expect(rec?.status).toBe('COMPLETED');
+  });
+});

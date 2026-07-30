@@ -11,13 +11,14 @@ const BATCH = toIntInRange(process.env.OUTBOX_BATCH, 20, 1, 500);
 let timer: NodeJS.Timeout | null = null;
 let stopped = false;
 let running = false;
+let started = false;
+let currentTick: Promise<void> | null = null;
 
-// Um ciclo do relay. So publica se o publisher estiver conectado; se nao
-// estiver, TENTA reconectar e, se ainda falhar, SAI sem penalizar os eventos
-// (falha transitoria de infra != mensagem ruim). Isso paga a divida de
-// auto-reconnect e distingue transitorio de permanente.
+// Um ciclo. So publica se o publisher estiver pronto; se nao, TENTA reconectar e,
+// se ainda falhar, SAI sem tocar nos eventos (broker fora = transitorio, nao
+// penaliza). Falha por publicacao mantem o evento PENDING (markRetry).
 export async function tick(): Promise<void> {
-  if (running) return; // evita sobreposicao se um ciclo demorar mais que o intervalo
+  if (running) return;
   running = true;
   try {
     if (!isPublisherReady()) {
@@ -35,9 +36,8 @@ export async function tick(): Promise<void> {
       if (ok) {
         await outbox.markSent(ev.id);
       } else {
-        await outbox.markRetry(ev.id, ev.attempts, 'publish falhou');
-        // Canal caiu no meio do lote: retoma no proximo ciclo (nao penaliza o resto).
-        if (!isPublisherReady()) break;
+        await outbox.markRetry(ev.id, 'publish falhou');
+        if (!isPublisherReady()) break; // canal caiu no meio do lote: retoma depois
       }
     }
   } catch (err) {
@@ -48,20 +48,34 @@ export async function tick(): Promise<void> {
 }
 
 export function startOutboxRelay(): void {
+  if (started) return; // idempotente: nao cria loops/timers duplicados
+  started = true;
   stopped = false;
   const loop = async (): Promise<void> => {
     if (stopped) return;
-    await tick();
+    currentTick = tick();
+    await currentTick;
+    currentTick = null;
     if (!stopped) timer = setTimeout(() => void loop(), POLL_INTERVAL_MS);
   };
   console.log('[relay] outbox relay iniciado (intervalo ' + POLL_INTERVAL_MS + 'ms, lote ' + BATCH + ')');
   void loop();
 }
 
-export function stopOutboxRelay(): void {
+// Para o relay e AGUARDA o ciclo em andamento terminar, para nao encerrar no meio
+// de uma publicacao/atualizacao de estado.
+export async function stopOutboxRelay(): Promise<void> {
   stopped = true;
   if (timer) {
     clearTimeout(timer);
     timer = null;
   }
+  if (currentTick) {
+    try {
+      await currentTick;
+    } catch {
+      /* erro do ciclo ja foi logado */
+    }
+  }
+  started = false;
 }
