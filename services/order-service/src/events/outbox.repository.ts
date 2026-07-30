@@ -35,8 +35,7 @@ export async function markSent(id: string): Promise<void> {
   });
 }
 
-// Falha ao publicar: MANTEM PENDING (retry indefinido — o intervalo do relay e o
-// backoff) e registra attempts/lastError so para observabilidade. Nao abandona o
+// Falha ao publicar: MANTEM PENDING (retry em intervalo fixo do relay; sem backoff exponencial ainda -> ver TECH_DEBT) e registra attempts/lastError so para observabilidade. Nao abandona o
 // evento, preservando o at-least-once. Quarentena/redrive de evento "poison"
 // fica para 8b-2/Fase 10 (documentado no TECH_DEBT).
 export async function markRetry(id: string, error: string): Promise<void> {

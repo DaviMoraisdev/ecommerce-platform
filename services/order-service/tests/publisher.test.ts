@@ -136,4 +136,39 @@ describe('event publisher', () => {
     expect(conn.close).toHaveBeenCalled();
     expect(isPublisherReady()).toBe(false);
   });
+
+  it('initEventPublisher e single-flight (concorrente = 1 connect)', async () => {
+    let resolveConn!: (v: unknown) => void;
+    connect.mockImplementation(
+      () => new Promise((res) => {
+        resolveConn = res;
+      })
+    );
+    const p1 = initEventPublisher();
+    const p2 = initEventPublisher();
+    resolveConn(makeConnection(makeChannel()));
+    await Promise.all([p1, p2]);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('timeout desativa canal+conexao e reconecta no init seguinte', async () => {
+    const ch1 = makeChannel({
+      waitForConfirms: jest.fn().mockReturnValue(new Promise(() => undefined)),
+    });
+    const conn1 = makeConnection(ch1);
+    const ch2 = makeChannel();
+    const conn2 = makeConnection(ch2);
+    connect.mockResolvedValueOnce(conn1).mockResolvedValueOnce(conn2);
+
+    await initEventPublisher();
+    expect(await publish('order.created', {})).toBe(false);
+    expect(ch1.close).toHaveBeenCalled();
+    expect(conn1.close).toHaveBeenCalled();
+    expect(isPublisherReady()).toBe(false);
+
+    await initEventPublisher();
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(isPublisherReady()).toBe(true);
+    expect(await publish('order.created', {})).toBe(true);
+  });
 });

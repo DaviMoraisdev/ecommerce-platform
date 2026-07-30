@@ -2,7 +2,12 @@ jest.mock('../src/events/publisher');
 jest.mock('../src/events/outbox.repository');
 import * as publisher from '../src/events/publisher';
 import * as outbox from '../src/events/outbox.repository';
-import { tick, startOutboxRelay, stopOutboxRelay } from '../src/events/outbox.relay';
+
+process.env.OUTBOX_POLL_INTERVAL_MS = '50';
+process.env.OUTBOX_STOP_TIMEOUT_MS = '50';
+
+const { tick, startOutboxRelay, stopOutboxRelay } =
+  require('../src/events/outbox.relay') as typeof import('../src/events/outbox.relay');
 
 const isReady = publisher.isPublisherReady as jest.Mock;
 const doPublish = publisher.publish as jest.Mock;
@@ -17,6 +22,7 @@ describe('outbox.relay', () => {
     jest.clearAllMocks();
     log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
   });
   afterEach(async () => {
     await stopOutboxRelay();
@@ -54,6 +60,17 @@ describe('outbox.relay', () => {
     expect(markSent).not.toHaveBeenCalled();
   });
 
+  it('markSent falha apos publish ok: nao lanca e nao marca (evento fica recuperavel)', async () => {
+    isReady.mockReturnValue(true);
+    fetchPending.mockResolvedValue([
+      { id: '1', routingKey: 'order.created', payload: {}, attempts: 0 },
+    ]);
+    doPublish.mockResolvedValue(true);
+    markSent.mockRejectedValue(new Error('db down'));
+    await expect(tick()).resolves.toBeUndefined();
+    expect(markSent).toHaveBeenCalledWith('1');
+  });
+
   it('startOutboxRelay e idempotente (loga inicio uma vez)', async () => {
     isReady.mockReturnValue(false);
     doInit.mockRejectedValue(new Error('down'));
@@ -89,5 +106,18 @@ describe('outbox.relay', () => {
     await stopP;
     expect(done).toBe(true);
     expect(markSent).toHaveBeenCalledWith('1');
+  });
+
+  it('stopOutboxRelay respeita o teto se o tick travar', async () => {
+    isReady.mockReturnValue(true);
+    fetchPending.mockResolvedValue([
+      { id: '1', routingKey: 'order.created', payload: {}, attempts: 0 },
+    ]);
+    doPublish.mockReturnValue(new Promise(() => undefined)); // nunca resolve
+    startOutboxRelay();
+    await new Promise((r) => setTimeout(r, 10));
+    const inicio = Date.now();
+    await stopOutboxRelay();
+    expect(Date.now() - inicio).toBeLessThan(1000);
   });
 });

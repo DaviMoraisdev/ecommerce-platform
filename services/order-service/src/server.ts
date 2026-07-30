@@ -4,7 +4,7 @@ dotenv.config();
 import app from './app';
 import { connectDatabase } from './config/database';
 import { validateRequiredEnv, resolvePort } from './config/env';
-import { initEventPublisher, closeEventPublisher } from './events/publisher';
+import { closeEventPublisher } from './events/publisher';
 import { startOutboxRelay, stopOutboxRelay } from './events/outbox.relay';
 
 async function startServer() {
@@ -27,16 +27,8 @@ async function startServer() {
     console.log('Order service rodando na porta ' + port);
   });
 
-  // Publisher em BACKGROUND: nao bloqueia o boot. Se o broker estiver fora ou
-  // lento, o servico ja esta atendendo; eventos sao best-effort (at-most-once).
-  void initEventPublisher().catch((err) => {
-    console.warn(
-      '[events] publisher indisponivel, seguindo sem eventos: ' +
-        (err instanceof Error ? err.message : String(err))
-    );
-  });
-
-  // Relay da outbox: publica os eventos gravados na transacao (at-least-once).
+  // O relay e o UNICO responsavel por conectar o publisher (single-flight) e
+  // publicar os eventos gravados na transacao (at-least-once). Nao bloqueia o boot.
   startOutboxRelay();
 
   // Encerramento gracioso: drena o HTTP (com teto), fecha o publisher e sai.

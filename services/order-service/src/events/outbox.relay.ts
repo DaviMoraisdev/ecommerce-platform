@@ -7,6 +7,7 @@ function toIntInRange(raw: string | undefined, fallback: number, min: number, ma
 }
 const POLL_INTERVAL_MS = toIntInRange(process.env.OUTBOX_POLL_INTERVAL_MS, 1000, 50, 60000);
 const BATCH = toIntInRange(process.env.OUTBOX_BATCH, 20, 1, 500);
+const STOP_TIMEOUT_MS = toIntInRange(process.env.OUTBOX_STOP_TIMEOUT_MS, 5000, 1, 60000);
 
 let timer: NodeJS.Timeout | null = null;
 let stopped = false;
@@ -71,10 +72,20 @@ export async function stopOutboxRelay(): Promise<void> {
     timer = null;
   }
   if (currentTick) {
+    // aguarda o ciclo ativo, mas com teto: um tick travado nao pendura o shutdown
+    let timeoutId: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timeoutId = setTimeout(() => {
+        console.warn(
+          '[relay] tick nao terminou em ' + STOP_TIMEOUT_MS + 'ms; seguindo o shutdown (evento fica PENDING)'
+        );
+        resolve();
+      }, STOP_TIMEOUT_MS);
+    });
     try {
-      await currentTick;
-    } catch {
-      /* erro do ciclo ja foi logado */
+      await Promise.race([currentTick.catch(() => undefined), deadline]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
   started = false;

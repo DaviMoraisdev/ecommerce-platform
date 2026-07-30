@@ -67,7 +67,19 @@ async function closeQuietly(resource: { close(): Promise<void> } | null): Promis
   }
 }
 
-export async function initEventPublisher(): Promise<void> {
+let connecting: Promise<void> | null = null;
+
+// Single-flight: chamadas concorrentes (boot + relay) compartilham a MESMA
+// conexao em andamento, evitando duas conexoes AMQP em corrida.
+export function initEventPublisher(): Promise<void> {
+  if (connecting) return connecting;
+  connecting = doInitEventPublisher().finally(() => {
+    connecting = null;
+  });
+  return connecting;
+}
+
+async function doInitEventPublisher(): Promise<void> {
   const url = process.env.RABBITMQ_URL;
   if (!url) {
     console.warn(
@@ -94,7 +106,8 @@ export async function initEventPublisher(): Promise<void> {
         );
       });
       conn.on('close', () => {
-        console.warn('[events] conexao fechada; publisher desativado ate reiniciar o processo');
+        if (connection !== conn) return; // conexao antiga: nao mexe no estado atual
+        console.warn('[events] conexao fechada; publisher desativado');
         connection = null;
         channel = null;
       });
@@ -118,9 +131,14 @@ export async function initEventPublisher(): Promise<void> {
 
 // Circuit-breaker: tira o canal quebrado do estado global e o fecha em
 // background. Evita reusar um canal que ja excedeu o deadline de confirmacao.
+// Canal quebrado: derruba canal E conexao (evita vazar a conexao no reconnect) e
+// zera o estado, para o proximo ciclo reconectar limpo.
 function disableChannel(broken: AmqpConfirmChannel): void {
   if (channel === broken) {
     channel = null;
+    const conn = connection;
+    connection = null;
+    void closeQuietly(conn);
   }
   void closeQuietly(broken);
 }
