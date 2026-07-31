@@ -118,8 +118,21 @@ Pago e verificado no 8b-1:
 - Shutdown aguarda o ciclo ativo do relay; start idempotente; ordem deterministica (createdAt, id).
 
 Aberto, com destino:
-- **[8b-2] Consumer idempotente (dedup por eventId):** a janela publish->markSent permite reentrega (natural do at-least-once). Hoje o consumer e stub que so loga (duplicata = log repetido, inofensivo). A dedup por eventId e PRE-REQUISITO OBRIGATORIO antes de o consumer executar qualquer efeito real (e-mail/push/etc.). [review PR #43, 4.2]
+- **[8b-2 PAGO] Consumer idempotente (dedup por eventId):** a janela publish->markSent permite reentrega (natural do at-least-once). Hoje o consumer e stub que so loga (duplicata = log repetido, inofensivo). A dedup por eventId e PRE-REQUISITO OBRIGATORIO antes de o consumer executar qualquer efeito real (e-mail/push/etc.). [review PR #43, 4.2]
 - **[8b-2] Classificacao transitorio/permanente + backoff + quarentena/redrive:** publish falho hoje volta a PENDING e retenta pelo poll (sem backoff exponencial); nao ha quarentena de evento "poison" nem mecanismo de redrive. O enum FAILED existe reservado para isso. [review PR #43, 4.1]
-- **[8b-2] Dead-letter queue** no consumidor. [review PR #43]
+- **[8b-2 PAGO] Dead-letter queue** no consumidor. [review PR #43]
 - **[Fase 7] Claim atomico entre instancias do relay (FOR UPDATE SKIP LOCKED / lease):** hoje roda 1 instancia; com multiplas, dois relays publicariam o mesmo evento e as marcacoes de estado poderiam se sobrepor. [review PR #43, 4.3]
 - **[Fase 10] Retencao/limpeza da outbox:** SENT/FAILED crescem sem politica e o payload guarda userId/total; definir arquivamento/cleanup e minimizar campos. [review PR #43, 3.1]
+
+
+### Bloco 8b-2 — estado (consumer confiavel)
+
+Pago e verificado (e2e: mesmo eventId 2x -> processado 1x; payload invalido -> DLQ):
+- Consumer idempotente por eventId (Redis SET NX + TTL, claim-first).
+- eventId obrigatorio no contrato do consumer.
+- Dead-letter queue (DLX fanout -> notifications.orders.dlq): mensagem envenenada vai pra DLQ em vez de sumir.
+
+Aberto, com destino:
+- **[follow-up produtor] Classificacao transitorio/permanente + backoff + quarentena/redrive** do relay (head-of-line blocking, achado 4.2 do review do PR #43): hoje o publish falho retenta em intervalo fixo, sem backoff/quarentena.
+- **[Fase 7] Migracao de args de fila duravel:** args sao imutaveis no RabbitMQ; adicionar a DLX exigiu deletar a fila antiga (one-time manual). Padronizar via policy/quorum ou script de migracao no deploy.
+- **Limite conhecido (semantica 2a):** claim-first tem a janela "claim ok -> crash antes de processar" (efeito perdido). Aceitavel com consumer stub; efeito real transacional seria outra evolucao.
