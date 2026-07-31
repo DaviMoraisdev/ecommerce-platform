@@ -14,7 +14,8 @@
   "license": "ISC",
   "dependencies": {
     "amqplib": "^0.10.4",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "ioredis": "^6.0.0"
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.5",

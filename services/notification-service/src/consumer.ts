@@ -10,7 +10,7 @@ export function sanitizeForLog(s: string): string {
 
 export interface OrderEvent {
   type: string;
-  eventId?: string;
+  eventId: string;
   orderId: string;
   userId?: string;
   status?: string;
@@ -38,7 +38,7 @@ export function parseEvent(raw: string): OrderEvent | null {
   if (typeof type !== 'string' || type.trim() === '') return null;
   if (typeof orderId !== 'string' || orderId.trim() === '') return null;
 
-  if (o.eventId !== undefined && typeof o.eventId !== 'string') return null;
+  if (typeof o.eventId !== 'string' || o.eventId.trim() === '') return null;
   if (o.userId !== undefined && typeof o.userId !== 'string') return null;
   if (o.status !== undefined && typeof o.status !== 'string') return null;
   if (o.at !== undefined && typeof o.at !== 'string') return null;
@@ -56,7 +56,7 @@ export function parseEvent(raw: string): OrderEvent | null {
 
   return {
     type,
-    eventId: o.eventId as string | undefined,
+    eventId: o.eventId as string,
     orderId,
     userId: o.userId as string | undefined,
     status: o.status as string | undefined,

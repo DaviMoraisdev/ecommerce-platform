@@ -1,50 +1,75 @@
 import dotenv from 'dotenv';
 dotenv.config();
 import { connect } from './config/connection';
-import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY } from './config/topology';
+import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY, DLX, DLQ } from './config/topology';
 import { decideMessage, handleEvent, sanitizeForLog } from './consumer';
+import { claimEvent } from './idempotency';
+import { closeRedis } from './config/redis';
 
 async function start() {
   const connection = await connect();
   const channel = await connection.createChannel();
 
-  // O consumidor e dono da fila: declara exchange, fila e binding.
   await channel.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
-  await channel.assertQueue(QUEUE, { durable: true });
+
+  // Dead-letter: DLX fanout -> DLQ duravel. Mensagem com nack(false,false) e
+  // roteada para a DLQ em vez de sumir.
+  await channel.assertExchange(DLX, 'fanout', { durable: true });
+  await channel.assertQueue(DLQ, { durable: true });
+  await channel.bindQueue(DLQ, DLX, '');
+
+  // Fila principal com dead-letter. NOTA: args de fila duravel sao imutaveis no
+  // RabbitMQ; migrar (adicionar a DLX) exige recriar a fila (migracao one-time:
+  // deletar a fila antiga antes de subir). Registrado no TECH_DEBT.
+  await channel.assertQueue(QUEUE, {
+    durable: true,
+    arguments: { 'x-dead-letter-exchange': DLX },
+  });
   await channel.bindQueue(QUEUE, EXCHANGE, BINDING_KEY);
   await channel.prefetch(1);
 
   console.log(
-    '[notification] consumindo ' + QUEUE + ' (binding ' + BINDING_KEY + ' no exchange ' + EXCHANGE + ')'
+    '[notification] consumindo ' + QUEUE + ' (binding ' + BINDING_KEY + ' no exchange ' + EXCHANGE + '); DLQ: ' + DLQ
   );
 
-  await channel.consume(QUEUE, (msg) => {
+  await channel.consume(QUEUE, async (msg) => {
     if (!msg) return;
     const routingKey = msg.fields.routingKey;
     const raw = msg.content.toString();
 
     const decision = decideMessage(raw, routingKey);
     if (!decision.ack || !decision.event) {
-      // Invalido/incompleto = mensagem envenenada. Descarta sem requeue (nao loopa).
+      // Invalido/envenenado -> DLQ (nack sem requeue; DLX roteia).
       console.error(
-        '[notification] descartado (' + sanitizeForLog(routingKey) + '): ' + decision.reason + ' :: ' + sanitizeForLog(raw)
+        '[notification] descartado para DLQ (' + sanitizeForLog(routingKey) + '): ' + decision.reason
       );
       channel.nack(msg, false, false);
       return;
     }
 
+    const event = decision.event;
     try {
-      handleEvent(decision.event);
-      channel.ack(msg); // ack SO apos processar com sucesso
+      const primeiro = await claimEvent(event.eventId);
+      if (!primeiro) {
+        // Duplicata: eventId ja reivindicado -> ack e ignora (sem reprocessar).
+        console.log('[notification] duplicata ignorada (eventId ' + sanitizeForLog(event.eventId) + ')');
+        channel.ack(msg);
+        return;
+      }
+      handleEvent(event);
+      channel.ack(msg);
     } catch (err) {
+      // Erro no store de idempotencia (ex.: Redis fora) ou no processamento:
+      // requeue para tentar de novo — nao perde e nao processa sem dedup.
       const reason = err instanceof Error ? err.message : String(err);
-      console.error('[notification] falha ao processar ' + sanitizeForLog(routingKey) + ': ' + reason);
-      channel.nack(msg, false, false);
+      console.error(
+        '[notification] falha ao processar/dedup ' + sanitizeForLog(routingKey) + ': ' + reason + ' (requeue)'
+      );
+      channel.nack(msg, false, true);
     }
   });
 
-  // Encerramento gracioso, idempotente. A flag evita que o listener de "close"
-  // (abaixo) reporte um shutdown intencional como crash (exit 1).
+  // Encerramento gracioso, idempotente.
   let shuttingDown = false;
   async function shutdown(signal: string): Promise<void> {
     if (shuttingDown) return;
@@ -60,6 +85,7 @@ async function start() {
     } catch {
       /* conexao ja fechada */
     }
+    await closeRedis();
     process.exit(0);
   }
   process.on('SIGINT', () => void shutdown('SIGINT'));
