@@ -149,3 +149,12 @@ Corrigido:
 
 Limite remanescente (documentado, aceito com consumer stub):
 - **Janela de crash entre o claim e o ack:** se o processo cair nesse meio, a reentrega trata como duplicata sem ter processado. Inerente ao at-least-once sem efeito transacional; para efeito real (e-mail/push) seria necessario efeito+claim atomicos (outbox no consumidor) -> evolucao futura.
+
+
+### Bloco 8b-2 — correcoes pos-review (2a rodada, PR #44)
+
+- **Falha no release nao e mais engolida:** se o processamento falha e o claim NAO consegue ser liberado, a mensagem vai pra DLQ (preservada) em vez de requeue (que viraria duplicata-ack = perda).
+- **Claim com token de propriedade + compare-and-delete (Lua):** releaseEvent so apaga o claim se ainda for deste consumo (nao apaga claim readquirido por outra instancia apos o TTL). Fecha o risco multi-instancia do DEL.
+- **Ping no Redis no boot** (fail-fast); REQUEUE_DELAY_MS com minimo (>=50); eventId canonico (rejeita espaco periferico); executeAction testado (ack / nack-dlq / requeue com atraso).
+
+Limite remanescente (documentado): janela de crash do PROCESSO entre o claim e o ack; efeito real futuro exigiria efeito+claim atomicos (outbox no consumidor).
