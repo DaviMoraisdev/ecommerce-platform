@@ -136,3 +136,16 @@ Aberto, com destino:
 - **[follow-up produtor] Classificacao transitorio/permanente + backoff + quarentena/redrive** do relay (head-of-line blocking, achado 4.2 do review do PR #43): hoje o publish falho retenta em intervalo fixo, sem backoff/quarentena.
 - **[Fase 7] Migracao de args de fila duravel:** args sao imutaveis no RabbitMQ; adicionar a DLX exigiu deletar a fila antiga (one-time manual). Padronizar via policy/quorum ou script de migracao no deploy.
 - **Limite conhecido (semantica 2a):** claim-first tem a janela "claim ok -> crash antes de processar" (efeito perdido). Aceitavel com consumer stub; efeito real transacional seria outra evolucao.
+
+
+### Bloco 8b-2 — correcoes pos-review (PR #44)
+
+Corrigido:
+- **Perda apos claim:** se handleEvent falha DEPOIS do claim, o claim e LIBERADO (DEL) e a mensagem faz requeue -> a reentrega reprocessa. Fases separadas (parse/claim/processa/recupera) em handleDelivery, com teste de todos os ramos.
+- **Hot loop no requeue:** atraso (REQUEUE_DELAY_MS) antes do nack(requeue) durante indisponibilidade do store.
+- **TTL de dedup** resolvido em runtime e validado (min 1min / max 7d). A garantia e TEMPORAL (janela do TTL), nao efeito unico eterno.
+- **eventId** com cap de tamanho (128) no parse.
+- **ioredis** alinhado ao cart (^5) + engines.node >=20; .env.example com newlines reais.
+
+Limite remanescente (documentado, aceito com consumer stub):
+- **Janela de crash entre o claim e o ack:** se o processo cair nesse meio, a reentrega trata como duplicata sem ter processado. Inerente ao at-least-once sem efeito transacional; para efeito real (e-mail/push) seria necessario efeito+claim atomicos (outbox no consumidor) -> evolucao futura.
