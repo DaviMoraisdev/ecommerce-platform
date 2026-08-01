@@ -1,50 +1,71 @@
 import dotenv from 'dotenv';
 dotenv.config();
 import { connect } from './config/connection';
-import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY } from './config/topology';
-import { decideMessage, handleEvent, sanitizeForLog } from './consumer';
+import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY, DLX, DLQ } from './config/topology';
+import { handleDelivery, executeAction, handleEvent, sanitizeForLog, DeliveryAction } from './consumer';
+import { claimEvent, releaseEvent, pingRedis } from './idempotency';
+import { closeRedis } from './config/redis';
+
+const REQUEUE_DELAY_MS = (() => {
+  const n = Number(process.env.REQUEUE_DELAY_MS);
+  return Number.isInteger(n) && n >= 50 && n <= 60000 ? n : 1000;
+})();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 async function start() {
+  // Fail-fast: valida o Redis ANTES de comecar a consumir (dependencia obrigatoria).
+  await pingRedis();
+
   const connection = await connect();
   const channel = await connection.createChannel();
 
-  // O consumidor e dono da fila: declara exchange, fila e binding.
   await channel.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
-  await channel.assertQueue(QUEUE, { durable: true });
+  await channel.assertExchange(DLX, 'fanout', { durable: true });
+  await channel.assertQueue(DLQ, { durable: true });
+  await channel.bindQueue(DLQ, DLX, '');
+
+  // Fila principal com dead-letter. NOTA: args de fila duravel sao imutaveis;
+  // adicionar a DLX exige recriar a fila (migracao one-time). Ver TECH_DEBT.
+  await channel.assertQueue(QUEUE, {
+    durable: true,
+    arguments: { 'x-dead-letter-exchange': DLX },
+  });
   await channel.bindQueue(QUEUE, EXCHANGE, BINDING_KEY);
   await channel.prefetch(1);
 
   console.log(
-    '[notification] consumindo ' + QUEUE + ' (binding ' + BINDING_KEY + ' no exchange ' + EXCHANGE + ')'
+    '[notification] consumindo ' + QUEUE + ' (binding ' + BINDING_KEY + ' no exchange ' + EXCHANGE + '); DLQ: ' + DLQ
   );
 
-  await channel.consume(QUEUE, (msg) => {
+  const deps = { claim: claimEvent, release: releaseEvent, handle: handleEvent };
+
+  await channel.consume(QUEUE, async (msg) => {
     if (!msg) return;
     const routingKey = msg.fields.routingKey;
     const raw = msg.content.toString();
 
-    const decision = decideMessage(raw, routingKey);
-    if (!decision.ack || !decision.event) {
-      // Invalido/incompleto = mensagem envenenada. Descarta sem requeue (nao loopa).
-      console.error(
-        '[notification] descartado (' + sanitizeForLog(routingKey) + '): ' + decision.reason + ' :: ' + sanitizeForLog(raw)
-      );
-      channel.nack(msg, false, false);
-      return;
+    let action: DeliveryAction;
+    try {
+      action = await handleDelivery(raw, routingKey, deps);
+    } catch (err) {
+      action = { type: 'nack-requeue', reason: err instanceof Error ? err.message : String(err) };
     }
 
-    try {
-      handleEvent(decision.event);
-      channel.ack(msg); // ack SO apos processar com sucesso
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      console.error('[notification] falha ao processar ' + sanitizeForLog(routingKey) + ': ' + reason);
-      channel.nack(msg, false, false);
+    const rk = sanitizeForLog(routingKey);
+    if (action.type === 'ack' && action.reason === 'duplicate') {
+      console.log('[notification] duplicata ignorada (' + rk + ')');
+    } else if (action.type === 'nack-dlq') {
+      console.error('[notification] DLQ (' + rk + '): ' + action.reason);
+    } else if (action.type === 'nack-requeue') {
+      console.warn('[notification] requeue (' + rk + '): ' + action.reason);
     }
+
+    await executeAction(channel, msg, action, () => sleep(REQUEUE_DELAY_MS));
   });
 
-  // Encerramento gracioso, idempotente. A flag evita que o listener de "close"
-  // (abaixo) reporte um shutdown intencional como crash (exit 1).
   let shuttingDown = false;
   async function shutdown(signal: string): Promise<void> {
     if (shuttingDown) return;
@@ -60,12 +81,12 @@ async function start() {
     } catch {
       /* conexao ja fechada */
     }
+    await closeRedis();
     process.exit(0);
   }
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  // Queda inesperada: so reinicia (exit 1) se NAO for shutdown intencional.
   connection.on('close', () => {
     if (shuttingDown) return;
     console.error('[notification] conexao fechada; encerrando (exit 1) para reiniciar');

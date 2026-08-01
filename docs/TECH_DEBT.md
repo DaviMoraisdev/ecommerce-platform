@@ -118,8 +118,50 @@ Pago e verificado no 8b-1:
 - Shutdown aguarda o ciclo ativo do relay; start idempotente; ordem deterministica (createdAt, id).
 
 Aberto, com destino:
-- **[8b-2] Consumer idempotente (dedup por eventId):** a janela publish->markSent permite reentrega (natural do at-least-once). Hoje o consumer e stub que so loga (duplicata = log repetido, inofensivo). A dedup por eventId e PRE-REQUISITO OBRIGATORIO antes de o consumer executar qualquer efeito real (e-mail/push/etc.). [review PR #43, 4.2]
+- **[8b-2 PAGO] Consumer idempotente (dedup por eventId):** a janela publish->markSent permite reentrega (natural do at-least-once). Hoje o consumer e stub que so loga (duplicata = log repetido, inofensivo). A dedup por eventId e PRE-REQUISITO OBRIGATORIO antes de o consumer executar qualquer efeito real (e-mail/push/etc.). [review PR #43, 4.2]
 - **[8b-2] Classificacao transitorio/permanente + backoff + quarentena/redrive:** publish falho hoje volta a PENDING e retenta pelo poll (sem backoff exponencial); nao ha quarentena de evento "poison" nem mecanismo de redrive. O enum FAILED existe reservado para isso. [review PR #43, 4.1]
-- **[8b-2] Dead-letter queue** no consumidor. [review PR #43]
+- **[8b-2 PAGO] Dead-letter queue** no consumidor. [review PR #43]
 - **[Fase 7] Claim atomico entre instancias do relay (FOR UPDATE SKIP LOCKED / lease):** hoje roda 1 instancia; com multiplas, dois relays publicariam o mesmo evento e as marcacoes de estado poderiam se sobrepor. [review PR #43, 4.3]
 - **[Fase 10] Retencao/limpeza da outbox:** SENT/FAILED crescem sem politica e o payload guarda userId/total; definir arquivamento/cleanup e minimizar campos. [review PR #43, 3.1]
+
+
+### Bloco 8b-2 — estado (consumer confiavel)
+
+Pago e verificado (e2e: mesmo eventId 2x -> processado 1x; payload invalido -> DLQ):
+- Consumer idempotente por eventId (Redis SET NX + TTL, claim-first).
+- eventId obrigatorio no contrato do consumer.
+- Dead-letter queue (DLX fanout -> notifications.orders.dlq): mensagem envenenada vai pra DLQ em vez de sumir.
+
+Aberto, com destino:
+- **[follow-up produtor] Classificacao transitorio/permanente + backoff + quarentena/redrive** do relay (head-of-line blocking, achado 4.2 do review do PR #43): hoje o publish falho retenta em intervalo fixo, sem backoff/quarentena.
+- **[Fase 7] Migracao de args de fila duravel:** args sao imutaveis no RabbitMQ; adicionar a DLX exigiu deletar a fila antiga (one-time manual). Padronizar via policy/quorum ou script de migracao no deploy.
+- **Limite conhecido (semantica 2a):** claim-first tem a janela "claim ok -> crash antes de processar" (efeito perdido). Aceitavel com consumer stub; efeito real transacional seria outra evolucao.
+
+
+### Bloco 8b-2 — correcoes pos-review (PR #44)
+
+Corrigido:
+- **Perda apos claim:** se handleEvent falha DEPOIS do claim, o claim e LIBERADO (DEL) e a mensagem faz requeue -> a reentrega reprocessa. Fases separadas (parse/claim/processa/recupera) em handleDelivery, com teste de todos os ramos.
+- **Hot loop no requeue:** atraso (REQUEUE_DELAY_MS) antes do nack(requeue) durante indisponibilidade do store.
+- **TTL de dedup** resolvido em runtime e validado (min 1min / max 7d). A garantia e TEMPORAL (janela do TTL), nao efeito unico eterno.
+- **eventId** com cap de tamanho (128) no parse.
+- **ioredis** alinhado ao cart (^5) + engines.node >=20; .env.example com newlines reais.
+
+Limite remanescente (documentado, aceito com consumer stub):
+- **Janela de crash entre o claim e o ack:** se o processo cair nesse meio, a reentrega trata como duplicata sem ter processado. Inerente ao at-least-once sem efeito transacional; para efeito real (e-mail/push) seria necessario efeito+claim atomicos (outbox no consumidor) -> evolucao futura.
+
+
+### Bloco 8b-2 — correcoes pos-review (2a rodada, PR #44)
+
+- **Falha no release nao e mais engolida:** se o processamento falha e o claim NAO consegue ser liberado, a mensagem vai pra DLQ (preservada) em vez de requeue (que viraria duplicata-ack = perda).
+- **Claim com token de propriedade + compare-and-delete (Lua):** releaseEvent so apaga o claim se ainda for deste consumo (nao apaga claim readquirido por outra instancia apos o TTL). Fecha o risco multi-instancia do DEL.
+- **Ping no Redis no boot** (fail-fast); REQUEUE_DELAY_MS com minimo (>=50); eventId canonico (rejeita espaco periferico); executeAction testado (ack / nack-dlq / requeue com atraso).
+
+Limite remanescente (documentado): janela de crash do PROCESSO entre o claim e o ack; efeito real futuro exigiria efeito+claim atomicos (outbox no consumidor).
+
+
+### Bloco 8b-2 — notas operacionais (aprovacao com ajustes, PR #44)
+
+- **Redrive da DLQ x TTL do claim:** um redrive DLQ -> fila principal ANTES de o TTL do claim expirar sera tratado como duplicata (ack sem reprocessar). Procedimento: redrive apenas apos o TTL, OU limpar a chave notif:evt:<eventId> antes do redrive. Follow-up: parking queue com atraso/metadados.
+- **DLQ mistura invalido e falha de recuperacao:** ambos caem na mesma DLQ; a distincao esta no log (reason), nao na mensagem. Follow-up: classificar via header/parking queue separada.
+- **Pre-condicoes operacionais do merge:** fila notifications.orders migrada/drenada por ambiente (args imutaveis); e2e (dedup + DLQ) executado.

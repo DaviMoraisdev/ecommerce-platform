@@ -14,7 +14,8 @@
   "license": "ISC",
   "dependencies": {
     "amqplib": "^0.10.4",
-    "dotenv": "^17.4.2"
+    "dotenv": "^17.4.2",
+    "ioredis": "^5.11.1"
   },
   "devDependencies": {
     "@types/amqplib": "^0.10.5",
@@ -25,5 +26,8 @@
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
