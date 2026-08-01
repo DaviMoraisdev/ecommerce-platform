@@ -158,3 +158,10 @@ Limite remanescente (documentado, aceito com consumer stub):
 - **Ping no Redis no boot** (fail-fast); REQUEUE_DELAY_MS com minimo (>=50); eventId canonico (rejeita espaco periferico); executeAction testado (ack / nack-dlq / requeue com atraso).
 
 Limite remanescente (documentado): janela de crash do PROCESSO entre o claim e o ack; efeito real futuro exigiria efeito+claim atomicos (outbox no consumidor).
+
+
+### Bloco 8b-2 — notas operacionais (aprovacao com ajustes, PR #44)
+
+- **Redrive da DLQ x TTL do claim:** um redrive DLQ -> fila principal ANTES de o TTL do claim expirar sera tratado como duplicata (ack sem reprocessar). Procedimento: redrive apenas apos o TTL, OU limpar a chave notif:evt:<eventId> antes do redrive. Follow-up: parking queue com atraso/metadados.
+- **DLQ mistura invalido e falha de recuperacao:** ambos caem na mesma DLQ; a distincao esta no log (reason), nao na mensagem. Follow-up: classificar via header/parking queue separada.
+- **Pre-condicoes operacionais do merge:** fila notifications.orders migrada/drenada por ambiente (args imutaveis); e2e (dedup + DLQ) executado.

@@ -1,15 +1,17 @@
 jest.mock('../src/config/redis');
 import { getRedisClient } from '../src/config/redis';
-import { claimEvent, releaseEvent } from '../src/idempotency';
+import { claimEvent, releaseEvent, pingRedis } from '../src/idempotency';
 
 const set = jest.fn();
 const evalFn = jest.fn();
-(getRedisClient as jest.Mock).mockReturnValue({ set, eval: evalFn });
+const ping = jest.fn();
+(getRedisClient as jest.Mock).mockReturnValue({ set, eval: evalFn, ping });
 
 describe('idempotency', () => {
   beforeEach(() => {
     set.mockReset();
     evalFn.mockReset();
+    ping.mockReset();
   });
 
   it('claimEvent: SET chave <token> PX ttl NX; OK -> retorna token', async () => {
@@ -40,8 +42,19 @@ describe('idempotency', () => {
     expect(args[3]).toBe('tok-123');
   });
 
-  it('releaseEvent: claim de outro (0) -> false (nao apaga o que nao e nosso)', async () => {
+  it('releaseEvent: claim de outro (0) -> false', async () => {
     evalFn.mockResolvedValue(0);
     expect(await releaseEvent('e1', 'tok-123')).toBe(false);
+  });
+
+  it('pingRedis: chama redis.ping (fail-fast no boot)', async () => {
+    ping.mockResolvedValue('PONG');
+    await expect(pingRedis()).resolves.toBeUndefined();
+    expect(ping).toHaveBeenCalled();
+  });
+
+  it('pingRedis: propaga erro se o Redis nao responde', async () => {
+    ping.mockRejectedValue(new Error('down'));
+    await expect(pingRedis()).rejects.toThrow('down');
   });
 });
