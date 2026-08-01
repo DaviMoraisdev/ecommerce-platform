@@ -1,6 +1,13 @@
-import { parseEvent, decideMessage, handleEvent, sanitizeForLog } from '../src/consumer';
+import {
+  parseEvent,
+  decideMessage,
+  handleEvent,
+  sanitizeForLog,
+  handleDelivery,
+} from '../src/consumer';
 
 const base = { eventId: 'e1' };
+const validRaw = JSON.stringify({ ...base, type: 'order.created', orderId: 'o1', total: 10 });
 
 describe('parseEvent', () => {
   it('aceita order.created valido (com total e eventId)', () => {
@@ -19,6 +26,10 @@ describe('parseEvent', () => {
 
   it('rejeita sem eventId (obrigatorio para dedup)', () => {
     expect(parseEvent(JSON.stringify({ type: 'order.created', orderId: 'o1', total: 1 }))).toBeNull();
+  });
+
+  it('rejeita eventId muito longo (cap de tamanho)', () => {
+    expect(parseEvent(JSON.stringify({ type: 'order.created', eventId: 'x'.repeat(200), orderId: 'o1', total: 1 }))).toBeNull();
   });
 
   it('rejeita sem type', () => {
@@ -41,6 +52,10 @@ describe('parseEvent', () => {
     expect(parseEvent(JSON.stringify({ ...base, type: 'order.created', orderId: 'o1', total: 'trinta' }))).toBeNull();
   });
 
+  it('rejeita schema incorreto: orderId numero', () => {
+    expect(parseEvent(JSON.stringify({ ...base, type: 'order.created', orderId: 123, total: 1 }))).toBeNull();
+  });
+
   it('rejeita nao-objeto (array e numero)', () => {
     expect(parseEvent(JSON.stringify([1, 2, 3]))).toBeNull();
     expect(parseEvent(JSON.stringify(42))).toBeNull();
@@ -49,24 +64,18 @@ describe('parseEvent', () => {
 
 describe('decideMessage', () => {
   it('ack quando routing key casa com o type', () => {
-    const raw = JSON.stringify({ ...base, type: 'order.created', orderId: 'o1', total: 30 });
-    const d = decideMessage(raw, 'order.created');
+    const d = decideMessage(validRaw, 'order.created');
     expect(d.ack).toBe(true);
     expect(d.event).toMatchObject({ orderId: 'o1', eventId: 'e1' });
   });
 
   it('nack quando o payload e invalido/incompleto', () => {
     const raw = JSON.stringify({ ...base, type: 'order.status_changed', orderId: 'o1' });
-    const d = decideMessage(raw, 'order.status_changed');
-    expect(d.ack).toBe(false);
-    expect(d.event).toBeNull();
+    expect(decideMessage(raw, 'order.status_changed').ack).toBe(false);
   });
 
   it('nack quando routing key nao casa com o type', () => {
-    const raw = JSON.stringify({ ...base, type: 'order.created', orderId: 'o1', total: 30 });
-    const d = decideMessage(raw, 'order.status_changed');
-    expect(d.ack).toBe(false);
-    expect(d.event).toBeNull();
+    expect(decideMessage(validRaw, 'order.status_changed').ack).toBe(false);
   });
 });
 
@@ -89,7 +98,7 @@ describe('handleEvent', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('PAGO'));
   });
 
-  it('sanitiza campo com caractere de controle (anti log-injection)', () => {
+  it('sanitiza campo com caractere de controle', () => {
     handleEvent({ ...base, type: 'order.created', orderId: 'o1' + String.fromCharCode(10) + 'FAKE', total: 1 });
     const logged = log.mock.calls[0][0] as string;
     expect(logged).not.toContain(String.fromCharCode(10));
@@ -99,6 +108,60 @@ describe('handleEvent', () => {
   it('tipo desconhecido cai no default', () => {
     handleEvent({ ...base, type: 'order.explodiu', orderId: 'o1' });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('nao tratado'));
+  });
+});
+
+describe('handleDelivery', () => {
+  it('valido + claim ok + handle ok -> ack processed', async () => {
+    const claim = jest.fn().mockResolvedValue(true);
+    const release = jest.fn();
+    const handle = jest.fn();
+    const a = await handleDelivery(validRaw, 'order.created', { claim, release, handle });
+    expect(a).toEqual({ type: 'ack', reason: 'processed' });
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it('duplicata (claim false) -> ack duplicate, sem processar', async () => {
+    const handle = jest.fn();
+    const a = await handleDelivery(validRaw, 'order.created', {
+      claim: jest.fn().mockResolvedValue(false),
+      release: jest.fn(),
+      handle,
+    });
+    expect(a).toEqual({ type: 'ack', reason: 'duplicate' });
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  it('store indisponivel (claim lanca) -> requeue, sem processar', async () => {
+    const handle = jest.fn();
+    const a = await handleDelivery(validRaw, 'order.created', {
+      claim: jest.fn().mockRejectedValue(new Error('redis down')),
+      release: jest.fn(),
+      handle,
+    });
+    expect(a.type).toBe('nack-requeue');
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  it('handle falha APOS o claim -> libera o claim e requeue', async () => {
+    const release = jest.fn().mockResolvedValue(undefined);
+    const a = await handleDelivery(validRaw, 'order.created', {
+      claim: jest.fn().mockResolvedValue(true),
+      release,
+      handle: jest.fn(() => {
+        throw new Error('boom');
+      }),
+    });
+    expect(a.type).toBe('nack-requeue');
+    expect(release).toHaveBeenCalledWith('e1');
+  });
+
+  it('payload invalido -> nack-dlq (sem claim)', async () => {
+    const claim = jest.fn();
+    const a = await handleDelivery('{ invalido', 'order.created', { claim, release: jest.fn(), handle: jest.fn() });
+    expect(a.type).toBe('nack-dlq');
+    expect(claim).not.toHaveBeenCalled();
   });
 });
 

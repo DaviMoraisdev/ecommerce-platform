@@ -38,7 +38,7 @@ export function parseEvent(raw: string): OrderEvent | null {
   if (typeof type !== 'string' || type.trim() === '') return null;
   if (typeof orderId !== 'string' || orderId.trim() === '') return null;
 
-  if (typeof o.eventId !== 'string' || o.eventId.trim() === '') return null;
+  if (typeof o.eventId !== 'string' || o.eventId.trim() === '' || o.eventId.length > 128) return null;
   if (o.userId !== undefined && typeof o.userId !== 'string') return null;
   if (o.status !== undefined && typeof o.status !== 'string') return null;
   if (o.at !== undefined && typeof o.at !== 'string') return null;
@@ -105,5 +105,54 @@ export function handleEvent(event: OrderEvent): void {
       break;
     default:
       console.log('[notificacao] evento nao tratado: ' + sanitizeForLog(event.type));
+  }
+}
+
+export type DeliveryAction =
+  | { type: 'ack'; reason: 'processed' | 'duplicate' }
+  | { type: 'nack-dlq'; reason: string }
+  | { type: 'nack-requeue'; reason: string };
+
+export interface DeliveryDeps {
+  claim: (eventId: string) => Promise<boolean>;
+  release: (eventId: string) => Promise<void>;
+  handle: (event: OrderEvent) => void;
+}
+
+// Decide a acao para uma entrega, com FASES SEPARADAS:
+//  - invalido           -> DLQ
+//  - erro no store       -> requeue (nada a liberar)
+//  - duplicata           -> ack
+//  - processa; se falhar APOS o claim -> libera o claim e requeue (reprocessa)
+export async function handleDelivery(
+  raw: string,
+  routingKey: string,
+  deps: DeliveryDeps
+): Promise<DeliveryAction> {
+  const decision = decideMessage(raw, routingKey);
+  if (!decision.ack || !decision.event) {
+    return { type: 'nack-dlq', reason: decision.reason ?? 'invalido' };
+  }
+  const event = decision.event;
+
+  let claimed: boolean;
+  try {
+    claimed = await deps.claim(event.eventId);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return { type: 'nack-requeue', reason: 'store indisponivel: ' + reason };
+  }
+  if (!claimed) {
+    return { type: 'ack', reason: 'duplicate' };
+  }
+
+  try {
+    deps.handle(event);
+    return { type: 'ack', reason: 'processed' };
+  } catch (err) {
+    // Falhou DEPOIS do claim: libera para a reentrega reprocessar.
+    await deps.release(event.eventId).catch(() => undefined);
+    const reason = err instanceof Error ? err.message : String(err);
+    return { type: 'nack-requeue', reason: 'processamento falhou (claim liberado): ' + reason };
   }
 }

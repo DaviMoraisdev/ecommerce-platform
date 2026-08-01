@@ -2,9 +2,18 @@ import dotenv from 'dotenv';
 dotenv.config();
 import { connect } from './config/connection';
 import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY, DLX, DLQ } from './config/topology';
-import { decideMessage, handleEvent, sanitizeForLog } from './consumer';
-import { claimEvent } from './idempotency';
+import { handleDelivery, handleEvent, sanitizeForLog } from './consumer';
+import { claimEvent, releaseEvent } from './idempotency';
 import { closeRedis } from './config/redis';
+
+const REQUEUE_DELAY_MS = (() => {
+  const n = Number(process.env.REQUEUE_DELAY_MS);
+  return Number.isInteger(n) && n >= 0 && n <= 60000 ? n : 1000;
+})();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 async function start() {
   const connection = await connect();
@@ -12,15 +21,13 @@ async function start() {
 
   await channel.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
 
-  // Dead-letter: DLX fanout -> DLQ duravel. Mensagem com nack(false,false) e
-  // roteada para a DLQ em vez de sumir.
+  // Dead-letter: DLX fanout -> DLQ duravel.
   await channel.assertExchange(DLX, 'fanout', { durable: true });
   await channel.assertQueue(DLQ, { durable: true });
   await channel.bindQueue(DLQ, DLX, '');
 
-  // Fila principal com dead-letter. NOTA: args de fila duravel sao imutaveis no
-  // RabbitMQ; migrar (adicionar a DLX) exige recriar a fila (migracao one-time:
-  // deletar a fila antiga antes de subir). Registrado no TECH_DEBT.
+  // Fila principal com dead-letter. NOTA: args de fila duravel sao imutaveis;
+  // adicionar a DLX exige recriar a fila (migracao one-time). Ver TECH_DEBT.
   await channel.assertQueue(QUEUE, {
     durable: true,
     arguments: { 'x-dead-letter-exchange': DLX },
@@ -32,44 +39,40 @@ async function start() {
     '[notification] consumindo ' + QUEUE + ' (binding ' + BINDING_KEY + ' no exchange ' + EXCHANGE + '); DLQ: ' + DLQ
   );
 
+  const deps = { claim: claimEvent, release: releaseEvent, handle: handleEvent };
+
   await channel.consume(QUEUE, async (msg) => {
     if (!msg) return;
     const routingKey = msg.fields.routingKey;
     const raw = msg.content.toString();
 
-    const decision = decideMessage(raw, routingKey);
-    if (!decision.ack || !decision.event) {
-      // Invalido/envenenado -> DLQ (nack sem requeue; DLX roteia).
-      console.error(
-        '[notification] descartado para DLQ (' + sanitizeForLog(routingKey) + '): ' + decision.reason
-      );
+    let action;
+    try {
+      action = await handleDelivery(raw, routingKey, deps);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error('[notification] erro inesperado (' + sanitizeForLog(routingKey) + '): ' + reason);
+      action = { type: 'nack-requeue', reason } as const;
+    }
+
+    if (action.type === 'ack') {
+      if (action.reason === 'duplicate') {
+        console.log('[notification] duplicata ignorada (' + sanitizeForLog(routingKey) + ')');
+      }
+      channel.ack(msg);
+      return;
+    }
+    if (action.type === 'nack-dlq') {
+      console.error('[notification] descartado para DLQ (' + sanitizeForLog(routingKey) + '): ' + action.reason);
       channel.nack(msg, false, false);
       return;
     }
-
-    const event = decision.event;
-    try {
-      const primeiro = await claimEvent(event.eventId);
-      if (!primeiro) {
-        // Duplicata: eventId ja reivindicado -> ack e ignora (sem reprocessar).
-        console.log('[notification] duplicata ignorada (eventId ' + sanitizeForLog(event.eventId) + ')');
-        channel.ack(msg);
-        return;
-      }
-      handleEvent(event);
-      channel.ack(msg);
-    } catch (err) {
-      // Erro no store de idempotencia (ex.: Redis fora) ou no processamento:
-      // requeue para tentar de novo — nao perde e nao processa sem dedup.
-      const reason = err instanceof Error ? err.message : String(err);
-      console.error(
-        '[notification] falha ao processar/dedup ' + sanitizeForLog(routingKey) + ': ' + reason + ' (requeue)'
-      );
-      channel.nack(msg, false, true);
-    }
+    // nack-requeue: atraso para nao entrar em hot loop enquanto a dependencia se recupera.
+    console.warn('[notification] requeue (' + sanitizeForLog(routingKey) + '): ' + action.reason);
+    await sleep(REQUEUE_DELAY_MS);
+    channel.nack(msg, false, true);
   });
 
-  // Encerramento gracioso, idempotente.
   let shuttingDown = false;
   async function shutdown(signal: string): Promise<void> {
     if (shuttingDown) return;
@@ -91,7 +94,6 @@ async function start() {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  // Queda inesperada: so reinicia (exit 1) se NAO for shutdown intencional.
   connection.on('close', () => {
     if (shuttingDown) return;
     console.error('[notification] conexao fechada; encerrando (exit 1) para reiniciar');
