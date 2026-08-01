@@ -1,4 +1,3 @@
-// Remove caracteres de controle (evita injecao em terminal/log) e trunca.
 export function sanitizeForLog(s: string): string {
   let out = '';
   for (const ch of s) {
@@ -18,9 +17,8 @@ export interface OrderEvent {
   at?: string;
 }
 
-// Valida o contrato em runtime. Alem dos obrigatorios comuns (type, orderId),
-// cada tipo exige campos proprios: order.created -> total; order.status_changed
-// -> status. Campo presente com tipo errado = schema incorreto -> rejeita.
+// Valida o contrato em runtime. eventId: obrigatorio, canonico (sem espacos
+// perifericos) e com cap de tamanho (vira chave no Redis).
 export function parseEvent(raw: string): OrderEvent | null {
   let v: unknown;
   try {
@@ -28,25 +26,27 @@ export function parseEvent(raw: string): OrderEvent | null {
   } catch {
     return null;
   }
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
-    return null;
-  }
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
 
   const type = o.type;
   const orderId = o.orderId;
   if (typeof type !== 'string' || type.trim() === '') return null;
   if (typeof orderId !== 'string' || orderId.trim() === '') return null;
-
-  if (typeof o.eventId !== 'string' || o.eventId.trim() === '' || o.eventId.length > 128) return null;
+  if (
+    typeof o.eventId !== 'string' ||
+    o.eventId.trim() === '' ||
+    o.eventId.trim() !== o.eventId ||
+    o.eventId.length > 128
+  ) {
+    return null;
+  }
   if (o.userId !== undefined && typeof o.userId !== 'string') return null;
   if (o.status !== undefined && typeof o.status !== 'string') return null;
   if (o.at !== undefined && typeof o.at !== 'string') return null;
   if (o.total !== undefined && (typeof o.total !== 'number' || !Number.isFinite(o.total))) {
     return null;
   }
-
-  // Obrigatorios por tipo:
   if (type === 'order.status_changed' && (typeof o.status !== 'string' || o.status.trim() === '')) {
     return null;
   }
@@ -65,8 +65,6 @@ export function parseEvent(raw: string): OrderEvent | null {
   };
 }
 
-// Decide ack/nack de uma mensagem crua. Pura e testavel (sem canal real):
-// payload invalido/incompleto ou routing key incompativel com o type -> nack.
 export function decideMessage(
   raw: string,
   routingKey: string
@@ -85,8 +83,6 @@ export function decideMessage(
   return { ack: true, event };
 }
 
-// "Envia" a notificacao (stub que loga). Sanitiza TODO campo derivado do evento
-// antes de interpolar (anti log-injection); total ja e number validado.
 export function handleEvent(event: OrderEvent): void {
   const orderId = sanitizeForLog(event.orderId);
   switch (event.type) {
@@ -99,8 +95,7 @@ export function handleEvent(event: OrderEvent): void {
       break;
     case 'order.status_changed':
       console.log(
-        '[notificacao] pedido ' + orderId + ' mudou para ' +
-          (event.status ? sanitizeForLog(event.status) : '?')
+        '[notificacao] pedido ' + orderId + ' mudou para ' + (event.status ? sanitizeForLog(event.status) : '?')
       );
       break;
     default:
@@ -114,16 +109,14 @@ export type DeliveryAction =
   | { type: 'nack-requeue'; reason: string };
 
 export interface DeliveryDeps {
-  claim: (eventId: string) => Promise<boolean>;
-  release: (eventId: string) => Promise<void>;
+  claim: (eventId: string) => Promise<string | null>;
+  release: (eventId: string, token: string) => Promise<boolean>;
   handle: (event: OrderEvent) => void;
 }
 
-// Decide a acao para uma entrega, com FASES SEPARADAS:
-//  - invalido           -> DLQ
-//  - erro no store       -> requeue (nada a liberar)
-//  - duplicata           -> ack
-//  - processa; se falhar APOS o claim -> libera o claim e requeue (reprocessa)
+// Fases separadas. Ponto critico: se o processamento falha APOS o claim, tenta
+// LIBERAR; se conseguir -> requeue (reprocessa); se NAO conseguir liberar, NAO
+// faz requeue (viraria duplicata-ack = perda) e sim manda pra DLQ (preservado).
 export async function handleDelivery(
   raw: string,
   routingKey: string,
@@ -135,24 +128,54 @@ export async function handleDelivery(
   }
   const event = decision.event;
 
-  let claimed: boolean;
+  let token: string | null;
   try {
-    claimed = await deps.claim(event.eventId);
+    token = await deps.claim(event.eventId);
   } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    return { type: 'nack-requeue', reason: 'store indisponivel: ' + reason };
+    return { type: 'nack-requeue', reason: 'store indisponivel: ' + (err instanceof Error ? err.message : String(err)) };
   }
-  if (!claimed) {
+  if (token === null) {
     return { type: 'ack', reason: 'duplicate' };
   }
 
   try {
     deps.handle(event);
     return { type: 'ack', reason: 'processed' };
-  } catch (err) {
-    // Falhou DEPOIS do claim: libera para a reentrega reprocessar.
-    await deps.release(event.eventId).catch(() => undefined);
-    const reason = err instanceof Error ? err.message : String(err);
-    return { type: 'nack-requeue', reason: 'processamento falhou (claim liberado): ' + reason };
+  } catch (handleErr) {
+    const reason = handleErr instanceof Error ? handleErr.message : String(handleErr);
+    let released = false;
+    try {
+      released = await deps.release(event.eventId, token);
+    } catch {
+      released = false;
+    }
+    if (released) {
+      return { type: 'nack-requeue', reason: 'processamento falhou, claim liberado: ' + reason };
+    }
+    return { type: 'nack-dlq', reason: 'processamento falhou e claim NAO liberado (evitando perda): ' + reason };
   }
+}
+
+export interface ChannelLike {
+  ack(msg: unknown): void;
+  nack(msg: unknown, allUpTo: boolean, requeue: boolean): void;
+}
+
+// Traduz a acao em ack/nack no canal. nack-requeue passa por um atraso (anti hot loop).
+export async function executeAction(
+  ch: ChannelLike,
+  msg: unknown,
+  action: DeliveryAction,
+  onRequeueDelay: () => Promise<void>
+): Promise<void> {
+  if (action.type === 'ack') {
+    ch.ack(msg);
+    return;
+  }
+  if (action.type === 'nack-dlq') {
+    ch.nack(msg, false, false);
+    return;
+  }
+  await onRequeueDelay();
+  ch.nack(msg, false, true);
 }

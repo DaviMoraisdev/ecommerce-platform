@@ -2,13 +2,13 @@ import dotenv from 'dotenv';
 dotenv.config();
 import { connect } from './config/connection';
 import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY, DLX, DLQ } from './config/topology';
-import { handleDelivery, handleEvent, sanitizeForLog } from './consumer';
-import { claimEvent, releaseEvent } from './idempotency';
+import { handleDelivery, executeAction, handleEvent, sanitizeForLog, DeliveryAction } from './consumer';
+import { claimEvent, releaseEvent, pingRedis } from './idempotency';
 import { closeRedis } from './config/redis';
 
 const REQUEUE_DELAY_MS = (() => {
   const n = Number(process.env.REQUEUE_DELAY_MS);
-  return Number.isInteger(n) && n >= 0 && n <= 60000 ? n : 1000;
+  return Number.isInteger(n) && n >= 50 && n <= 60000 ? n : 1000;
 })();
 
 function sleep(ms: number): Promise<void> {
@@ -16,12 +16,13 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function start() {
+  // Fail-fast: valida o Redis ANTES de comecar a consumir (dependencia obrigatoria).
+  await pingRedis();
+
   const connection = await connect();
   const channel = await connection.createChannel();
 
   await channel.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
-
-  // Dead-letter: DLX fanout -> DLQ duravel.
   await channel.assertExchange(DLX, 'fanout', { durable: true });
   await channel.assertQueue(DLQ, { durable: true });
   await channel.bindQueue(DLQ, DLX, '');
@@ -46,31 +47,23 @@ async function start() {
     const routingKey = msg.fields.routingKey;
     const raw = msg.content.toString();
 
-    let action;
+    let action: DeliveryAction;
     try {
       action = await handleDelivery(raw, routingKey, deps);
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      console.error('[notification] erro inesperado (' + sanitizeForLog(routingKey) + '): ' + reason);
-      action = { type: 'nack-requeue', reason } as const;
+      action = { type: 'nack-requeue', reason: err instanceof Error ? err.message : String(err) };
     }
 
-    if (action.type === 'ack') {
-      if (action.reason === 'duplicate') {
-        console.log('[notification] duplicata ignorada (' + sanitizeForLog(routingKey) + ')');
-      }
-      channel.ack(msg);
-      return;
+    const rk = sanitizeForLog(routingKey);
+    if (action.type === 'ack' && action.reason === 'duplicate') {
+      console.log('[notification] duplicata ignorada (' + rk + ')');
+    } else if (action.type === 'nack-dlq') {
+      console.error('[notification] DLQ (' + rk + '): ' + action.reason);
+    } else if (action.type === 'nack-requeue') {
+      console.warn('[notification] requeue (' + rk + '): ' + action.reason);
     }
-    if (action.type === 'nack-dlq') {
-      console.error('[notification] descartado para DLQ (' + sanitizeForLog(routingKey) + '): ' + action.reason);
-      channel.nack(msg, false, false);
-      return;
-    }
-    // nack-requeue: atraso para nao entrar em hot loop enquanto a dependencia se recupera.
-    console.warn('[notification] requeue (' + sanitizeForLog(routingKey) + '): ' + action.reason);
-    await sleep(REQUEUE_DELAY_MS);
-    channel.nack(msg, false, true);
+
+    await executeAction(channel, msg, action, () => sleep(REQUEUE_DELAY_MS));
   });
 
   let shuttingDown = false;
