@@ -28,10 +28,13 @@ describe('e2e - jornada com auth-service (login real)', () => {
     const productId = await newProduct(30, 5);
 
     const { token, userId } = await registerAndLogin();
+    expect(typeof userId).toBe('string');
+    expect(userId).not.toBe('');
 
     expect((await addToCart(token, productId, 1)).status).toBe(200);
     const order = await createOrder(token, key('idem'));
     expect(order.status).toBe(201);
+    expect(typeof order.body.userId).toBe('string');
     expect(order.body.userId).toBe(userId); // pedido do usuario real (id do token do auth)
 
     expect((await getStock(productId)).reserved).toBe(1);

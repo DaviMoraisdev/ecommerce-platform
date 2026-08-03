@@ -75,5 +75,11 @@ describe('e2e - concorrencia na reserva (sem oversell)', () => {
       if (r.status === 409) expect(String(r.body?.error ?? '')).toMatch(/processamento|andamento/i);
     }
     expect((await getStock(productId)).reserved).toBe(1);
+
+    // replay posterior com a MESMA chave -> retorna o pedido original (idempotencia completa)
+    const winner = [a, b].find((r) => r.status === 201)!;
+    const replay = await createOrder(token, k);
+    expect(replay.status).toBe(201);
+    expect(replay.body.id).toBe(winner.body.id);
   });
 });

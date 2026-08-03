@@ -131,8 +131,13 @@ export async function registerAndLogin(): Promise<{ token: string; userId: strin
   });
   if (reg.status !== 201) throw new Error('register falhou: ' + reg.status + ' ' + trunc(reg.body));
   const login = await request('POST', AUTH + '/auth/login', { body: { email, password } });
-  if (login.status !== 200 || typeof login.body?.accessToken !== 'string') {
-    throw new Error('login falhou/sem accessToken: ' + login.status + ' ' + trunc(login.body));
+  if (
+    login.status !== 200 ||
+    typeof login.body?.accessToken !== 'string' ||
+    typeof login.body?.user?.id !== 'string' ||
+    login.body.user.id === ''
+  ) {
+    throw new Error('login falhou/contrato invalido: ' + login.status + ' ' + trunc(login.body));
   }
   return { token: login.body.accessToken, userId: login.body.user.id, email };
 }
