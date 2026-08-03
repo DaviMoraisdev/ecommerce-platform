@@ -13,6 +13,9 @@ export function getRedisClient(): Redis {
     redisClient = new Redis(url, {
       // Falha rapido se o Redis cair, em vez de travar esperando reconexao.
       maxRetriesPerRequest: 2,
+      // Limita o comando no CLIENTE (nao so no withTimeout externo): um comando
+      // que nao responde e rejeitado em 2s, evitando acumulo apos o timeout.
+      commandTimeout: 2000,
     });
     redisClient.on('error', (err) => {
       // Nao derruba o processo: ioredis reconecta sozinho.

@@ -47,6 +47,8 @@ abaixo sao conhecidas e aceitas para o 8a; o destino de cada uma esta marcado.
 
 ## FASE 7 — API Gateway e Segurança
 
+- **[Fase 7] Automatizar o e2e via docker-compose:** a suite e2e (pacote e2e/, Bloco 9) roda contra o stack local subido manualmente (todos os servicos: auth, product, inventory, cart, order e notification + infra). Containerizar os servicos e orquestrar no compose permitiria rodar o e2e no CI. Anda junto com a containerizacao dos servicos.
+
 - **JWT hardening:** `jwt.verify` com `algorithms`, `issuer`, `audience` explícitos + validar shape do payload antes de confiar no `role`. Aplicar em auth, product, inventory e cart de forma consistente.
 - **403 não vazar roles:** retornar 403 genérico, logar `required`/`current` apenas server-side. Hoje os serviços retornam `{ required, current }` no corpo.
 - **Autenticação serviço-a-serviço:** token interno/mTLS entre serviços (hoje product→inventory e cart→product consultam endpoints públicos). Modelar identidade de serviço.

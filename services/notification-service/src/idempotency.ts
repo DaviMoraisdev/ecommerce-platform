@@ -37,6 +37,12 @@ export async function releaseEvent(eventId: string, token: string): Promise<bool
 }
 
 // Valida a conexao com o Redis (fail-fast no boot).
+// Marcador de "processado" por pedido (observabilidade + gancho de e2e). Best-effort.
+export async function recordProcessed(orderId: string, type: string): Promise<void> {
+  const redis = getRedisClient();
+  await redis.set('notif:proc:' + orderId + ':' + type, '1', 'PX', resolveTtlMs());
+}
+
 export async function pingRedis(): Promise<void> {
   await getRedisClient().ping();
 }

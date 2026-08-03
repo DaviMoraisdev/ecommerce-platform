@@ -2,8 +2,8 @@ import dotenv from 'dotenv';
 dotenv.config();
 import { connect } from './config/connection';
 import { EXCHANGE, EXCHANGE_TYPE, QUEUE, BINDING_KEY, DLX, DLQ } from './config/topology';
-import { handleDelivery, executeAction, handleEvent, sanitizeForLog, DeliveryAction } from './consumer';
-import { claimEvent, releaseEvent, pingRedis } from './idempotency';
+import { handleDelivery, executeAction, handleEvent, sanitizeForLog, DeliveryAction, OrderEvent } from './consumer';
+import { claimEvent, releaseEvent, pingRedis, recordProcessed } from './idempotency';
 import { closeRedis } from './config/redis';
 
 const REQUEUE_DELAY_MS = (() => {
@@ -40,7 +40,12 @@ async function start() {
     '[notification] consumindo ' + QUEUE + ' (binding ' + BINDING_KEY + ' no exchange ' + EXCHANGE + '); DLQ: ' + DLQ
   );
 
-  const deps = { claim: claimEvent, release: releaseEvent, handle: handleEvent };
+  const deps = {
+    claim: claimEvent,
+    release: releaseEvent,
+    handle: handleEvent,
+    recordProcessed: (ev: OrderEvent) => recordProcessed(ev.orderId, ev.type),
+  };
 
   await channel.consume(QUEUE, async (msg) => {
     if (!msg) return;

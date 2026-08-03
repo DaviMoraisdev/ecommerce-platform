@@ -112,11 +112,31 @@ export interface DeliveryDeps {
   claim: (eventId: string) => Promise<string | null>;
   release: (eventId: string, token: string) => Promise<boolean>;
   handle: (event: OrderEvent) => void;
+  recordProcessed?: (event: OrderEvent) => Promise<void>;
 }
 
 // Fases separadas. Ponto critico: se o processamento falha APOS o claim, tenta
 // LIBERAR; se conseguir -> requeue (reprocessa); se NAO conseguir liberar, NAO
 // faz requeue (viraria duplicata-ack = perda) e sim manda pra DLQ (preservado).
+const RECORD_TIMEOUT_MS = 1000;
+
+// Limita a espera do marcador (best-effort): um Redis travado nao pode pendurar o ack.
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    );
+  });
+}
+
 export async function handleDelivery(
   raw: string,
   routingKey: string,
@@ -140,6 +160,17 @@ export async function handleDelivery(
 
   try {
     deps.handle(event);
+    if (deps.recordProcessed) {
+      // Best-effort E time-bounded: nunca bloqueia nem falha o ack.
+      try {
+        await withTimeout(deps.recordProcessed(event), RECORD_TIMEOUT_MS);
+      } catch (err) {
+        const cat = err instanceof Error ? err.message : 'erro';
+        console.warn(
+          '[notification] recordProcessed falhou/expirou (eventId ' + sanitizeForLog(event.eventId) + '): ' + sanitizeForLog(cat)
+        );
+      }
+    }
     return { type: 'ack', reason: 'processed' };
   } catch (handleErr) {
     const reason = handleErr instanceof Error ? handleErr.message : String(handleErr);
