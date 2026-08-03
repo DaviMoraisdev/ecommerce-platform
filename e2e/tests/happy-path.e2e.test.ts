@@ -1,3 +1,4 @@
+import jwt from 'jsonwebtoken';
 import {
   mintToken, key, seedProduct, cleanupProduct, setStock, getStock,
   addToCart, getCart, createOrder, health, request, URLS,
@@ -67,6 +68,16 @@ describe('e2e - auth', () => {
   });
   it('token invalido -> 401', async () => {
     expect((await request('GET', URLS.cart + '/cart', { token: 'lixo.invalido' })).status).toBe(401);
+  });
+
+  it('token expirado -> 401', async () => {
+    const expirado = mintToken('u-' + key(), 'ADMIN', -1);
+    expect((await request('GET', URLS.cart + '/cart', { token: expirado })).status).toBe(401);
+  });
+
+  it('token com assinatura invalida -> 401', async () => {
+    const forjado = jwt.sign({ id: 'u1', role: 'ADMIN' }, 'segredo-errado', { expiresIn: '1h' });
+    expect((await request('GET', URLS.cart + '/cart', { token: forjado })).status).toBe(401);
   });
   it('nao-admin (USER) nao seta estoque -> 403', async () => {
     const user = mintToken('u-' + key(), 'USER');

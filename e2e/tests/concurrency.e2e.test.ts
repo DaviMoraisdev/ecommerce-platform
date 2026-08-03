@@ -41,15 +41,17 @@ describe('e2e - concorrencia na reserva (sem oversell)', () => {
     expect(stock.available).toBe(0);
   });
 
-  it('estoque=3, 5 concorrentes -> 3 sucessos, 2 conflitos, reservado=3', async () => {
+  it('estoque=3, 5 concorrentes -> 3 sucessos, 2 conflitos-estoque, reservado=3', async () => {
     const productId = await newProduct(20, 3);
     const N = 5;
     const users = Array.from({ length: N }, () => mintToken('u-' + key(), 'ADMIN'));
     for (const u of users) expect((await addToCart(u, productId, 1)).status).toBe(200);
 
     const results = await Promise.all(users.map((u) => createOrder(u, key('idem'))));
+    const conflitos = results.filter((r) => r.status === 409);
     expect(results.filter((r) => r.status === 201)).toHaveLength(3);
-    expect(results.filter((r) => r.status === 409)).toHaveLength(2);
+    expect(conflitos).toHaveLength(2);
+    for (const c of conflitos) expect(String(c.body?.error ?? '')).toMatch(/insuficiente/i);
 
     const stock = await getStock(productId);
     expect(stock.reserved).toBe(3);
@@ -63,9 +65,15 @@ describe('e2e - concorrencia na reserva (sem oversell)', () => {
 
     const k = key('idem');
     const [a, b] = await Promise.all([createOrder(token, k), createOrder(token, k)]);
+
+    // Contrato: cada resposta e 201 (criado/mesmo pedido) ou 409 (em processamento).
+    for (const r of [a, b]) expect([201, 409]).toContain(r.status);
     const criados = [a, b].filter((r) => r.status === 201);
     expect(criados.length).toBeGreaterThanOrEqual(1);
     if (a.status === 201 && b.status === 201) expect(a.body.id).toBe(b.body.id);
+    for (const r of [a, b]) {
+      if (r.status === 409) expect(String(r.body?.error ?? '')).toMatch(/processamento|andamento/i);
+    }
     expect((await getStock(productId)).reserved).toBe(1);
   });
 });

@@ -2,53 +2,22 @@ import * as dotenv from 'dotenv';
 dotenv.config();
 import jwt from 'jsonwebtoken';
 import Redis from 'ioredis';
+import { resolveConfig, redactUrl } from './config';
 
-function requireEnv(name: string): string {
-  const v = process.env[name];
-  if (!v || v.trim() === '') throw new Error('e2e: variavel obrigatoria ausente: ' + name);
-  return v;
-}
-
-const ALLOW_DESTRUCTIVE = process.env.E2E_ALLOW_DESTRUCTIVE === 'true';
-
-// Trava de ambiente: por padrao so roda contra localhost (a suite cria dados e
-// usa JWT ADMIN). Alvo nao-local exige E2E_ALLOW_DESTRUCTIVE=true consciente.
-function assertLocalTarget(url: string): string {
-  let host: string;
-  try {
-    host = new URL(url).hostname;
-  } catch {
-    throw new Error('e2e: URL invalida: ' + url);
-  }
-  const local = host === 'localhost' || host === '127.0.0.1' || host === '::1';
-  if (!local && !ALLOW_DESTRUCTIVE) {
-    throw new Error(
-      'e2e BLOQUEADO: alvo nao-local (' + host + '). Rode apenas contra localhost, ou defina ' +
-        'E2E_ALLOW_DESTRUCTIVE=true conscientemente (cria dados + usa JWT ADMIN).'
-    );
-  }
-  return url;
-}
-
-const SECRET = requireEnv('JWT_SECRET');
-if (SECRET === 'troque_este_segredo') {
-  throw new Error('e2e: JWT_SECRET e o placeholder; copie o segredo real dos servicos para o .env');
-}
-
+const cfg = resolveConfig();
+const SECRET = cfg.secret;
 export const URLS = {
-  product: assertLocalTarget(requireEnv('PRODUCT_URL')),
-  inventory: assertLocalTarget(requireEnv('INVENTORY_URL')),
-  cart: assertLocalTarget(requireEnv('CART_URL')),
-  order: assertLocalTarget(requireEnv('ORDER_URL')),
+  product: cfg.urls.product,
+  inventory: cfg.urls.inventory,
+  cart: cfg.urls.cart,
+  order: cfg.urls.order,
 };
+const AUTH = cfg.urls.auth;
+const REDIS = cfg.urls.redis;
+const HTTP_TIMEOUT_MS = cfg.httpTimeoutMs;
 
-const AUTH = assertLocalTarget(requireEnv('AUTH_URL'));
-const REDIS = assertLocalTarget(requireEnv('REDIS_URL'));
-
-const HTTP_TIMEOUT_MS = Number(process.env.E2E_HTTP_TIMEOUT_MS) || 8000;
-
-export function mintToken(id: string, role = 'ADMIN'): string {
-  return jwt.sign({ id, email: id + '@e2e.dev', role }, SECRET, { expiresIn: '1h' });
+export function mintToken(id: string, role = 'ADMIN', expiresIn: string | number = '1h'): string {
+  return jwt.sign({ id, email: id + '@e2e.dev', role }, SECRET, { expiresIn } as jwt.SignOptions);
 }
 
 export function key(prefix = 'e2e'): string {
@@ -65,7 +34,6 @@ function trunc(v: unknown): string {
   return s && s.length > 200 ? s.slice(0, 200) + '...' : String(s);
 }
 
-// Request cru (nao lanca por status) com TIMEOUT por requisicao (AbortController).
 export async function request(
   method: string,
   url: string,
@@ -95,7 +63,7 @@ export async function request(
     return { status: res.status, body };
   } catch (err) {
     if (controller.signal.aborted) {
-      throw new Error(method + ' ' + url + ': timeout apos ' + HTTP_TIMEOUT_MS + 'ms');
+      throw new Error(method + ' ' + redactUrl(url) + ': timeout apos ' + HTTP_TIMEOUT_MS + 'ms');
     }
     throw err;
   } finally {
@@ -115,7 +83,10 @@ export async function seedProduct(token: string, price: number): Promise<string>
 }
 
 export async function cleanupProduct(token: string, productId: string): Promise<void> {
-  await request('DELETE', URLS.product + '/products/' + productId, { token });
+  const r = await request('DELETE', URLS.product + '/products/' + productId, { token });
+  if (![200, 204, 404].includes(r.status)) {
+    console.warn('[e2e] cleanupProduct: status inesperado ' + r.status + ' para ' + productId);
+  }
 }
 
 export async function setStock(token: string, productId: string, quantity: number): Promise<void> {
@@ -127,10 +98,17 @@ export async function getStock(
   productId: string
 ): Promise<{ productId: string; quantity: number; reserved: number; available: number }> {
   const r = await request('GET', URLS.inventory + '/stock/' + productId);
-  if (r.status !== 200 || typeof r.body?.available !== 'number' || typeof r.body?.reserved !== 'number') {
-    throw new Error('getStock falhou/contrato invalido: ' + r.status + ' ' + trunc(r.body));
+  const b = r.body;
+  if (
+    r.status !== 200 ||
+    typeof b?.productId !== 'string' ||
+    typeof b?.quantity !== 'number' ||
+    typeof b?.reserved !== 'number' ||
+    typeof b?.available !== 'number'
+  ) {
+    throw new Error('getStock falhou/contrato invalido: ' + r.status + ' ' + trunc(b));
   }
-  return r.body;
+  return b;
 }
 
 export async function addToCart(token: string, productId: string, quantity: number): Promise<HttpResult> {
@@ -145,17 +123,13 @@ export async function createOrder(token: string, idempotencyKey: string): Promis
   return request('POST', URLS.order + '/orders', { token, body: {}, idempotencyKey });
 }
 
-// Jornada real: registra e loga no auth-service, devolvendo o accessToken que ELE
-// emite (prova o contrato do token de ponta a ponta).
 export async function registerAndLogin(): Promise<{ token: string; userId: string; email: string }> {
   const email = 'e2e-' + key() + '@e2e.dev';
   const password = 'Senha123!';
   const reg = await request('POST', AUTH + '/auth/register', {
     body: { email, password, name: 'e2e user' },
   });
-  if (reg.status !== 201) {
-    throw new Error('register falhou: ' + reg.status + ' ' + trunc(reg.body));
-  }
+  if (reg.status !== 201) throw new Error('register falhou: ' + reg.status + ' ' + trunc(reg.body));
   const login = await request('POST', AUTH + '/auth/login', { body: { email, password } });
   if (login.status !== 200 || typeof login.body?.accessToken !== 'string') {
     throw new Error('login falhou/sem accessToken: ' + login.status + ' ' + trunc(login.body));
@@ -176,8 +150,7 @@ export async function closeRedis(): Promise<void> {
   }
 }
 
-// Poll do marcador que o notification-service grava ao PROCESSAR o evento.
-// Prova o caminho assincrono: outbox -> relay -> broker -> consumer.
+// Poll do marcador que o notification grava ao processar (outbox->relay->broker->consumer).
 export async function waitForNotification(orderId: string, type: string, timeoutMs = 8000): Promise<boolean> {
   const k = 'notif:proc:' + orderId + ':' + type;
   const start = Date.now();
