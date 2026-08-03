@@ -128,6 +128,22 @@ describe('handleDelivery', () => {
     expect(a).toEqual({ type: 'ack', reason: 'processed' });
   });
 
+  it('recordProcessed PENDENTE nao bloqueia o ack (timeout)', async () => {
+    jest.useFakeTimers();
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const pendente = new Promise<void>(() => undefined); // nunca resolve
+    const p = handleDelivery(validRaw, 'order.created', {
+      claim: jest.fn().mockResolvedValue('tok'),
+      release: jest.fn(),
+      handle: jest.fn(),
+      recordProcessed: jest.fn().mockReturnValue(pendente),
+    });
+    await jest.advanceTimersByTimeAsync(2000);
+    const a = await p;
+    expect(a).toEqual({ type: 'ack', reason: 'processed' });
+    jest.useRealTimers();
+  });
+
   it('duplicata (claim null) -> ack duplicate, sem processar', async () => {
     const handle = jest.fn();
     const a = await handleDelivery(validRaw, 'order.created', {
