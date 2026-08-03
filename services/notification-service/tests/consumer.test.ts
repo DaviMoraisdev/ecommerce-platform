@@ -106,14 +106,26 @@ describe('handleEvent', () => {
 });
 
 describe('handleDelivery', () => {
-  it('claim ok + handle ok -> ack processed', async () => {
+  it('claim ok + handle ok -> ack processed + recordProcessed chamado', async () => {
     const claim = jest.fn().mockResolvedValue('tok');
     const release = jest.fn();
     const handle = jest.fn();
-    const a = await handleDelivery(validRaw, 'order.created', { claim, release, handle });
+    const recordProcessed = jest.fn().mockResolvedValue(undefined);
+    const a = await handleDelivery(validRaw, 'order.created', { claim, release, handle, recordProcessed });
     expect(a).toEqual({ type: 'ack', reason: 'processed' });
     expect(handle).toHaveBeenCalledTimes(1);
+    expect(recordProcessed).toHaveBeenCalledTimes(1);
     expect(release).not.toHaveBeenCalled();
+  });
+
+  it('recordProcessed falho nao quebra o ack', async () => {
+    const a = await handleDelivery(validRaw, 'order.created', {
+      claim: jest.fn().mockResolvedValue('tok'),
+      release: jest.fn(),
+      handle: jest.fn(),
+      recordProcessed: jest.fn().mockRejectedValue(new Error('redis down')),
+    });
+    expect(a).toEqual({ type: 'ack', reason: 'processed' });
   });
 
   it('duplicata (claim null) -> ack duplicate, sem processar', async () => {

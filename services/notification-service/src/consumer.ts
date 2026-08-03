@@ -112,6 +112,7 @@ export interface DeliveryDeps {
   claim: (eventId: string) => Promise<string | null>;
   release: (eventId: string, token: string) => Promise<boolean>;
   handle: (event: OrderEvent) => void;
+  recordProcessed?: (event: OrderEvent) => Promise<void>;
 }
 
 // Fases separadas. Ponto critico: se o processamento falha APOS o claim, tenta
@@ -140,6 +141,13 @@ export async function handleDelivery(
 
   try {
     deps.handle(event);
+    if (deps.recordProcessed) {
+      try {
+        await deps.recordProcessed(event);
+      } catch {
+        /* marcador best-effort: nao falha o ack */
+      }
+    }
     return { type: 'ack', reason: 'processed' };
   } catch (handleErr) {
     const reason = handleErr instanceof Error ? handleErr.message : String(handleErr);
