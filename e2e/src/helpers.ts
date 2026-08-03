@@ -1,19 +1,52 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 import jwt from 'jsonwebtoken';
+import Redis from 'ioredis';
 
-const SECRET = process.env.JWT_SECRET as string;
-const PRODUCT = process.env.PRODUCT_URL || 'http://localhost:3003';
-const INVENTORY = process.env.INVENTORY_URL || 'http://localhost:3004';
-const CART = process.env.CART_URL || 'http://localhost:3005';
-const ORDER = process.env.ORDER_URL || 'http://localhost:3006';
-
-export interface HttpResult<T = any> {
-  status: number;
-  body: T;
+function requireEnv(name: string): string {
+  const v = process.env[name];
+  if (!v || v.trim() === '') throw new Error('e2e: variavel obrigatoria ausente: ' + name);
+  return v;
 }
 
-// Assina um JWT valido com o segredo compartilhado (claim id -> userId).
+const ALLOW_DESTRUCTIVE = process.env.E2E_ALLOW_DESTRUCTIVE === 'true';
+
+// Trava de ambiente: por padrao so roda contra localhost (a suite cria dados e
+// usa JWT ADMIN). Alvo nao-local exige E2E_ALLOW_DESTRUCTIVE=true consciente.
+function assertLocalTarget(url: string): string {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    throw new Error('e2e: URL invalida: ' + url);
+  }
+  const local = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  if (!local && !ALLOW_DESTRUCTIVE) {
+    throw new Error(
+      'e2e BLOQUEADO: alvo nao-local (' + host + '). Rode apenas contra localhost, ou defina ' +
+        'E2E_ALLOW_DESTRUCTIVE=true conscientemente (cria dados + usa JWT ADMIN).'
+    );
+  }
+  return url;
+}
+
+const SECRET = requireEnv('JWT_SECRET');
+if (SECRET === 'troque_este_segredo') {
+  throw new Error('e2e: JWT_SECRET e o placeholder; copie o segredo real dos servicos para o .env');
+}
+
+export const URLS = {
+  product: assertLocalTarget(requireEnv('PRODUCT_URL')),
+  inventory: assertLocalTarget(requireEnv('INVENTORY_URL')),
+  cart: assertLocalTarget(requireEnv('CART_URL')),
+  order: assertLocalTarget(requireEnv('ORDER_URL')),
+};
+
+const AUTH = assertLocalTarget(requireEnv('AUTH_URL'));
+const REDIS = assertLocalTarget(requireEnv('REDIS_URL'));
+
+const HTTP_TIMEOUT_MS = Number(process.env.E2E_HTTP_TIMEOUT_MS) || 8000;
+
 export function mintToken(id: string, role = 'ADMIN'): string {
   return jwt.sign({ id, email: id + '@e2e.dev', role }, SECRET, { expiresIn: '1h' });
 }
@@ -22,7 +55,18 @@ export function key(prefix = 'e2e'): string {
   return prefix + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
 }
 
-async function http(
+export interface HttpResult<T = any> {
+  status: number;
+  body: T;
+}
+
+function trunc(v: unknown): string {
+  const s = typeof v === 'string' ? v : JSON.stringify(v);
+  return s && s.length > 200 ? s.slice(0, 200) + '...' : String(s);
+}
+
+// Request cru (nao lanca por status) com TIMEOUT por requisicao (AbortController).
+export async function request(
   method: string,
   url: string,
   opts: { token?: string; body?: unknown; idempotencyKey?: string } = {}
@@ -31,70 +75,124 @@ async function http(
   if (opts.token) headers['Authorization'] = 'Bearer ' + opts.token;
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
   if (opts.idempotencyKey) headers['Idempotency-Key'] = opts.idempotencyKey;
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
-  const text = await res.text();
-  let body: any = null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
   try {
-    body = text ? JSON.parse(text) : null;
-  } catch {
-    body = text;
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let body: any = null;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = text;
+    }
+    return { status: res.status, body };
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(method + ' ' + url + ': timeout apos ' + HTTP_TIMEOUT_MS + 'ms');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return { status: res.status, body };
 }
 
-// Sobe um produto novo (nome unico) e devolve o _id.
 export async function seedProduct(token: string, price: number): Promise<string> {
-  const r = await http('POST', PRODUCT + '/products', {
+  const r = await request('POST', URLS.product + '/products', {
     token,
     body: { name: 'e2e-' + key(), description: 'e2e', price, category: 'e2e' },
   });
-  if (r.status !== 201) {
-    throw new Error('seedProduct falhou: ' + r.status + ' ' + JSON.stringify(r.body));
+  if (r.status !== 201 || typeof r.body?._id !== 'string') {
+    throw new Error('seedProduct falhou: ' + r.status + ' ' + trunc(r.body));
   }
-  return r.body._id as string;
+  return r.body._id;
+}
+
+export async function cleanupProduct(token: string, productId: string): Promise<void> {
+  await request('DELETE', URLS.product + '/products/' + productId, { token });
 }
 
 export async function setStock(token: string, productId: string, quantity: number): Promise<void> {
-  const r = await http('POST', INVENTORY + '/stock', { token, body: { productId, quantity } });
-  if (r.status !== 200) {
-    throw new Error('setStock falhou: ' + r.status + ' ' + JSON.stringify(r.body));
-  }
+  const r = await request('POST', URLS.inventory + '/stock', { token, body: { productId, quantity } });
+  if (r.status !== 200) throw new Error('setStock falhou: ' + r.status + ' ' + trunc(r.body));
 }
 
 export async function getStock(
   productId: string
 ): Promise<{ productId: string; quantity: number; reserved: number; available: number }> {
-  const r = await http('GET', INVENTORY + '/stock/' + productId);
-  if (r.status !== 200) {
-    throw new Error('getStock falhou: ' + r.status + ' ' + JSON.stringify(r.body));
+  const r = await request('GET', URLS.inventory + '/stock/' + productId);
+  if (r.status !== 200 || typeof r.body?.available !== 'number' || typeof r.body?.reserved !== 'number') {
+    throw new Error('getStock falhou/contrato invalido: ' + r.status + ' ' + trunc(r.body));
   }
   return r.body;
 }
 
 export async function addToCart(token: string, productId: string, quantity: number): Promise<HttpResult> {
-  return http('POST', CART + '/cart/items', { token, body: { productId, quantity } });
+  return request('POST', URLS.cart + '/cart/items', { token, body: { productId, quantity } });
 }
 
 export async function getCart(token: string): Promise<HttpResult> {
-  return http('GET', CART + '/cart', { token });
+  return request('GET', URLS.cart + '/cart', { token });
 }
 
 export async function createOrder(token: string, idempotencyKey: string): Promise<HttpResult> {
-  return http('POST', ORDER + '/orders', { token, body: {}, idempotencyKey });
+  return request('POST', URLS.order + '/orders', { token, body: {}, idempotencyKey });
 }
 
-// Verifica se os quatro servicos HTTP estao de pe (retorna status por servico).
+// Jornada real: registra e loga no auth-service, devolvendo o accessToken que ELE
+// emite (prova o contrato do token de ponta a ponta).
+export async function registerAndLogin(): Promise<{ token: string; userId: string; email: string }> {
+  const email = 'e2e-' + key() + '@e2e.dev';
+  const password = 'Senha123!';
+  const reg = await request('POST', AUTH + '/auth/register', {
+    body: { email, password, name: 'e2e user' },
+  });
+  if (reg.status !== 201) {
+    throw new Error('register falhou: ' + reg.status + ' ' + trunc(reg.body));
+  }
+  const login = await request('POST', AUTH + '/auth/login', { body: { email, password } });
+  if (login.status !== 200 || typeof login.body?.accessToken !== 'string') {
+    throw new Error('login falhou/sem accessToken: ' + login.status + ' ' + trunc(login.body));
+  }
+  return { token: login.body.accessToken, userId: login.body.user.id, email };
+}
+
+let redisClient: Redis | null = null;
+function getRedis(): Redis {
+  if (!redisClient) redisClient = new Redis(REDIS, { maxRetriesPerRequest: 2 });
+  return redisClient;
+}
+
+export async function closeRedis(): Promise<void> {
+  if (redisClient) {
+    await redisClient.quit().catch(() => undefined);
+    redisClient = null;
+  }
+}
+
+// Poll do marcador que o notification-service grava ao PROCESSAR o evento.
+// Prova o caminho assincrono: outbox -> relay -> broker -> consumer.
+export async function waitForNotification(orderId: string, type: string, timeoutMs = 8000): Promise<boolean> {
+  const k = 'notif:proc:' + orderId + ':' + type;
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await getRedis().get(k)) return true;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
 export async function health(): Promise<Record<string, number>> {
-  const urls: Record<string, string> = { product: PRODUCT, inventory: INVENTORY, cart: CART, order: ORDER };
   const out: Record<string, number> = {};
-  for (const [name, base] of Object.entries(urls)) {
+  for (const [name, base] of Object.entries(URLS)) {
     try {
-      const r = await fetch(base + '/health');
-      out[name] = r.status;
+      out[name] = (await request('GET', base + '/health')).status;
     } catch {
       out[name] = 0;
     }
