@@ -142,6 +142,7 @@ describe('handleDelivery', () => {
     const a = await p;
     expect(a).toEqual({ type: 'ack', reason: 'processed' });
     jest.useRealTimers();
+    jest.restoreAllMocks();
   });
 
   it('duplicata (claim null) -> ack duplicate, sem processar', async () => {
