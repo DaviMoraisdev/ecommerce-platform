@@ -187,42 +187,42 @@ Funcionalidades já implementadas:
 - Consulta pública de disponibilidade, consumida pelo `product-service`.
 - Cobertura de testes: 6 suítes / 54 testes, incluindo teste de concorrência.
 
-> Nota: a baixa de estoque após confirmação do pedido e o ownership real da reserva
-> (amarrar cada reserva a um pedido/usuário) serão implementados na Fase 4, com o `order-service`.
+> Fase 4: o **ownership da reserva** (cada reserva amarrada a um `orderId`) e o `release(orderId)`
+> idempotente foram implementados e são consumidos pela saga do `order-service`.
 
 Banco: **PostgreSQL** (via Prisma).
 
 ---
 
-### `cart-service`
+### `cart-service` ✅ Implementado (Fase 4)
 
 Responsável pelo carrinho de compras.
 
-Principais responsabilidades:
+Funcionalidades já implementadas:
 
-- Adicionar produtos ao carrinho.
-- Remover produtos do carrinho.
-- Atualizar quantidades.
-- Calcular subtotal.
-- Manter estado temporário da compra.
+- Adicionar, remover e atualizar quantidade de itens; limpar o carrinho.
+- Enriquecimento de preço/nome consultando o `product-service` (carrinho "parcial" quando algum item perde preço).
+- Validação de estoque no add (consulta ao `inventory-service`) antes de aceitar o item.
+- Cálculo de subtotal/total no servidor; estado por usuário com TTL.
 
-Armazenamento previsto: **Redis**.
+Armazenamento: **Redis** (via ioredis).
 
 ---
 
-### `order-service`
+### `order-service` ✅ Implementado (Fase 4)
 
-Responsável pelo ciclo de vida dos pedidos.
+Responsável pelo ciclo de vida dos pedidos — o núcleo transacional da fase.
 
-Principais responsabilidades:
+Funcionalidades já implementadas:
 
-- Criação de pedidos.
-- Consulta de pedidos por usuário.
-- Controle de status do pedido.
-- Integração com estoque.
-- Publicação de eventos para pagamento e notificações.
+- **Checkout como saga** a partir do carrinho: reserva de estoque por item, criação do pedido + itens numa transação, limpeza dos itens comprados e **compensação** (release do estoque) em falha.
+- **Idempotência** por `Idempotency-Key` (claim atômico antes de qualquer efeito) — retry e concorrência não duplicam pedido nem reserva.
+- **Total recalculado no servidor** (nunca confia no total do cliente); invariante `total = Σ subtotais`.
+- **Máquina de estados** de status (PENDENTE → PAGO → ENVIADO → ENTREGUE; cancelamento) com trilha auditável e compare-and-swap.
+- **Outbox transacional**: o evento é gravado na mesma transação do pedido e um **relay** publica no RabbitMQ com confirmação (**at-least-once**).
+- Cobertura de testes: 54 unit + 31 integração (+ e2e ponta a ponta).
 
-Banco previsto: **PostgreSQL**.
+Banco: **PostgreSQL** (via Prisma).
 
 ---
 
@@ -242,18 +242,20 @@ Banco previsto: **PostgreSQL**.
 
 ---
 
-### `notification-service`
+### `notification-service` 🟡 Parcial — infra de mensageria entregue na Fase 4 (consumo idempotente, DLQ, shutdown gracioso); efeito real (e-mail/push) é escopo da Fase 6.
 
-Responsável pelo envio de notificações assíncronas.
+Consumer assíncrono dos eventos de pedido.
 
-Principais responsabilidades:
+Funcionalidades já implementadas:
 
-- Consumir eventos do RabbitMQ.
-- Enviar notificações de pedido criado.
-- Enviar notificações de pagamento aprovado ou recusado.
-- Enviar mensagens futuras por e-mail ou outros canais.
+- Consome `order.created` / `order.status_changed` do RabbitMQ (topic exchange `orders`).
+- **Idempotência por `eventId`** (Redis `SET NX` com token + compare-and-delete) — a reentrega do at-least-once não duplica efeito.
+- Validação de contrato por tipo; **dead-letter queue** para mensagem inválida (em vez de descartar).
+- Encerramento gracioso; erro no store → requeue com atraso (sem hot loop).
+- Hoje o "efeito" é log (stub); e-mail/push são evolução futura.
+- Cobertura de testes: 39 unit.
 
-Este serviço atua principalmente como **consumer** de eventos.
+Armazenamento (dedup): **Redis**.
 
 ---
 
@@ -290,6 +292,7 @@ ecommerce-platform/
 │   ├── order-service/
 │   ├── payment-service/
 │   └── notification-service/
+├── e2e/                      # testes ponta a ponta (Fase 4, Bloco 9)
 ├── gateway/
 │   └── nginx/
 ├── frontend/
@@ -409,6 +412,30 @@ docker compose down -v
 
 ---
 
+### Rodar os serviços
+
+Cada serviço roda com o próprio `npm run dev` (ex.: `cd services/order-service && npm run dev`), após aplicar as migrations dos serviços com banco relacional:
+
+```bash
+( cd services/auth-service && npx prisma migrate deploy )
+( cd services/inventory-service && npx prisma migrate deploy )
+( cd services/order-service && npx prisma migrate deploy )
+```
+
+Portas padrão: auth `3001`, product `3003`, inventory `3004`, cart `3005`, order `3006`. O `notification-service` é um worker (sem porta HTTP).
+
+### Testes e e2e
+
+Cada serviço tem a própria suíte (`npm test` / `npm run test:integration`). O fluxo **ponta a ponta** vive no pacote `e2e/`, rodando contra o stack local de pé (ver `e2e/README.md`):
+
+```bash
+cd e2e
+npm ci
+npm test   # cart -> order -> inventory, concorrência (sem oversell), jornada com auth, consumo do notification
+```
+
+---
+
 ## Variáveis de ambiente
 
 Exemplo de variáveis esperadas no arquivo `.env`:
@@ -517,8 +544,8 @@ O projeto será desenvolvido em fases para evitar acúmulo de complexidade e per
 | Fase 2 | Concluída | Serviço de autenticação |
 | Fase 3 | Concluída | Catálogo de produtos e estoque |
 | Fase 4 | Concluída | Carrinho e pedidos |
-| Fase 5 | Pendente | Pagamentos |
-| Fase 6 | Concluída | Notificações assíncronas |
+| Fase 5 | Em andamento | Pagamentos |
+| Fase 6 | Parcial | Notificações assíncronas |
 | Fase 7 | Pendente | API Gateway e segurança |
 | Fase 8 | Pendente | Frontend web |
 | Fase 9 | Pendente | Admin dashboard |
@@ -541,7 +568,8 @@ docs/
 ├── phase-reviews/
 │   ├── phase-01.md
 │   ├── phase-02.md
-│   └── phase-03.md
+│   ├── phase-03.md
+│   └── phase-04.pdf
 ├── decisions/
 │   └── adr-001-architecture-choice.md
 └── roadmap.md
