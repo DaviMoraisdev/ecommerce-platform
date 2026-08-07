@@ -5,7 +5,7 @@ const config: Config = {
   testEnvironment: 'node',
   roots: ['<rootDir>/tests'],
   clearMocks: true,
-  setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
+  setupFilesAfterEnv: ['<rootDir>/tests/setup.integration.ts'],
   testMatch: ['**/*.integration.test.ts'],
   testPathIgnorePatterns: ['/node_modules/'],
   // Os arquivos de integracao compartilham o MESMO order_test_db. Em paralelo,
