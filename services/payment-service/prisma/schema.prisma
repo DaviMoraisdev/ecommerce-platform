@@ -125,10 +125,16 @@ model WebhookEvent {
   // deve ser ignorado, e so este campo permite decidir isso.
   //
   // NULLABLE por necessidade: nem todo provedor envia timestamp de origem.
-  // POLITICA FAIL-CLOSED (obrigatoria no Bloco 4): evento sem providerCreatedAt
-  // NAO pode alterar o estado do pagamento. Ele e persistido com status
-  // IGNORED e fica disponivel para triagem manual. Preferimos um webhook
-  // parado a um pagamento aprovado sendo sobrescrito por um evento antigo.
+  //
+  // PERSISTENCIA aceita null — e a funcao do inbox registrar TUDO que chega,
+  // inclusive evento malformado. Recusar a gravacao perderia a evidencia.
+  //
+  // POLITICA FAIL-CLOSED, do HANDLER (criterio de aceite do Bloco 4): evento
+  // sem providerCreatedAt nao pode alterar o estado do pagamento. O handler
+  // deve transicionar o registro para IGNORED e deixa-lo para triagem manual.
+  // Preferimos um webhook parado a um pagamento aprovado sendo sobrescrito
+  // por um evento antigo. A garantia e da aplicacao, nao do banco: uma
+  // constraint aqui impediria a propria gravacao.
   providerCreatedAt DateTime?
 
   status    WebhookStatus @default(RECEIVED)
@@ -179,9 +185,18 @@ model IdempotencyRecord {
 
   // NULLABLE por exigencia do claim-first: a chave e reivindicada ANTES de o
   // pagamento existir, para que uma requisicao duplicada colida no @@unique
-  // em vez de criar uma segunda cobranca. O preenchimento acontece na mesma
-  // transacao que cria o Payment (status PROCESSING -> COMPLETED).
-  // FK com Restrict: um registro concluido nunca pode apontar para o vazio.
+  // em vez de criar uma segunda cobranca.
+  //
+  // Combinacoes validas (CHECK idempotency_completed_exige_pagamento):
+  //   PROCESSING + null      -> chave reivindicada, pagamento ainda nao criado
+  //   PROCESSING + paymentId -> pagamento criado, fluxo ainda em andamento
+  //   COMPLETED  + paymentId -> UNICA forma valida de COMPLETED: o replay da
+  //                             chave PRECISA ter um resultado para devolver
+  //   COMPLETED  + null      -> PROIBIDO pelo banco
+  //   FAILED     + null      -> falhou antes de criar o pagamento
+  //   FAILED     + paymentId -> pagamento criado, fluxo falhou depois
+  //
+  // FK com Restrict: pagamento referenciado por uma chave nao pode ser apagado.
   paymentId String?
   payment   Payment? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
 
