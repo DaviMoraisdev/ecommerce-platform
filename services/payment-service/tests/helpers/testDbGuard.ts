@@ -18,7 +18,10 @@
 
 export const BANCO_DE_TESTE = 'payment_test_db';
 
-const HOSTS_LOCAIS = new Set(['127.0.0.1', 'localhost', '::1']);
+// URL.hostname devolve endereco IPv6 ENTRE COLCHETES ("[::1]"). Sem a forma
+// com colchetes, o allowlist ANUNCIARIA ::1 e o rejeitaria na pratica — bug
+// encontrado ao escrever o teste de host IPv6 local.
+const HOSTS_LOCAIS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
 export class GuardaDeBancoError extends Error {
   constructor(message: string) {

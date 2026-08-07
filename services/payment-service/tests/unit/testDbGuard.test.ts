@@ -91,14 +91,44 @@ describe('assertTestDatabase', () => {
     ).not.toThrow();
   });
 
+  it('aceita o host local IPv6', () => {
+    expect(() =>
+      assertTestDatabase(
+        ambiente({ DATABASE_URL: `postgresql://u:p@[::1]:5432/${BANCO_DE_TESTE}` }),
+      ),
+    ).not.toThrow();
+  });
+
+  it.each(['1', 'TRUE', 'yes', 'false'])(
+    'rejeita host remoto com ALLOW_REMOTE_TEST_DB=%s — so a string exata "true" autoriza',
+    (valor) => {
+      expect(() =>
+        assertTestDatabase(
+          ambiente({
+            DATABASE_URL: `postgresql://u:p@db.producao.com:5432/${BANCO_DE_TESTE}`,
+            ALLOW_REMOTE_TEST_DB: valor,
+          }),
+        ),
+      ).toThrow(GuardaDeBancoError);
+    },
+  );
+
   it('nao vaza a senha na mensagem de erro', () => {
+    // Capturar fora do catch. Na versao anterior, se a guarda NAO lancasse, o
+    // proprio erro-sentinela era capturado — e a mensagem dele tambem nao
+    // contem a senha, entao a assercao passava. Falso positivo: o teste
+    // precisa provar as DUAS coisas, que recusou e que nao vazou.
+    let capturado: unknown;
+
     try {
       assertTestDatabase(
         ambiente({ DATABASE_URL: 'postgresql://u:SenhaSecreta@127.0.0.1:5432/producao' }),
       );
-      throw new Error('esperava que a guarda abortasse');
     } catch (erro) {
-      expect((erro as Error).message).not.toContain('SenhaSecreta');
+      capturado = erro;
     }
+
+    expect(capturado).toBeInstanceOf(GuardaDeBancoError);
+    expect((capturado as Error).message).not.toContain('SenhaSecreta');
   });
 });
