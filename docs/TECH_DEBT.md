@@ -16,6 +16,9 @@ Trade-offs aceitos cujo **gatilho** de correção está explícito — não são
 
 ---
 
+- **Premissa de 2 casas decimais (payment-service):** `src/domain/money.ts` assume 100 centavos por unidade monetária. Verdadeiro para BRL, falso para JPY (0 casas) e dinares (3). Seguro enquanto `Currency = 'BRL'`. **Gatilho:** suporte a segunda moeda.
+
+
 ## Decisões e procedimentos documentados (sem trabalho pendente)
 
 Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro.
@@ -32,6 +35,13 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 
 ---
 
+## FASE 5 — fechar no Bloco 10 (dentro desta fase)
+
+
+- **`.env` da raiz defasado em relação ao container:** a credencial do `.env` da raiz não é a que o Postgres em execução aceita; os serviços usam outra. O `docker compose down -v` documentado no README recriaria o volume com a senha da raiz e **quebraria todos os serviços de uma vez**. Alinhar raiz e serviços, e validar no boot.
+- **`.env.example` ausente em `inventory-service` e `product-service`:** ambos concluídos, nenhum documenta as variáveis necessárias. Ninguém consegue subi-los em máquina nova, e as portas deles só são descobríveis lendo o código. Viola a regra do projeto de `.env.example` sempre versionado.
+
+
 ## FASE 7 — Gateway, Segurança e Infra
 
 ### Segurança
@@ -43,6 +53,7 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 - **Portas de dev em 0.0.0.0:** postgres/mongo/redis publicam em todas as interfaces (rabbitmq já restrito a 127.0.0.1). Restringir + credenciais fortes por ambiente. Dev-only, baixa.
 
 ### Infra / containerização
+- **payment-service no docker-compose:** nasceu fora do compose (só `npm run dev`), mesmo estado do notification-service. Dockerfile, entrada no compose e healthcheck. Tratar junto com o item acima.
 - **notification-service no docker-compose:** Dockerfile, entrada no compose, healthcheck e observabilidade (hoje só `npm run dev`).
 - **Migração de args de fila durável (RabbitMQ):** args são imutáveis; adicionar a DLX exigiu deletar a fila (one-time manual). Padronizar via policy/quorum ou script de deploy.
 - **Automatizar o e2e via docker-compose:** a suíte `e2e/` (Bloco 9) roda contra o stack local subido manualmente (auth, product, inventory, cart, order, notification + infra). Containerizar permite rodar no CI.
@@ -96,6 +107,8 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ---
 
 ## Refatoração transversal (→ Fase 7, pass de qualidade)
+
+- **`dotenv` sem `quiet: true` no order-service** (`src/config/database.ts`, `tests/setup.ts`): imprime dicas promocionais no stdout. É a causa raiz do problema 5.2 da Fase 4 (token JWT contaminado), corrigida pontualmente na época mas ainda presente nesses arquivos. O payment-service já nasceu com `quiet: true`.
 
 - **Alinhar `database.ts` do inventory ao padrão do order:** exit centralizado no `server.ts`, não na camada de banco.
 - **Erros de domínio como classes/enums** em vez de strings (inventory, product, cart).
