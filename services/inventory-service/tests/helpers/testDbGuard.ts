@@ -16,7 +16,7 @@
  * Recebe o ambiente como parametro para ser testavel sem mutar process.env.
  */
 
-export const BANCO_DE_TESTE = 'order_test_db';
+export const BANCO_DE_TESTE = 'inventory_test_db';
 
 // URL.hostname devolve endereco IPv6 ENTRE COLCHETES ("[::1]"). Sem a forma
 // com colchetes, o allowlist ANUNCIARIA ::1 e o rejeitaria na pratica — bug

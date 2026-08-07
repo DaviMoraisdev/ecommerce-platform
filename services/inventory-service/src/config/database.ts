@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 // Carrega as variaveis ANTES de instanciar o PrismaClient
-dotenv.config();
+dotenv.config({ quiet: true });
 import { PrismaClient } from '@prisma/client';
 import { sanitizeConnectionError } from './database-error';
 
