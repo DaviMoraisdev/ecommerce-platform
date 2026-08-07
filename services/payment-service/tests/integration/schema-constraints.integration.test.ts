@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { Prisma } from '@prisma/client';
-import { prisma } from '../../src/config/database';
+import { Prisma, type PrismaClient } from '@prisma/client';
+import { connectDatabase, disconnectDatabase } from '../../src/config/database';
 import { MAX_AMOUNT_CENTS } from '../../src/domain/money';
 
 /**
@@ -39,6 +39,7 @@ function webhookValido(
     providerEventId: randomUUID(),
     eventType: 'payment.succeeded',
     payload: { ok: true },
+    providerCreatedAt: new Date(),
     ...overrides,
   };
 }
@@ -54,6 +55,13 @@ function outboxValido(
   };
 }
 
+let prisma: PrismaClient;
+
+beforeAll(async () => {
+  // A URL ja foi validada pela guarda em tests/setup.integration.ts.
+  prisma = await connectDatabase(process.env.DATABASE_URL as string);
+});
+
 afterEach(async () => {
   // Ordem ditada pelas FKs com Restrict: dependentes antes de payments.
   await prisma.idempotencyRecord.deleteMany();
@@ -64,7 +72,7 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
-  await prisma.$disconnect();
+  await disconnectDatabase();
 });
 
 describe('caminho feliz', () => {
@@ -223,8 +231,24 @@ describe('webhook_events (inbox)', () => {
     const criado = await prisma.webhookEvent.create({ data: webhookValido() });
     expect(criado.status).toBe('RECEIVED');
     expect(criado.attempts).toBe(0);
+    expect(criado.providerCreatedAt).not.toBeNull();
+  });
+
+  it('PERSISTE evento sem providerCreatedAt — o inbox registra tudo que chega', async () => {
+    const criado = await prisma.webhookEvent.create({
+      data: webhookValido({ providerCreatedAt: null }),
+    });
+
+    // Gravar e obrigatorio: recusar aqui perderia a evidencia do evento
+    // malformado. A politica fail-closed e do HANDLER, nao do banco.
+    expect(criado.id).toBeDefined();
     expect(criado.providerCreatedAt).toBeNull();
   });
+
+  // Obrigacao registrada na propria suite, nao so em comentario: quando o
+  // handler do Bloco 4 existir, evento sem providerCreatedAt deve virar
+  // IGNORED e NAO pode alterar o estado do pagamento.
+  it.todo('handler do Bloco 4: evento sem providerCreatedAt vira IGNORED e nao altera o pagamento');
 
   it('recusa attempts negativo', async () => {
     const erro = await capturarViolacao(() =>
@@ -308,6 +332,55 @@ describe('idempotency_records', () => {
       data: { userId: randomUUID(), key },
     });
     expect(outro.key).toBe(key);
+  });
+
+  it.each(['PROCESSING', 'FAILED'] as const)(
+    'aceita %s sem paymentId',
+    async (status) => {
+      const criado = await prisma.idempotencyRecord.create({
+        data: { userId: randomUUID(), key: randomUUID(), status },
+      });
+      expect(criado.paymentId).toBeNull();
+    },
+  );
+
+  it('recusa COMPLETED sem paymentId na criacao', async () => {
+    const erro = await capturarViolacao(() =>
+      prisma.idempotencyRecord.create({
+        data: { userId: randomUUID(), key: randomUUID(), status: 'COMPLETED' },
+      }),
+    );
+    expect(erro.message).toContain('idempotency_completed_exige_pagamento');
+  });
+
+  it('recusa transicao para COMPLETED deixando paymentId nulo', async () => {
+    const registro = await prisma.idempotencyRecord.create({
+      data: { userId: randomUUID(), key: randomUUID() },
+    });
+
+    const erro = await capturarViolacao(() =>
+      prisma.idempotencyRecord.update({
+        where: { id: registro.id },
+        data: { status: 'COMPLETED' },
+      }),
+    );
+    expect(erro.message).toContain('idempotency_completed_exige_pagamento');
+  });
+
+  it('aceita COMPLETED com paymentId — a unica forma valida', async () => {
+    const pagamento = await prisma.payment.create({ data: pagamentoValido() });
+
+    const registro = await prisma.idempotencyRecord.create({
+      data: { userId: randomUUID(), key: randomUUID() },
+    });
+
+    const concluido = await prisma.idempotencyRecord.update({
+      where: { id: registro.id },
+      data: { status: 'COMPLETED', paymentId: pagamento.id },
+    });
+
+    expect(concluido.status).toBe('COMPLETED');
+    expect(concluido.paymentId).toBe(pagamento.id);
   });
 
   it('recusa paymentId que nao existe (integridade referencial)', async () => {
