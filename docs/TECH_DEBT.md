@@ -38,6 +38,8 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ## FASE 5 — fechar no Bloco 10 (dentro desta fase)
 
 
+- **Suíte de integração sem guarda fail-closed em `order-service` e `inventory-service`:** ambos usam `dotenv.config({ path: '.env.test' })` sem checar o retorno e executam `deleteMany()` nos testes. Se o `.env.test` sumir ou for mal configurado, a suíte apaga o banco de **desenvolvimento** — e ao contrário do payment, esses bancos têm dados acumulados. O `payment-service` já tem a guarda (`tests/test-db-guard.ts`); replicar o padrão. **Prioridade: antes do Bloco 2.** Descoberto ao aplicar a revisão do PR #47.
+
 - **`.env` da raiz defasado em relação ao container:** a credencial do `.env` da raiz não é a que o Postgres em execução aceita; os serviços usam outra. O `docker compose down -v` documentado no README recriaria o volume com a senha da raiz e **quebraria todos os serviços de uma vez**. Alinhar raiz e serviços, e validar no boot.
 - **`.env.example` ausente em `inventory-service` e `product-service`:** ambos concluídos, nenhum documenta as variáveis necessárias. Ninguém consegue subi-los em máquina nova, e as portas deles só são descobríveis lendo o código. Viola a regra do projeto de `.env.example` sempre versionado.
 
@@ -81,12 +83,13 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ## FASE 10 — Resiliência avançada, jobs e qualidade
 
 ### Jobs / reconciliação
-- **Processor de reconciliação da saga:** o estado durável já existe (`idempotency_records` com orderId+status; `pending_compensations`). Falta o JOB, tratando cada caso sem liberar pedido válido:
+
+- **Retenção e minimização do inbox de webhooks (`payment-service`):** `webhook_events.payload` guarda o JSON íntegro do provedor, e `lastError`/`failureMessage` guardam texto arbitrário. Payload de gateway pode conter dados pessoais (nome, últimos dígitos, e-mail) e mensagens de erro podem carregar segredo. Definir campos permitidos, política de expiração e arquivamento. Tratar junto com a retenção da outbox. *(Item 3.2 da revisão do PR #47. A sanitização em escrita é critério de aceite dos Blocos 4 e 9, dentro da fase; aqui fica só a retenção.)*- **Processor de reconciliação da saga:** o estado durável já existe (`idempotency_records` com orderId+status; `pending_compensations`). Falta o JOB, tratando cada caso sem liberar pedido válido:
   - `pending_compensations` aberta → reexecutar `release(orderId)` (idempotente) + marcar `resolvedAt`.
   - `idempotency_records` em `PROCESSING` → **bifurcar**: se o pedido existe, marcar `COMPLETED` (não liberar!); se não, `release` + `FAILED`.
   - `idempotency_records` `FAILED` → reexecutar `release(orderId)`.
   Tudo com retry/backoff, métricas e alerta.
-- **Retenção/limpeza da outbox:** `SENT`/`FAILED` crescem sem política; o payload guarda userId/total. Definir arquivamento/cleanup e minimizar campos.
+- **Retenção/limpeza da outbox:** [ver também o item de inbox abaixo] `SENT`/`FAILED` crescem sem política; o payload guarda userId/total. Definir arquivamento/cleanup e minimizar campos.
 - **Backoff/quarentena/redrive no relay da outbox (produtor):** o publish falho volta a `PENDING` e é retentado em intervalo fixo (sem backoff exponencial, sem quarentena de "poison" nem redrive) — um evento inpublicável causaria head-of-line blocking. Eventos são bem-formados (produtor próprio) → risco baixo hoje; necessário sob carga real. Enum `FAILED` reservado. (PR #43/#44.)
 - **Limpeza do carrinho por versão/CAS:** hoje o checkout remove só os itens comprados por productId; um CAS por versão preservaria mudanças de quantidade. Exige versionamento no cart.
 
