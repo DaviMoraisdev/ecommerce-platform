@@ -89,6 +89,30 @@ describe('equals', () => {
     expect(equals({ amountCents: 100, currency: 'BRL' }, { amountCents: 101, currency: 'BRL' })).toBe(false);
   });
 
+  it.each([-1, 1.5, MAX_AMOUNT_CENTS + 1])(
+    'lanca quando o primeiro operando tem centavos invalidos (%p)',
+    (invalido) => {
+      expect(() =>
+        equals({ amountCents: invalido, currency: 'BRL' }, { amountCents: 100, currency: 'BRL' }),
+      ).toThrow(MoneyError);
+    },
+  );
+
+  it.each([-1, 1.5, MAX_AMOUNT_CENTS + 1])(
+    'lanca quando o segundo operando tem centavos invalidos (%p)',
+    (invalido) => {
+      expect(() =>
+        equals({ amountCents: 100, currency: 'BRL' }, { amountCents: invalido, currency: 'BRL' }),
+      ).toThrow(MoneyError);
+    },
+  );
+
+  it('nao considera iguais dois valores invalidos identicos', () => {
+    expect(() =>
+      equals({ amountCents: -5, currency: 'BRL' }, { amountCents: -5, currency: 'BRL' }),
+    ).toThrow(MoneyError);
+  });
+
   it('lanca ao comparar moedas diferentes em vez de retornar false', () => {
     const brl = { amountCents: 100, currency: 'BRL' as const };
     const outra = { amountCents: 100, currency: 'USD' as unknown as 'BRL' };
