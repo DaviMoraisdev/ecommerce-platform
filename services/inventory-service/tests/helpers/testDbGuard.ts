@@ -16,7 +16,7 @@
  * Recebe o ambiente como parametro para ser testavel sem mutar process.env.
  */
 
-export const BANCO_DE_TESTE = 'order_test_db';
+export const BANCO_DE_TESTE = 'inventory_test_db';
 
 const HOSTS_LOCAIS = new Set(['127.0.0.1', 'localhost', '::1']);
 

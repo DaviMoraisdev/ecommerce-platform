@@ -1,4 +1,4 @@
-import { assertTestDatabase, GuardaDeBancoError, BANCO_DE_TESTE } from './helpers/testDbGuard';
+import { assertTestDatabase, GuardaDeBancoError, BANCO_DE_TESTE } from '../helpers/testDbGuard';
 
 /**
  * A guarda recebe o ambiente por parametro, entao nenhum teste aqui muta
