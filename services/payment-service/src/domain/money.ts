@@ -70,6 +70,13 @@ export function assertValidCents(amountCents: number): void {
 
 /** Igualdade de dinheiro exige moeda igual. Comparar BRL com USD e erro, nao false. */
 export function equals(a: Money, b: Money): boolean {
+  // Money e uma interface: qualquer objeto estrutural pode chegar aqui com
+  // valor negativo, fracionario ou acima do teto. Sem esta validacao, dois
+  // valores INVALIDOS seriam considerados iguais — o modulo estaria violando
+  // a propria invariante que declara.
+  assertValidCents(a.amountCents);
+  assertValidCents(b.amountCents);
+
   if (a.currency !== b.currency) {
     throw new MoneyError(`Moedas incompativeis: ${a.currency} vs ${b.currency}`);
   }

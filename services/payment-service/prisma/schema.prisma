@@ -10,13 +10,13 @@ datasource db {
 // Ciclo de vida do pagamento. Reembolso NAO e estado: e aritmetica
 // sobre refundedAmountCents (ver CHECK constraints na migration).
 enum PaymentStatus {
-  PENDING     // criado, nenhuma tentativa ainda
-  PROCESSING  // tentativa em voo no provedor, resposta pendente
-  AUTHORIZED  // fundos bloqueados no cartao, dinheiro NAO movido
-  CAPTURED    // dinheiro movido — e este estado que vira PAGO no order
-  FAILED      // ultima tentativa falhou; janela de retentativa AINDA ABERTA
-  EXPIRED     // janela esgotou sem captura (Bloco 6 compensa a saga)
-  CANCELED    // cancelado deliberadamente; void da autorizacao se existir
+  PENDING // criado, nenhuma tentativa ainda
+  PROCESSING // tentativa em voo no provedor, resposta pendente
+  AUTHORIZED // fundos bloqueados no cartao, dinheiro NAO movido
+  CAPTURED // dinheiro movido — e este estado que vira PAGO no order
+  FAILED // ultima tentativa falhou; janela de retentativa AINDA ABERTA
+  EXPIRED // janela esgotou sem captura (Bloco 6 compensa a saga)
+  CANCELED // cancelado deliberadamente; void da autorizacao se existir
 }
 
 model Payment {
@@ -44,7 +44,8 @@ model Payment {
   // Qual adapter originou este pagamento: 'fake' (Bloco 2) ou 'stripe' (Bloco 9).
   provider String
 
-  transactions PaymentTransaction[]
+  transactions       PaymentTransaction[]
+  idempotencyRecords IdempotencyRecord[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -69,7 +70,7 @@ enum TransactionStatus {
 }
 
 model PaymentTransaction {
-  id        String  @id @default(uuid())
+  id        String @id @default(uuid())
   paymentId String
 
   // Restrict, e NAO Cascade: a trilha financeira nunca pode ser apagada
@@ -122,6 +123,12 @@ model WebhookEvent {
   // Momento em que o PROVEDOR gerou o evento. Necessario para tolerar
   // entrega fora de ordem: um evento antigo que chega depois de um novo
   // deve ser ignorado, e so este campo permite decidir isso.
+  //
+  // NULLABLE por necessidade: nem todo provedor envia timestamp de origem.
+  // POLITICA FAIL-CLOSED (obrigatoria no Bloco 4): evento sem providerCreatedAt
+  // NAO pode alterar o estado do pagamento. Ele e persistido com status
+  // IGNORED e fica disponivel para triagem manual. Preferimos um webhook
+  // parado a um pagamento aprovado sendo sobrescrito por um evento antigo.
   providerCreatedAt DateTime?
 
   status    WebhookStatus @default(RECEIVED)
@@ -166,10 +173,18 @@ enum IdempotencyStatus {
 }
 
 model IdempotencyRecord {
-  id        String            @id @default(uuid())
-  userId    String
-  key       String
-  paymentId String
+  id     String @id @default(uuid())
+  userId String
+  key    String
+
+  // NULLABLE por exigencia do claim-first: a chave e reivindicada ANTES de o
+  // pagamento existir, para que uma requisicao duplicada colida no @@unique
+  // em vez de criar uma segunda cobranca. O preenchimento acontece na mesma
+  // transacao que cria o Payment (status PROCESSING -> COMPLETED).
+  // FK com Restrict: um registro concluido nunca pode apontar para o vazio.
+  paymentId String?
+  payment   Payment? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
   status    IdempotencyStatus @default(PROCESSING)
   createdAt DateTime          @default(now())
   updatedAt DateTime          @updatedAt
