@@ -38,7 +38,6 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ## FASE 5 — fechar no Bloco 10 (dentro desta fase)
 
 
-- **Suíte de integração sem guarda fail-closed em `order-service` e `inventory-service`:** ambos usam `dotenv.config({ path: '.env.test' })` sem checar o retorno e executam `deleteMany()` nos testes. Se o `.env.test` sumir ou for mal configurado, a suíte apaga o banco de **desenvolvimento** — e ao contrário do payment, esses bancos têm dados acumulados. O `payment-service` já tem a guarda (`tests/test-db-guard.ts`); replicar o padrão. **Prioridade: antes do Bloco 2.** Descoberto ao aplicar a revisão do PR #47.
 
 - **`.env` da raiz defasado em relação ao container:** a credencial do `.env` da raiz não é a que o Postgres em execução aceita; os serviços usam outra. O `docker compose down -v` documentado no README recriaria o volume com a senha da raiz e **quebraria todos os serviços de uma vez**. Alinhar raiz e serviços, e validar no boot.
 - **`.env.example` ausente em `inventory-service` e `product-service`:** ambos concluídos, nenhum documenta as variáveis necessárias. Ninguém consegue subi-los em máquina nova, e as portas deles só são descobríveis lendo o código. Viola a regra do projeto de `.env.example` sempre versionado.
@@ -100,6 +99,7 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 - **Ciclo de vida acoplado a efeitos globais:** `start()`/estado do publisher rodam no import, com `process.exit` embutido e estado de módulo global. Separar construção/start/stop + injetar conexão/logger/exit.
 
 ### Qualidade de testes / CI
+- **`inventory-service` com uma unica config de Jest:** unit e integração compartilham `jest.config.ts`, então a guarda de banco de teste se aplica a todos os testes, inclusive os que não tocam o banco. Funciona, mas acopla teste puro a configuração de infraestrutura. Separar em `jest.integration.config.ts` como nos demais serviços.
 - **Velocidade dos testes (ts-jest):** recompila+type-checa cada arquivo por run (o build já faz o type-check). `isolatedModules: true` ou `@swc/jest`/`esbuild-jest` → 3–5× mais rápido. Aplicar em order/inventory/cart/product.
 - **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham.
 - **Teste de config do `redis.ts`** (fallback quando `REDIS_URL` ausente).
@@ -113,7 +113,6 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 
 ## Refatoração transversal (→ Fase 7, pass de qualidade)
 
-- **`dotenv` sem `quiet: true` no order-service** (`src/config/database.ts`, `tests/setup.ts`): imprime dicas promocionais no stdout. É a causa raiz do problema 5.2 da Fase 4 (token JWT contaminado), corrigida pontualmente na época mas ainda presente nesses arquivos. O payment-service já nasceu com `quiet: true`.
 
 - **Alinhar `database.ts` do inventory ao padrão do order:** exit centralizado no `server.ts`, não na camada de banco.
 - **Erros de domínio como classes/enums** em vez de strings (inventory, product, cart).
