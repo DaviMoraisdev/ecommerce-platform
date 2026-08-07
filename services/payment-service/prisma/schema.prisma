@@ -1,0 +1,210 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Ciclo de vida do pagamento. Reembolso NAO e estado: e aritmetica
+// sobre refundedAmountCents (ver CHECK constraints na migration).
+enum PaymentStatus {
+  PENDING // criado, nenhuma tentativa ainda
+  PROCESSING // tentativa em voo no provedor, resposta pendente
+  AUTHORIZED // fundos bloqueados no cartao, dinheiro NAO movido
+  CAPTURED // dinheiro movido — e este estado que vira PAGO no order
+  FAILED // ultima tentativa falhou; janela de retentativa AINDA ABERTA
+  EXPIRED // janela esgotou sem captura (Bloco 6 compensa a saga)
+  CANCELED // cancelado deliberadamente; void da autorizacao se existir
+}
+
+model Payment {
+  id      String @id @default(uuid())
+  // Unico: um pedido tem no maximo UM pagamento. Varias tentativas
+  // sao transacoes deste mesmo pagamento, nao pagamentos diferentes.
+  orderId String @unique
+  userId  String
+
+  status PaymentStatus @default(PENDING)
+
+  // Dinheiro SEMPRE inteiro em centavos (ver src/domain/money.ts).
+  // Invariante garantida por CHECK: refunded <= captured <= amount.
+  amountCents         Int
+  capturedAmountCents Int @default(0)
+  refundedAmountCents Int @default(0)
+
+  currency String @db.VarChar(3)
+
+  // Janela de retentativa (decisao 5 da fase). attemptCount limita as
+  // tentativas; expiresAt limita o tempo. O job do Bloco 6 le os dois.
+  attemptCount Int      @default(0)
+  expiresAt    DateTime
+
+  // Qual adapter originou este pagamento: 'fake' (Bloco 2) ou 'stripe' (Bloco 9).
+  provider String
+
+  transactions       PaymentTransaction[]
+  idempotencyRecords IdempotencyRecord[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Job de expiracao do Bloco 6: varre por status + prazo.
+  @@index([status, expiresAt])
+  @@index([userId])
+  @@map("payments")
+}
+
+enum TransactionType {
+  AUTHORIZE
+  CAPTURE
+  VOID
+  REFUND
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+model PaymentTransaction {
+  id        String @id @default(uuid())
+  paymentId String
+
+  // Restrict, e NAO Cascade: a trilha financeira nunca pode ser apagada
+  // por efeito colateral. Contraste deliberado com OrderStatusHistory,
+  // onde Cascade e correto porque pedido nunca sofre hard delete.
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  type   TransactionType
+  status TransactionStatus @default(PENDING)
+
+  // Valor DESTA movimentacao — nao o total do pagamento.
+  amountCents Int
+
+  // Identificador da operacao no provedor. Nullable porque a linha nasce
+  // antes da chamada (write-ahead): se o processo cair no meio, existe
+  // rastro de que a tentativa comecou.
+  providerRef String?
+
+  failureCode    String?
+  failureMessage String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentId, createdAt])
+  @@index([providerRef])
+  @@map("payment_transactions")
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+// INBOX (Bloco 4): espelho do outbox. Grava o evento do provedor antes
+// de agir, para que duplicata e reprocessamento sejam seguros.
+model WebhookEvent {
+  id       String @id @default(uuid())
+  provider String
+
+  // Id do evento NO PROVEDOR. O unique composto abaixo e o que torna
+  // o webhook idempotente: o mesmo evento reentregue colide e e descartado.
+  providerEventId String
+
+  eventType String
+  payload   Json
+
+  // Momento em que o PROVEDOR gerou o evento. Necessario para tolerar
+  // entrega fora de ordem: um evento antigo que chega depois de um novo
+  // deve ser ignorado, e so este campo permite decidir isso.
+  //
+  // NULLABLE por necessidade: nem todo provedor envia timestamp de origem.
+  //
+  // PERSISTENCIA aceita null — e a funcao do inbox registrar TUDO que chega,
+  // inclusive evento malformado. Recusar a gravacao perderia a evidencia.
+  //
+  // POLITICA FAIL-CLOSED, do HANDLER (criterio de aceite do Bloco 4): evento
+  // sem providerCreatedAt nao pode alterar o estado do pagamento. O handler
+  // deve transicionar o registro para IGNORED e deixa-lo para triagem manual.
+  // Preferimos um webhook parado a um pagamento aprovado sendo sobrescrito
+  // por um evento antigo. A garantia e da aplicacao, nao do banco: uma
+  // constraint aqui impediria a propria gravacao.
+  providerCreatedAt DateTime?
+
+  status    WebhookStatus @default(RECEIVED)
+  attempts  Int           @default(0)
+  lastError String?
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@unique([provider, providerEventId])
+  @@index([status, receivedAt])
+  @@map("webhook_events")
+}
+
+// OUTBOX (Bloco 5): identico ao do order-service por decisao consciente.
+// A duplicacao do contrato esta registrada no TECH_DEBT (Fase 10).
+enum OutboxStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model OutboxEvent {
+  id         String       @id @default(uuid())
+  eventId    String       @unique
+  routingKey String
+  payload    Json
+  status     OutboxStatus @default(PENDING)
+  attempts   Int          @default(0)
+  lastError  String?
+  createdAt  DateTime     @default(now())
+  sentAt     DateTime?
+
+  @@index([status, createdAt])
+  @@map("outbox_events")
+}
+
+enum IdempotencyStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+model IdempotencyRecord {
+  id     String @id @default(uuid())
+  userId String
+  key    String
+
+  // NULLABLE por exigencia do claim-first: a chave e reivindicada ANTES de o
+  // pagamento existir, para que uma requisicao duplicada colida no @@unique
+  // em vez de criar uma segunda cobranca.
+  //
+  // Combinacoes validas (CHECK idempotency_completed_exige_pagamento):
+  //   PROCESSING + null      -> chave reivindicada, pagamento ainda nao criado
+  //   PROCESSING + paymentId -> pagamento criado, fluxo ainda em andamento
+  //   COMPLETED  + paymentId -> UNICA forma valida de COMPLETED: o replay da
+  //                             chave PRECISA ter um resultado para devolver
+  //   COMPLETED  + null      -> PROIBIDO pelo banco
+  //   FAILED     + null      -> falhou antes de criar o pagamento
+  //   FAILED     + paymentId -> pagamento criado, fluxo falhou depois
+  //
+  // FK com Restrict: pagamento referenciado por uma chave nao pode ser apagado.
+  paymentId String?
+  payment   Payment? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  status    IdempotencyStatus @default(PROCESSING)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  @@unique([userId, key])
+  @@index([status])
+  @@map("idempotency_records")
+}
