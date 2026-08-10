@@ -21,13 +21,30 @@ import {
   type WebhookEventPayload,
   type WebhookRequest,
 } from '../payment-provider.port';
-import { desserializarEvento, traduzirEvento, type CorpoDeEvento } from './fake.wire';
+import { desserializarEnvelope, traduzirEvento, type CorpoDeEvento } from './fake.wire';
 import { comportamentoDoToken } from './fake.tokens';
 
 export const FAKE_SIGNATURE_HEADER = 'x-fake-signature';
 
 const TOLERANCIA_PADRAO_SEGUNDOS = 300;
 const TOLERANCIA_MAXIMA_SEGUNDOS = 3600;
+
+/**
+ * Maquina de estados da cobranca. FONTE UNICA: cancelCharge e simularTransicao
+ * consultam esta tabela, para nao existirem duas regras diferentes no mesmo
+ * objeto. Reembolso nao aparece aqui porque nao muda o state — ele move
+ * refundedAmountCents dentro de SUCCEEDED.
+ */
+const TRANSICOES: Record<ChargeState, ReadonlySet<ChargeState>> = {
+  PROCESSING: new Set<ChargeState>(['SUCCEEDED', 'DECLINED', 'CANCELED']),
+  SUCCEEDED: new Set<ChargeState>([]),
+  DECLINED: new Set<ChargeState>([]),
+  CANCELED: new Set<ChargeState>([]),
+};
+
+function podeTransicionar(de: ChargeState, para: ChargeState): boolean {
+  return TRANSICOES[de].has(para);
+}
 
 /** Estado interno. Nunca devolvido por referencia — sempre copia. */
 interface Cobranca {
@@ -206,7 +223,14 @@ export class FakeProvider implements PaymentProvider {
 
     // DECLINED e CANCELED sao terminais: no-op idempotente, para que o job de
     // expiracao nao precise consultar o estado antes de cancelar.
-    if (cobranca.state === 'PROCESSING') {
+    // cancelCharge e COMANDO idempotente: quando a transicao nao e possivel, faz
+    // no-op em vez de lancar, para que o job de expiracao do Bloco 6 nao precise
+    // consultar o estado antes de pedir cancelamento.
+    //
+    // simularTransicao usa a MESMA tabela mas e ESTRITO, porque fabrica evento —
+    // emitir payment.canceled para uma cobranca DECLINED produziria fixture
+    // incoerente. Diferenca deliberada de tolerancia, nao de regra.
+    if (podeTransicionar(cobranca.state, 'CANCELED')) {
       cobranca.state = 'CANCELED';
     }
 
@@ -289,7 +313,7 @@ export class FakeProvider implements PaymentProvider {
 
     // Assinatura valida prova AUTENTICIDADE dos bytes, nao validade do
     // CONTEUDO. A validacao semantica e obrigatoria e mora em fake.wire.
-    return traduzirEvento(desserializarEvento(request.rawBody));
+    return traduzirEvento(desserializarEnvelope(request.rawBody));
   }
 
   // ==========================================================
@@ -308,11 +332,7 @@ export class FakeProvider implements PaymentProvider {
 
     switch (input.eventType) {
       case 'payment.succeeded': {
-        if (cobranca.state !== 'PROCESSING' && cobranca.state !== 'SUCCEEDED') {
-          throw new ProviderInvalidRequestError(
-            `transicao para SUCCEEDED invalida a partir de ${cobranca.state}`,
-          );
-        }
+        this.exigirTransicao(cobranca.state, 'SUCCEEDED');
         cobranca.state = 'SUCCEEDED';
         cobranca.capturedAmountCents = cobranca.amountCents;
         cobranca.declineCode = undefined;
@@ -321,11 +341,7 @@ export class FakeProvider implements PaymentProvider {
       }
 
       case 'payment.failed': {
-        if (cobranca.state !== 'PROCESSING' && cobranca.state !== 'DECLINED') {
-          throw new ProviderInvalidRequestError(
-            `transicao para DECLINED invalida a partir de ${cobranca.state}`,
-          );
-        }
+        this.exigirTransicao(cobranca.state, 'DECLINED');
         cobranca.state = 'DECLINED';
         cobranca.capturedAmountCents = 0;
         cobranca.declineCode = input.declineCode ?? 'generic_decline';
@@ -333,9 +349,9 @@ export class FakeProvider implements PaymentProvider {
       }
 
       case 'payment.canceled': {
-        if (cobranca.state === 'SUCCEEDED') {
-          throw new ProviderInvalidRequestError('cobranca capturada nao pode ser cancelada');
-        }
+        // Antes isto aceitava DECLINED -> CANCELED, criando uma segunda maquina
+        // de estados dentro do proprio Fake.
+        this.exigirTransicao(cobranca.state, 'CANCELED');
         cobranca.state = 'CANCELED';
         cobranca.capturedAmountCents = 0;
         break;
@@ -421,6 +437,19 @@ export class FakeProvider implements PaymentProvider {
   // ==========================================================
   // Internos
   // ==========================================================
+
+  /**
+   * Estrito: usado por simularTransicao. Repetir o estado atual e permitido
+   * (replay do mesmo evento); qualquer outro salto fora da tabela lanca.
+   */
+  private exigirTransicao(de: ChargeState, para: ChargeState): void {
+    if (de === para) return;
+    if (!podeTransicionar(de, para)) {
+      throw new ProviderInvalidRequestError(
+        `transicao para ${para} invalida a partir de ${de}`,
+      );
+    }
+  }
 
   private padroesDoEvento(
     eventType: string,
