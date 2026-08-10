@@ -1,4 +1,8 @@
-import type { Currency } from '../config/env';
+/**
+ * Moeda e conceito de DOMINIO, nao de configuracao — por isso mora aqui e nao
+ * em config/env.ts. Config apenas escolhe qual valor usar como padrao.
+ */
+export type Currency = 'BRL';
 
 /**
  * Dinheiro no payment-service e SEMPRE inteiro em centavos.

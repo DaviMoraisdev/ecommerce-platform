@@ -2,7 +2,9 @@ import dotenv from 'dotenv';
 
 dotenv.config({ quiet: true });
 
-export type Currency = 'BRL';
+import type { Currency } from '../domain/money';
+
+export type { Currency };
 
 export interface AppConfig {
   port: number;
