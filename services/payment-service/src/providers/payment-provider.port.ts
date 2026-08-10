@@ -7,6 +7,10 @@ import type { Currency } from '../domain/money';
  * payment_intent_id, client_secret ou charge_id, a abstracao vazou: sao termos
  * da Stripe. O adapter e o unico lugar do servico que conhece o provedor real;
  * ele traduz para os tipos abaixo (camada anticorrupcao).
+ *
+ * Os desfechos sao UNIOES DISCRIMINADAS: combinacao impossivel nao compila.
+ * Um adapter nao consegue devolver DECLINED sem declineCode, nem SUCCEEDED com
+ * campo de recusa. Invariante no tipo vale mais que invariante em comentario.
  */
 
 // ============================================================
@@ -31,11 +35,10 @@ export type ProviderRef = string;
  */
 export type ChargeState = 'PROCESSING' | 'SUCCEEDED' | 'DECLINED' | 'CANCELED';
 
-/**
- * createCharge nunca devolve CANCELED — cancelamento exige um pedido explicito.
- * Extract restringe a uniao no tipo, entao o compilador impede o adapter de
- * devolver um estado impossivel.
- */
+/** Lista em runtime, para validar entrada estrangeira. Derivada do tipo abaixo. */
+export const CHARGE_STATES = ['PROCESSING', 'SUCCEEDED', 'DECLINED', 'CANCELED'] as const;
+
+/** createCharge nunca devolve CANCELED — cancelar exige pedido explicito. */
 export type CreateChargeState = Extract<ChargeState, 'PROCESSING' | 'SUCCEEDED' | 'DECLINED'>;
 
 // ============================================================
@@ -60,6 +63,11 @@ export interface CreateChargeInput {
    * A nossa (Idempotency-Key no Bloco 3) protege o nosso banco. Esta protege o
    * dinheiro: se a chamada HTTP der timeout e retentarmos, a primeira pode ter
    * chegado, e sem esta chave o cliente seria cobrado duas vezes.
+   *
+   * CONTRATO: replay com a MESMA chave e os MESMOS parametros devolve a
+   * resposta ORIGINAL, imutavel, independente do estado atual da cobranca.
+   * Com parametros DIFERENTES, e erro — reusar chave para outra cobranca e bug
+   * do chamador, e devolver a anterior esconderia o problema.
    */
   idempotencyKey: string;
 
@@ -73,27 +81,41 @@ export interface CreateChargeInput {
 /**
  * Resultado IMEDIATO da chamada. A confirmacao definitiva chega por webhook —
  * este retorno diz apenas o que o provedor sabia no instante da resposta.
+ *
+ * Uniao discriminada por `state`: capturedAmountCents e literal 0 onde nada foi
+ * capturado, e declineCode e OBRIGATORIO em DECLINED.
  */
-export interface ChargeResult {
-  providerRef: ProviderRef;
-  state: CreateChargeState;
-
-  /** 0 enquanto nao houver captura confirmada. */
-  capturedAmountCents: number;
-
-  /**
-   * Preenchidos SOMENTE quando state === 'DECLINED'.
-   * Recusa e resultado de negocio, nao excecao — ver a secao de erros abaixo.
-   */
-  declineCode?: string;
-  declineMessage?: string;
-}
+export type ChargeResult =
+  | {
+      providerRef: ProviderRef;
+      state: 'SUCCEEDED';
+      capturedAmountCents: number;
+    }
+  | {
+      providerRef: ProviderRef;
+      state: 'PROCESSING';
+      capturedAmountCents: 0;
+    }
+  | {
+      providerRef: ProviderRef;
+      state: 'DECLINED';
+      capturedAmountCents: 0;
+      /** Recusa e resultado de negocio — e sempre vem com codigo. */
+      declineCode: string;
+      declineMessage?: string;
+    };
 
 // ============================================================
 // Consultar (reconciliacao, Bloco 6)
 // ============================================================
 
-/** Retrato do que o provedor — fonte da verdade — diz sobre a cobranca agora. */
+/**
+ * Retrato do que o provedor — fonte da verdade — diz sobre a cobranca agora.
+ *
+ * PLANO de proposito, ao contrario de ChargeResult. Snapshot e ESTADO, nao
+ * desfecho: uma cobranca cancelada continua tendo amountCents, e valores
+ * capturado e reembolsado coexistem. Apenas declineCode e condicional.
+ */
 export interface ChargeSnapshot {
   providerRef: ProviderRef;
   state: ChargeState;
@@ -109,6 +131,7 @@ export interface ChargeSnapshot {
 
 export interface CancelChargeInput {
   providerRef: ProviderRef;
+  /** Mesmo contrato de replay do createCharge. */
   idempotencyKey: string;
 }
 
@@ -119,14 +142,14 @@ export interface CancelChargeInput {
 export interface RefundInput {
   providerRef: ProviderRef;
   amountCents: number;
+  /** Mesmo contrato de replay do createCharge. */
   idempotencyKey: string;
 }
 
-export interface RefundResult {
-  providerRefundRef: string;
-  state: 'PROCESSING' | 'SUCCEEDED' | 'DECLINED';
-  amountCents: number;
-}
+export type RefundResult =
+  | { providerRefundRef: string; state: 'SUCCEEDED'; amountCents: number }
+  | { providerRefundRef: string; state: 'PROCESSING'; amountCents: number }
+  | { providerRefundRef: string; state: 'DECLINED'; amountCents: number; declineCode: string };
 
 // ============================================================
 // Webhook (Bloco 4)
@@ -152,10 +175,9 @@ export type PaymentEventType =
   /** Evento que o provedor manda e nos nao tratamos -> inbox com status IGNORED. */
   | 'unsupported';
 
-export interface WebhookEventPayload {
+interface WebhookEventBase {
   /** Id do evento NO PROVEDOR. Base do unique(provider, providerEventId). */
   providerEventId: string;
-  eventType: PaymentEventType;
   providerRef: ProviderRef;
 
   /**
@@ -164,14 +186,44 @@ export interface WebhookEventPayload {
    */
   providerCreatedAt: Date | null;
 
-  state: ChargeState;
-  capturedAmountCents: number;
-  refundedAmountCents: number;
-  declineCode?: string;
-
   /** Payload original, gravado no inbox para auditoria e reprocessamento. */
   raw: unknown;
 }
+
+/**
+ * Uniao discriminada por eventType. Cada variante carrega SOMENTE os campos que
+ * fazem sentido para ela — o handler do Bloco 4 e obrigado a estreitar antes de
+ * tocar em valor financeiro.
+ *
+ * `unsupported` NAO carrega estado nem valores: nao conhecemos a semantica de um
+ * evento que nao tratamos, e o tipo impede o handler de usar dado que nao sabe
+ * interpretar.
+ */
+export type WebhookEventPayload =
+  | (WebhookEventBase & {
+      eventType: 'payment.succeeded';
+      state: 'SUCCEEDED';
+      capturedAmountCents: number;
+      refundedAmountCents: number;
+    })
+  | (WebhookEventBase & {
+      eventType: 'payment.failed';
+      state: 'DECLINED';
+      declineCode?: string;
+    })
+  | (WebhookEventBase & {
+      eventType: 'payment.canceled';
+      state: 'CANCELED';
+    })
+  | (WebhookEventBase & {
+      eventType: 'refund.succeeded';
+      state: 'SUCCEEDED';
+      capturedAmountCents: number;
+      refundedAmountCents: number;
+    })
+  | (WebhookEventBase & {
+      eventType: 'unsupported';
+    });
 
 // ============================================================
 // Erros
@@ -202,7 +254,10 @@ export class ProviderUnavailableError extends PaymentProviderError {
   readonly retryable = true;
 }
 
-/** Requisicao malformada ou token invalido. Bug nosso — nao retentar. */
+/**
+ * Requisicao malformada, token invalido, ou payload de webhook que passou a
+ * assinatura mas nao a validacao semantica. Nao retentar.
+ */
 export class ProviderInvalidRequestError extends PaymentProviderError {
   readonly retryable = false;
 }
@@ -240,7 +295,11 @@ export interface PaymentProvider {
   /**
    * Sincrono de proposito: verificacao de assinatura e criptografia pura, sem
    * I/O. Torna o handler do webhook mais simples e o teste trivial.
-   * Lanca WebhookSignatureError quando a assinatura nao confere.
+   *
+   * Lanca WebhookSignatureError quando a assinatura, o timestamp ou o relogio
+   * nao permitem confiar na origem; lanca ProviderInvalidRequestError quando a
+   * origem e confiavel mas o CONTEUDO e invalido. Assinatura valida prova
+   * autenticidade dos bytes, nao validade semantica.
    */
   verifyWebhook(request: WebhookRequest): WebhookEventPayload;
 }
