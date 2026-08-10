@@ -33,10 +33,14 @@ export type ProviderRef = string;
  *   PROCESSING -> PROCESSING   SUCCEEDED -> CAPTURED
  *   DECLINED   -> FAILED       CANCELED  -> CANCELED
  */
-export type ChargeState = 'PROCESSING' | 'SUCCEEDED' | 'DECLINED' | 'CANCELED';
-
-/** Lista em runtime, para validar entrada estrangeira. Derivada do tipo abaixo. */
+/**
+ * Fonte UNICA da verdade. O tipo e derivado da lista, entao adicionar um estado
+ * em um lugar e esquecer o outro deixou de ser possivel — antes as duas
+ * declaracoes podiam divergir silenciosamente.
+ */
 export const CHARGE_STATES = ['PROCESSING', 'SUCCEEDED', 'DECLINED', 'CANCELED'] as const;
+
+export type ChargeState = (typeof CHARGE_STATES)[number];
 
 /** createCharge nunca devolve CANCELED — cancelar exige pedido explicito. */
 export type CreateChargeState = Extract<ChargeState, 'PROCESSING' | 'SUCCEEDED' | 'DECLINED'>;
@@ -176,9 +180,18 @@ export type PaymentEventType =
   | 'unsupported';
 
 interface WebhookEventBase {
-  /** Id do evento NO PROVEDOR. Base do unique(provider, providerEventId). */
+  /**
+   * Id do evento NO PROVEDOR. Base do unique(provider, providerEventId).
+   * Valor OPACO: preservado exatamente como recebido, sem normalizacao.
+   */
   providerEventId: string;
-  providerRef: ProviderRef;
+
+  /**
+   * Tipo BRUTO recebido do provedor, antes do mapeamento para o nosso
+   * vocabulario. Vai para a coluna eventType do inbox: gravar 'unsupported'
+   * perderia a informacao de que o operador precisa para triar.
+   */
+  providerEventTypeBruto: string;
 
   /**
    * Quando o PROVEDOR gerou o evento. Null quando ele nao informa.
@@ -195,32 +208,42 @@ interface WebhookEventBase {
  * fazem sentido para ela — o handler do Bloco 4 e obrigado a estreitar antes de
  * tocar em valor financeiro.
  *
- * `unsupported` NAO carrega estado nem valores: nao conhecemos a semantica de um
- * evento que nao tratamos, e o tipo impede o handler de usar dado que nao sabe
- * interpretar.
+ * `unsupported` NAO carrega providerRef, estado nem valores: nao conhecemos a
+ * semantica de um evento que nao tratamos, e o tipo impede o handler de usar
+ * dado que nao sabe interpretar.
  */
 export type WebhookEventPayload =
   | (WebhookEventBase & {
       eventType: 'payment.succeeded';
+      providerRef: ProviderRef;
       state: 'SUCCEEDED';
       capturedAmountCents: number;
       refundedAmountCents: number;
     })
   | (WebhookEventBase & {
       eventType: 'payment.failed';
+      providerRef: ProviderRef;
       state: 'DECLINED';
       declineCode?: string;
     })
   | (WebhookEventBase & {
       eventType: 'payment.canceled';
+      providerRef: ProviderRef;
       state: 'CANCELED';
     })
   | (WebhookEventBase & {
       eventType: 'refund.succeeded';
+      providerRef: ProviderRef;
       state: 'SUCCEEDED';
       capturedAmountCents: number;
       refundedAmountCents: number;
     })
+  /**
+   * Evento que o provedor manda e nos nao tratamos. NAO carrega providerRef,
+   * state nem valores: um evento desconhecido pode nao ser sobre cobranca
+   * nenhuma, e exigir estrutura de cobranca dele fazia eventos ignoraveis serem
+   * recusados como invalidos. Destino: inbox com status IGNORED.
+   */
   | (WebhookEventBase & {
       eventType: 'unsupported';
     });
