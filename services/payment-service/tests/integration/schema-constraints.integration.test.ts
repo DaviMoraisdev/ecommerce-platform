@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { connectDatabase, disconnectDatabase } from '../../src/config/database';
+import { assertTestDatabase } from '../helpers/testDbGuard';
 import { MAX_AMOUNT_CENTS } from '../../src/domain/money';
 
 /**
@@ -58,7 +59,12 @@ function outboxValido(
 let prisma: PrismaClient;
 
 beforeAll(async () => {
-  // A URL ja foi validada pela guarda em tests/setup.integration.ts.
+  // Defesa em profundidade: o setup.integration.ts ja executou a guarda, mas a
+  // config do Jest pode ser trocada por linha de comando (testPathIgnorePatterns
+  // e sobrescrevivel), e neste arquivo ha deleteMany(). Guarda no ponto do
+  // perigo nao depende de qual config coletou o arquivo.
+  assertTestDatabase(process.env);
+
   prisma = await connectDatabase(process.env.DATABASE_URL as string);
 });
 
