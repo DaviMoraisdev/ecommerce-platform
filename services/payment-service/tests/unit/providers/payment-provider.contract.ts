@@ -4,6 +4,7 @@ import {
   ChargeNotFoundError,
   PaymentProviderError,
   ProviderInvalidRequestError,
+  type ChargeResult,
   type CreateChargeInput,
   type PaymentProvider,
   type WebhookRequest,
@@ -16,12 +17,26 @@ import {
  * o FakeProvider e vai rodar no Bloco 9 contra a Stripe. Se ambos passarem, a
  * logica de negocio dos Blocos 3 a 8 nao precisa saber qual provedor esta ativo.
  *
- * Por isso nada aqui inspeciona estado interno nem assume formato de
- * providerRef: so o comportamento observavel pela porta.
+ * Nada aqui inspeciona estado interno nem assume formato de providerRef: so o
+ * comportamento observavel pela porta.
  *
- * Este arquivo NAO termina em .test.ts de proposito — ele e importado e
- * invocado por quem tem um kit, nao coletado direto pelo Jest.
+ * Este arquivo NAO termina em .test.ts de proposito — e importado e invocado por
+ * quem tem um kit, nao coletado direto pelo Jest.
  */
+
+/**
+ * Estreita um ChargeResult para a variante do estado esperado.
+ * Necessario porque ChargeResult e uniao discriminada: declineCode so existe em
+ * DECLINED, e o compilador exige o estreitamento antes do acesso — que e
+ * exatamente a garantia que a uniao fornece.
+ */
+function exigirEstado<E extends ChargeResult['state']>(
+  resultado: ChargeResult,
+  estado: E,
+): Extract<ChargeResult, { state: E }> {
+  expect(resultado.state).toBe(estado);
+  return resultado as Extract<ChargeResult, { state: E }>;
+}
 
 export interface KitDeContrato {
   nome: string;
@@ -34,19 +49,35 @@ export interface KitDeContrato {
     processando: string;
     recusado: string;
     desconhecido: string;
-    /** Opcional: token que provoca falha TECNICA transiente. */
+    /** Exigido quando capacidades.falhaTransiente e true. */
     erroTransiente?: string;
   };
 
   /**
-   * Opcional: como o provedor fabrica um webhook assinado valido.
-   * Nao faz parte da porta (nao e capacidade de runtime), mas sem isso o
-   * contrato nao pode exercitar verifyWebhook.
+   * OBRIGATORIO. verifyWebhook e obrigatorio na porta, entao o contrato tem de
+   * poder exercita-lo — antes isso era opcional e um adapter podia passar a
+   * suite inteira sem nenhum teste de webhook.
    */
-  assinarWebhook?: (
+  assinarWebhook(
     provider: PaymentProvider,
     input: { providerRef: string; eventType: string },
-  ) => WebhookRequest;
+  ): WebhookRequest;
+
+  /**
+   * Declaracao EXPLICITA do que este provedor nao consegue simular. Existe para
+   * que um gap de cobertura seja decisao visivel em code review, e nao ausencia
+   * silenciosa de teste. Ha um teste que confere se a declaracao bate com os
+   * hooks entregues.
+   */
+  capacidades: {
+    /** false quando nao ha como provocar falha transiente de forma deterministica. */
+    falhaTransiente: boolean;
+    /** false quando nao ha como avancar PROCESSING -> SUCCEEDED sob controle. */
+    transicaoAssincrona: boolean;
+  };
+
+  /** Exigido quando capacidades.transicaoAssincrona e true. */
+  simularSucesso?(provider: PaymentProvider, providerRef: string): WebhookRequest;
 }
 
 export function rodarContratoDeProvedor(kit: KitDeContrato): void {
@@ -68,34 +99,44 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       };
     }
 
+    it('o kit declara capacidades coerentes com os hooks que forneceu', () => {
+      expect(typeof kit.assinarWebhook).toBe('function');
+
+      if (kit.capacidades.falhaTransiente) {
+        expect(typeof kit.tokens.erroTransiente).toBe('string');
+      }
+      if (kit.capacidades.transicaoAssincrona) {
+        expect(typeof kit.simularSucesso).toBe('function');
+      }
+    });
+
     describe('createCharge', () => {
       it('captura na propria chamada com o token de sucesso', async () => {
-        const r = await provider.createCharge(entrada());
+        const r = exigirEstado(await provider.createCharge(entrada()), 'SUCCEEDED');
 
-        expect(r.state).toBe('SUCCEEDED');
         expect(r.capturedAmountCents).toBe(12990);
         expect(typeof r.providerRef).toBe('string');
         expect(r.providerRef.length).toBeGreaterThan(0);
-        expect(r.declineCode).toBeUndefined();
       });
 
       it('devolve PROCESSING quando a confirmacao vem so por webhook', async () => {
-        const r = await provider.createCharge(
-          entrada({ paymentMethodToken: kit.tokens.processando }),
+        const r = exigirEstado(
+          await provider.createCharge(entrada({ paymentMethodToken: kit.tokens.processando })),
+          'PROCESSING',
         );
 
-        expect(r.state).toBe('PROCESSING');
         expect(r.capturedAmountCents).toBe(0);
       });
 
-      it('RECUSA e resultado de negocio, nao excecao', async () => {
-        const r = await provider.createCharge(
-          entrada({ paymentMethodToken: kit.tokens.recusado }),
+      it('RECUSA e resultado de negocio, nao excecao, e sempre traz declineCode', async () => {
+        const r = exigirEstado(
+          await provider.createCharge(entrada({ paymentMethodToken: kit.tokens.recusado })),
+          'DECLINED',
         );
 
-        expect(r.state).toBe('DECLINED');
         expect(r.capturedAmountCents).toBe(0);
         expect(typeof r.declineCode).toBe('string');
+        expect(r.declineCode.length).toBeGreaterThan(0);
       });
 
       it('rejeita token desconhecido em vez de suceder silenciosamente', async () => {
@@ -105,14 +146,12 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       });
 
       it('IDEMPOTENCIA: mesma chave e mesmos parametros devolvem a mesma cobranca', async () => {
-        const idempotencyKey = randomUUID();
-        const base = entrada({ idempotencyKey });
+        const base = entrada();
 
         const primeira = await provider.createCharge(base);
         const segunda = await provider.createCharge({ ...base });
 
-        expect(segunda.providerRef).toBe(primeira.providerRef);
-        expect(segunda.state).toBe(primeira.state);
+        expect(segunda).toEqual(primeira);
       });
 
       it('IDEMPOTENCIA: mesma chave com parametros DIFERENTES e erro', async () => {
@@ -124,17 +163,34 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('chaves diferentes criam cobrancas diferentes', async () => {
-        const a = await provider.createCharge(entrada());
-        const b = await provider.createCharge(entrada());
+      it('IDEMPOTENCIA: replay tardio devolve o resultado ORIGINAL, mesmo apos mudanca de estado', async () => {
+        const base = entrada({ paymentMethodToken: kit.tokens.processando });
+        const primeira = await provider.createCharge(base);
+
+        await provider.cancelCharge({
+          providerRef: primeira.providerRef,
+          idempotencyKey: randomUUID(),
+        });
+
+        // Reconstruir a resposta do estado ATUAL faria isto virar excecao ou
+        // devolver CANCELED. Replay tem de ser estavel.
+        const replay = await provider.createCharge({ ...base });
+        expect(replay).toEqual(primeira);
+      });
+
+      it('SO a chave diferente cria cobranca diferente — resto do input identico', async () => {
+        const base = entrada();
+
+        const a = await provider.createCharge({ ...base, idempotencyKey: randomUUID() });
+        const b = await provider.createCharge({ ...base, idempotencyKey: randomUUID() });
 
         expect(b.providerRef).not.toBe(a.providerRef);
       });
 
       it.each([0, -1])('rejeita valor invalido (%i)', async (amountCents) => {
-        await expect(
-          provider.createCharge(entrada({ amountCents })),
-        ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
+        await expect(provider.createCharge(entrada({ amountCents }))).rejects.toBeInstanceOf(
+          ProviderInvalidRequestError,
+        );
       });
 
       it('exige idempotencyKey', async () => {
@@ -164,24 +220,48 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
     });
 
     describe('cancelCharge', () => {
-      it('cancela cobranca em PROCESSING', async () => {
-        const criada = await provider.createCharge(
+      async function emProcessamento(): Promise<string> {
+        const r = await provider.createCharge(
           entrada({ paymentMethodToken: kit.tokens.processando }),
         );
+        return r.providerRef;
+      }
+
+      it('cancela cobranca em PROCESSING', async () => {
+        const ref = await emProcessamento();
 
         const snapshot = await provider.cancelCharge({
-          providerRef: criada.providerRef,
+          providerRef: ref,
           idempotencyKey: randomUUID(),
         });
 
         expect(snapshot.state).toBe('CANCELED');
       });
 
-      it('cancelar duas vezes e no-op idempotente', async () => {
-        const criada = await provider.createCharge(
-          entrada({ paymentMethodToken: kit.tokens.processando }),
-        );
-        const ref = criada.providerRef;
+      it('IDEMPOTENCIA: mesma chave devolve exatamente o mesmo resultado', async () => {
+        const ref = await emProcessamento();
+        const idempotencyKey = randomUUID();
+
+        const primeira = await provider.cancelCharge({ providerRef: ref, idempotencyKey });
+        const segunda = await provider.cancelCharge({ providerRef: ref, idempotencyKey });
+
+        expect(segunda).toEqual(primeira);
+      });
+
+      it('IDEMPOTENCIA: mesma chave para OUTRA cobranca e erro', async () => {
+        const primeiroRef = await emProcessamento();
+        const segundoRef = await emProcessamento();
+        const idempotencyKey = randomUUID();
+
+        await provider.cancelCharge({ providerRef: primeiroRef, idempotencyKey });
+
+        await expect(
+          provider.cancelCharge({ providerRef: segundoRef, idempotencyKey }),
+        ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
+      });
+
+      it('cancelar de novo com chave NOVA tambem e no-op — idempotencia por estado', async () => {
+        const ref = await emProcessamento();
 
         await provider.cancelCharge({ providerRef: ref, idempotencyKey: randomUUID() });
         const segunda = await provider.cancelCharge({
@@ -235,16 +315,8 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         const criada = await provider.createCharge(entrada());
         const ref = criada.providerRef;
 
-        await provider.refund({
-          providerRef: ref,
-          amountCents: 5000,
-          idempotencyKey: randomUUID(),
-        });
-        await provider.refund({
-          providerRef: ref,
-          amountCents: 7990,
-          idempotencyKey: randomUUID(),
-        });
+        await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey: randomUUID() });
+        await provider.refund({ providerRef: ref, amountCents: 7990, idempotencyKey: randomUUID() });
 
         const snapshot = await provider.getCharge(ref);
         expect(snapshot.refundedAmountCents).toBe(12990);
@@ -254,11 +326,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         const criada = await provider.createCharge(entrada());
         const ref = criada.providerRef;
 
-        await provider.refund({
-          providerRef: ref,
-          amountCents: 12000,
-          idempotencyKey: randomUUID(),
-        });
+        await provider.refund({ providerRef: ref, amountCents: 12000, idempotencyKey: randomUUID() });
 
         await expect(
           provider.refund({ providerRef: ref, amountCents: 991, idempotencyKey: randomUUID() }),
@@ -270,17 +338,25 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         const ref = criada.providerRef;
         const idempotencyKey = randomUUID();
 
-        await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey });
-        const segunda = await provider.refund({
-          providerRef: ref,
-          amountCents: 5000,
-          idempotencyKey,
-        });
+        const primeira = await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey });
+        const segunda = await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey });
 
-        expect(segunda.amountCents).toBe(5000);
+        expect(segunda).toEqual(primeira);
 
         const snapshot = await provider.getCharge(ref);
         expect(snapshot.refundedAmountCents).toBe(5000);
+      });
+
+      it('IDEMPOTENCIA: mesma chave com VALOR diferente e erro', async () => {
+        const criada = await provider.createCharge(entrada());
+        const ref = criada.providerRef;
+        const idempotencyKey = randomUUID();
+
+        await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey });
+
+        await expect(
+          provider.refund({ providerRef: ref, amountCents: 1000, idempotencyKey }),
+        ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
       it('recusa reembolsar cobranca que nao foi capturada', async () => {
@@ -309,20 +385,21 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
     });
 
     describe('taxonomia de erro', () => {
-      const temTokenTransiente = Boolean(kit.tokens.erroTransiente);
-
-      (temTokenTransiente ? it : it.skip)(
+      (kit.capacidades.falhaTransiente ? it : it.skip)(
         'falha transiente vem marcada como retryable',
         async () => {
+          let capturado: unknown;
+
           try {
             await provider.createCharge(
               entrada({ paymentMethodToken: kit.tokens.erroTransiente as string }),
             );
-            throw new Error('esperava falha tecnica');
           } catch (erro) {
-            expect(erro).toBeInstanceOf(PaymentProviderError);
-            expect((erro as PaymentProviderError).retryable).toBe(true);
+            capturado = erro;
           }
+
+          expect(capturado).toBeInstanceOf(PaymentProviderError);
+          expect((capturado as PaymentProviderError).retryable).toBe(true);
         },
       );
 
@@ -340,14 +417,10 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       });
     });
 
-    // describe.skip em vez de omitir: o output mostra que os casos existem e
-    // estao pulados, em vez de eles simplesmente nao aparecerem.
-    (kit.assinarWebhook ? describe : describe.skip)('verifyWebhook', () => {
-      const assinar = kit.assinarWebhook as NonNullable<KitDeContrato['assinarWebhook']>;
-
+    describe('verifyWebhook', () => {
       it('verifica e traduz um webhook valido', async () => {
         const criada = await provider.createCharge(entrada());
-        const request = assinar(provider, {
+        const request = kit.assinarWebhook(provider, {
           providerRef: criada.providerRef,
           eventType: 'payment.succeeded',
         });
@@ -357,26 +430,27 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         expect(evento.eventType).toBe('payment.succeeded');
         expect(evento.providerRef).toBe(criada.providerRef);
         expect(typeof evento.providerEventId).toBe('string');
+        expect(evento.providerEventId.length).toBeGreaterThan(0);
       });
 
       it('recusa quando o corpo foi alterado apos a assinatura', async () => {
         const criada = await provider.createCharge(entrada());
-        const request = assinar(provider, {
+        const request = kit.assinarWebhook(provider, {
           providerRef: criada.providerRef,
           eventType: 'payment.succeeded',
         });
 
-        const adulterado = {
-          ...request,
-          rawBody: Buffer.concat([request.rawBody, Buffer.from(' ')]),
-        };
-
-        expect(() => provider.verifyWebhook(adulterado)).toThrow();
+        expect(() =>
+          provider.verifyWebhook({
+            ...request,
+            rawBody: Buffer.concat([request.rawBody, Buffer.from(' ')]),
+          }),
+        ).toThrow();
       });
 
       it('recusa quando nao ha cabecalho de assinatura', async () => {
         const criada = await provider.createCharge(entrada());
-        const request = assinar(provider, {
+        const request = kit.assinarWebhook(provider, {
           providerRef: criada.providerRef,
           eventType: 'payment.succeeded',
         });
@@ -384,5 +458,34 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         expect(() => provider.verifyWebhook({ ...request, headers: {} })).toThrow();
       });
     });
+
+    (kit.capacidades.transicaoAssincrona ? describe : describe.skip)(
+      'transicao assincrona PROCESSING -> SUCCEEDED',
+      () => {
+        it('o webhook e o snapshot ficam coerentes depois da confirmacao', async () => {
+          const criada = exigirEstado(
+            await provider.createCharge(entrada({ paymentMethodToken: kit.tokens.processando })),
+            'PROCESSING',
+          );
+
+          const antes = await provider.getCharge(criada.providerRef);
+          expect(antes.state).toBe('PROCESSING');
+          expect(antes.capturedAmountCents).toBe(0);
+
+          const simular = kit.simularSucesso as NonNullable<KitDeContrato['simularSucesso']>;
+          const request = simular(provider, criada.providerRef);
+
+          const evento = provider.verifyWebhook(request);
+          expect(evento.eventType).toBe('payment.succeeded');
+          expect(evento.providerRef).toBe(criada.providerRef);
+
+          // A confirmacao tem de aparecer TAMBEM na fonte da verdade — senao o
+          // provedor teria duas versoes do mesmo fato.
+          const depois = await provider.getCharge(criada.providerRef);
+          expect(depois.state).toBe('SUCCEEDED');
+          expect(depois.capturedAmountCents).toBe(12990);
+        });
+      },
+    );
   });
 }
