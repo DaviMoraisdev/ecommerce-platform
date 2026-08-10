@@ -11,7 +11,7 @@ import {
 import { FakeProvider, FAKE_SIGNATURE_HEADER } from '../../../src/providers/fake/fake.provider';
 import { FAKE_TOKENS } from '../../../src/providers/fake/fake.tokens';
 import { MAX_AMOUNT_CENTS } from '../../../src/domain/money';
-import { rodarContratoDeProvedor } from './payment-provider.contract';
+import { exigirEvento, rodarContratoDeProvedor } from './payment-provider.contract';
 
 const SEGREDO = 'segredo-de-teste-do-fake';
 
@@ -441,9 +441,11 @@ describe('FakeProvider — payload assinado e semanticamente invalido', () => {
 
   it('sanidade: o corpo base e aceito', () => {
     const provider = criarFake();
-    const evento = provider.verifyWebhook(provider.assinarCorpo(corpo()));
+    const evento = exigirEvento(
+      provider.verifyWebhook(provider.assinarCorpo(corpo())),
+      'payment.succeeded',
+    );
 
-    expect(evento.eventType).toBe('payment.succeeded');
     expect(evento.providerEventId).toBe('evt_teste');
     expect(evento.providerRef).toBe('ch_teste');
   });
@@ -503,6 +505,12 @@ describe('FakeProvider — payload assinado e semanticamente invalido', () => {
     ['payment.canceled com state PROCESSING', 'payment.canceled', { state: 'PROCESSING' }],
     ['payment.canceled com valor capturado', 'payment.canceled', { state: 'CANCELED', captured_amount_cents: 500 }],
     ['refund.succeeded sem valor reembolsado', 'refund.succeeded', { refunded_amount_cents: 0 }],
+    ['refund.succeeded sem valor capturado', 'refund.succeeded', { captured_amount_cents: 0, refunded_amount_cents: 100 }],
+    ['payment.failed com valor reembolsado', 'payment.failed', { state: 'DECLINED', captured_amount_cents: 0, refunded_amount_cents: 50 }],
+    ['payment.canceled com valor reembolsado', 'payment.canceled', { state: 'CANCELED', captured_amount_cents: 0, refunded_amount_cents: 50 }],
+    ['payment.succeeded com decline_code', 'payment.succeeded', { decline_code: 'insufficient_funds' }],
+    ['payment.canceled com decline_code', 'payment.canceled', { state: 'CANCELED', captured_amount_cents: 0, decline_code: 'fraudulent' }],
+    ['refund.succeeded com decline_code', 'refund.succeeded', { refunded_amount_cents: 100, decline_code: 'fraudulent' }],
   ])('recusa incoerencia: %s', (_rotulo, type, dados) => {
     const provider = criarFake();
     const request = provider.assinarCorpo(corpo({ type }, dados));
@@ -601,5 +609,227 @@ describe('FakeProvider — traducao do payload', () => {
 
     const evento = provider.verifyWebhook(request);
     expect(evento.raw).toEqual(JSON.parse(request.rawBody.toString('utf8')));
+  });
+});
+
+// ==========================================================
+// Identificadores opacos: recusar, nunca normalizar
+// ==========================================================
+
+describe('FakeProvider — identificadores opacos', () => {
+  function corpoBase(
+    raiz: Record<string, unknown> = {},
+    dados: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      id: 'evt_teste',
+      type: 'payment.succeeded',
+      created_at: '2026-08-10T12:00:00.000Z',
+      ...raiz,
+      data: {
+        charge_ref: 'ch_teste',
+        state: 'SUCCEEDED',
+        captured_amount_cents: 1000,
+        refunded_amount_cents: 0,
+        decline_code: null,
+        ...dados,
+      },
+    };
+  }
+
+  /**
+   * Aplicar trim() aqui faria "evt_1" e " evt_1 " colapsarem no mesmo valor.
+   * providerEventId e a base do unique(provider, providerEventId) do inbox:
+   * duas mensagens distintas passariam a ser tratadas como duplicata, ou uma
+   * correlacionaria com a cobranca errada. Recusar > normalizar.
+   */
+  it.each([
+    ['id com espaco nas duas pontas', { id: ' evt_teste ' }],
+    ['id com espaco a esquerda', { id: ' evt_teste' }],
+    ['id com espaco a direita', { id: 'evt_teste ' }],
+    ['id com quebra de linha', { id: 'evt_teste\n' }],
+    ['type com espaco', { type: ' payment.succeeded ' }],
+  ])('recusa %s', (_rotulo, raiz) => {
+    const provider = criarFake();
+
+    expect(() => provider.verifyWebhook(provider.assinarCorpo(corpoBase(raiz)))).toThrow(
+      ProviderInvalidRequestError,
+    );
+  });
+
+  it('recusa charge_ref com espaco nas extremidades', () => {
+    const provider = criarFake();
+
+    expect(() =>
+      provider.verifyWebhook(provider.assinarCorpo(corpoBase({}, { charge_ref: ' ch_teste ' }))),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('recusa decline_code com espaco nas extremidades', () => {
+    const provider = criarFake();
+    const corpo = corpoBase(
+      { type: 'payment.failed' },
+      { state: 'DECLINED', captured_amount_cents: 0, decline_code: ' expired_card ' },
+    );
+
+    expect(() => provider.verifyWebhook(provider.assinarCorpo(corpo))).toThrow(
+      ProviderInvalidRequestError,
+    );
+  });
+
+  it('aceita espaco INTERNO — so as extremidades sao recusadas', () => {
+    const provider = criarFake();
+    const evento = exigirEvento(
+      provider.verifyWebhook(provider.assinarCorpo(corpoBase({ id: 'evt com espaco' }))),
+      'payment.succeeded',
+    );
+
+    // Valor preservado exatamente como recebido.
+    expect(evento.providerEventId).toBe('evt com espaco');
+  });
+});
+
+// ==========================================================
+// Evento nao suportado nao precisa fingir que e cobranca
+// ==========================================================
+
+describe('FakeProvider — evento nao suportado', () => {
+  const envelope = {
+    id: 'evt_desconhecido',
+    type: 'customer.updated',
+    created_at: '2026-08-10T12:00:00.000Z',
+  };
+
+  it.each([
+    ['sem o bloco data', {}],
+    ['com data null', { data: null }],
+    ['com data como texto', { data: 'qualquer coisa' }],
+    ['com data sem os campos de cobranca', { data: { alguma_coisa: 1 } }],
+  ])('vira unsupported %s', (_rotulo, extra) => {
+    const provider = criarFake();
+
+    const evento = provider.verifyWebhook(provider.assinarCorpo({ ...envelope, ...extra }));
+
+    expect(evento.eventType).toBe('unsupported');
+    // O tipo BRUTO sobrevive: e ele que o operador precisa para triar no inbox.
+    expect(evento.providerEventTypeBruto).toBe('customer.updated');
+    // A uniao nao da providerRef nem state a evento nao suportado — um evento
+    // desconhecido pode nao ser sobre cobranca nenhuma.
+    expect('providerRef' in evento).toBe(false);
+    expect('state' in evento).toBe(false);
+  });
+
+  it('mas o ENVELOPE continua obrigatorio: id ausente e recusado', () => {
+    const provider = criarFake();
+
+    expect(() =>
+      provider.verifyWebhook(provider.assinarCorpo({ type: 'customer.updated', created_at: null })),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('e created_at fora de ISO-8601 tambem e recusado', () => {
+    const provider = criarFake();
+
+    expect(() =>
+      provider.verifyWebhook(provider.assinarCorpo({ ...envelope, created_at: '10/08/2026' })),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+});
+
+// ==========================================================
+// Uma maquina de estados, duas tolerancias deliberadas
+// ==========================================================
+
+describe('FakeProvider — maquina de estados de cancelamento', () => {
+  async function recusada(provider: FakeProvider): Promise<string> {
+    const r = await provider.createCharge(
+      entradaDeCobranca({ paymentMethodToken: FAKE_TOKENS.DECLINED_FRAUD }),
+    );
+    return r.providerRef;
+  }
+
+  it('simularTransicao RECUSA DECLINED -> CANCELED', async () => {
+    const provider = criarFake();
+    const ref = await recusada(provider);
+
+    // Estrito porque FABRICA EVENTO: emitir payment.canceled para uma cobranca
+    // recusada produziria fixture incoerente, que validaria a coisa errada nos
+    // blocos seguintes.
+    expect(() =>
+      provider.simularTransicao({ providerRef: ref, eventType: 'payment.canceled' }),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('cancelCharge sobre cobranca recusada e no-op, nao erro', async () => {
+    const provider = criarFake();
+    const ref = await recusada(provider);
+
+    // Tolerante porque e COMANDO idempotente: o job de expiracao do Bloco 6 nao
+    // precisa consultar o estado antes de pedir cancelamento.
+    const snapshot = await provider.cancelCharge({
+      providerRef: ref,
+      idempotencyKey: randomUUID(),
+    });
+
+    expect(snapshot.state).toBe('DECLINED');
+  });
+
+  it('simularTransicao permite repetir o mesmo evento (replay)', async () => {
+    const provider = criarFake();
+    const criada = await provider.createCharge(
+      entradaDeCobranca({ paymentMethodToken: FAKE_TOKENS.PROCESSING }),
+    );
+
+    provider.simularTransicao({ providerRef: criada.providerRef, eventType: 'payment.canceled' });
+
+    expect(() =>
+      provider.simularTransicao({
+        providerRef: criada.providerRef,
+        eventType: 'payment.canceled',
+      }),
+    ).not.toThrow();
+  });
+
+  it('simularTransicao recusa SUCCEEDED -> CANCELED', async () => {
+    const provider = criarFake();
+    const criada = await provider.createCharge(entradaDeCobranca());
+
+    expect(() =>
+      provider.simularTransicao({
+        providerRef: criada.providerRef,
+        eventType: 'payment.canceled',
+      }),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+});
+
+// ==========================================================
+// raw preserva a evidencia integra
+// ==========================================================
+
+describe('FakeProvider — integridade do raw', () => {
+  it('preserva campos extras que o provedor mande', () => {
+    const provider = criarFake();
+
+    const corpoComExtra = {
+      id: 'evt_extra',
+      type: 'payment.succeeded',
+      created_at: '2026-08-10T12:00:00.000Z',
+      campo_novo_do_provedor: { qualquer: 'coisa' },
+      data: {
+        charge_ref: 'ch_extra',
+        state: 'SUCCEEDED',
+        captured_amount_cents: 1000,
+        refunded_amount_cents: 0,
+        decline_code: null,
+        campo_extra_em_data: 42,
+      },
+    };
+
+    const evento = provider.verifyWebhook(provider.assinarCorpo(corpoComExtra));
+
+    // Reconstruir o payload dos campos validados descartaria estes campos — e o
+    // inbox existe para preservar a evidencia como ela chegou.
+    expect(evento.raw).toEqual(corpoComExtra);
   });
 });

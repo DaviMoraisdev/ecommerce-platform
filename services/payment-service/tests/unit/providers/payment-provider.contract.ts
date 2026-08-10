@@ -4,9 +4,11 @@ import {
   ChargeNotFoundError,
   PaymentProviderError,
   ProviderInvalidRequestError,
+  WebhookSignatureError,
   type ChargeResult,
   type CreateChargeInput,
   type PaymentProvider,
+  type WebhookEventPayload,
   type WebhookRequest,
 } from '../../../src/providers/payment-provider.port';
 
@@ -36,6 +38,19 @@ function exigirEstado<E extends ChargeResult['state']>(
 ): Extract<ChargeResult, { state: E }> {
   expect(resultado.state).toBe(estado);
   return resultado as Extract<ChargeResult, { state: E }>;
+}
+
+/**
+ * Estreita um WebhookEventPayload para a variante do tipo esperado.
+ * Exportado porque os testes especificos de cada adapter precisam do mesmo
+ * estreitamento — providerRef e state so existem nas variantes suportadas.
+ */
+export function exigirEvento<E extends WebhookEventPayload['eventType']>(
+  evento: WebhookEventPayload,
+  tipo: E,
+): Extract<WebhookEventPayload, { eventType: E }> {
+  expect(evento.eventType).toBe(tipo);
+  return evento as Extract<WebhookEventPayload, { eventType: E }>;
 }
 
 export interface KitDeContrato {
@@ -177,6 +192,38 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         const replay = await provider.createCharge({ ...base });
         expect(replay).toEqual(primeira);
       });
+
+      it.each([
+        ['amountCents', { amountCents: 999 }],
+        ['paymentMethodToken', { paymentMethodToken: 'tok_outro_qualquer' }],
+      ])(
+        'IDEMPOTENCIA: divergencia em %s com a mesma chave e erro',
+        async (_campo, override) => {
+          const idempotencyKey = randomUUID();
+          const base = entrada({ idempotencyKey });
+          await provider.createCharge(base);
+
+          await expect(
+            provider.createCharge({ ...base, ...override }),
+          ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
+        },
+      );
+
+      it.each(['paymentId', 'orderId'] as const)(
+        'IDEMPOTENCIA: divergencia em reference.%s com a mesma chave e erro',
+        async (campo) => {
+          const idempotencyKey = randomUUID();
+          const base = entrada({ idempotencyKey });
+          await provider.createCharge(base);
+
+          await expect(
+            provider.createCharge({
+              ...base,
+              reference: { ...base.reference, [campo]: randomUUID() },
+            }),
+          ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
+        },
+      );
 
       it('SO a chave diferente cria cobranca diferente — resto do input identico', async () => {
         const base = entrada();
@@ -425,12 +472,14 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
           eventType: 'payment.succeeded',
         });
 
-        const evento = provider.verifyWebhook(request);
+        const evento = exigirEvento(provider.verifyWebhook(request), 'payment.succeeded');
 
-        expect(evento.eventType).toBe('payment.succeeded');
         expect(evento.providerRef).toBe(criada.providerRef);
         expect(typeof evento.providerEventId).toBe('string');
         expect(evento.providerEventId.length).toBeGreaterThan(0);
+        // O tipo BRUTO tem de sobreviver: e ele que vai para a coluna eventType
+        // do inbox, e gravar o nosso rotulo perderia informacao de triagem.
+        expect(evento.providerEventTypeBruto).toBe('payment.succeeded');
       });
 
       it('recusa quando o corpo foi alterado apos a assinatura', async () => {
@@ -440,12 +489,15 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
           eventType: 'payment.succeeded',
         });
 
+        // Classe ESPECIFICA, nao toThrow() generico: um adapter que parseasse o
+        // corpo antes de verificar a assinatura lancaria outro erro e ainda
+        // passaria no teste generico.
         expect(() =>
           provider.verifyWebhook({
             ...request,
             rawBody: Buffer.concat([request.rawBody, Buffer.from(' ')]),
           }),
-        ).toThrow();
+        ).toThrow(WebhookSignatureError);
       });
 
       it('recusa quando nao ha cabecalho de assinatura', async () => {
@@ -455,7 +507,9 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
           eventType: 'payment.succeeded',
         });
 
-        expect(() => provider.verifyWebhook({ ...request, headers: {} })).toThrow();
+        expect(() => provider.verifyWebhook({ ...request, headers: {} })).toThrow(
+          WebhookSignatureError,
+        );
       });
     });
 
@@ -475,8 +529,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
           const simular = kit.simularSucesso as NonNullable<KitDeContrato['simularSucesso']>;
           const request = simular(provider, criada.providerRef);
 
-          const evento = provider.verifyWebhook(request);
-          expect(evento.eventType).toBe('payment.succeeded');
+          const evento = exigirEvento(provider.verifyWebhook(request), 'payment.succeeded');
           expect(evento.providerRef).toBe(criada.providerRef);
 
           // A confirmacao tem de aparecer TAMBEM na fonte da verdade — senao o
