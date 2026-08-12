@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.dev.json src/server.ts",
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
     "start": "node dist/server.js",
-    "test": "jest --ci",
-    "verify": "npm run typecheck && npm run build && npm test"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run typecheck && npm run test:fast",
+    "test:fast": "jest --ci",
+    "verify": "npm run test && npm run build"
   },
   "author": "DaviMoraisdev",
   "license": "ISC",
