@@ -42,9 +42,6 @@ export const CHARGE_STATES = ['PROCESSING', 'SUCCEEDED', 'DECLINED', 'CANCELED']
 
 export type ChargeState = (typeof CHARGE_STATES)[number];
 
-/** createCharge nunca devolve CANCELED — cancelar exige pedido explicito. */
-export type CreateChargeState = Extract<ChargeState, 'PROCESSING' | 'SUCCEEDED' | 'DECLINED'>;
-
 // ============================================================
 // Criar cobranca
 // ============================================================

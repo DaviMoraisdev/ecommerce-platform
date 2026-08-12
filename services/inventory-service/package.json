@@ -7,7 +7,11 @@
     "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.dev.json src/server.ts",
     "build": "tsc --project tsconfig.build.json",
     "start": "node dist/server.js",
-    "test": "jest --ci"
+    "migrate:test": "ts-node scripts/migrate-test-db.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "npm run typecheck && npm run test:fast",
+    "test:fast": "jest --ci",
+    "verify": "npm run test && npm run build"
   },
   "keywords": [],
   "author": "DaviMoraisdev",

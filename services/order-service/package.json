@@ -7,8 +7,13 @@
     "dev": "ts-node-dev --respawn --transpile-only --project tsconfig.dev.json src/server.ts",
     "build": "tsc --project tsconfig.build.json",
     "start": "node dist/server.js",
-    "test": "jest --ci",
-    "test:integration": "jest --ci --config jest.integration.config.ts"
+    "migrate:test": "ts-node scripts/migrate-test-db.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "npm run typecheck && npm run test:fast",
+    "test:fast": "jest --ci",
+    "test:integration": "jest --ci --config jest.integration.config.ts",
+    "verify": "npm run test && npm run build",
+    "verify:integration": "npm run typecheck && npm run test:integration"
   },
   "author": "DaviMoraisdev",
   "license": "ISC",

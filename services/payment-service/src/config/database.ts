@@ -8,7 +8,7 @@ import { sanitizeConnectionError } from './database-error';
 let clienteAtivo: PrismaClient | null = null;
 
 /** Constroi um cliente a partir de uma URL ja validada. Nao conecta. */
-export function criarPrismaClient(databaseUrl: string): PrismaClient {
+function criarPrismaClient(databaseUrl: string): PrismaClient {
   return new PrismaClient({ datasourceUrl: databaseUrl });
 }
 
@@ -30,16 +30,6 @@ export async function connectDatabase(databaseUrl: string): Promise<PrismaClient
     await cliente.$disconnect().catch(() => undefined);
     throw new Error(sanitizeConnectionError(error));
   }
-}
-
-/** Cliente do processo. Lanca se ninguem chamou connectDatabase antes. */
-export function getPrisma(): PrismaClient {
-  if (!clienteAtivo) {
-    throw new Error(
-      'PrismaClient nao inicializado: connectDatabase() deve rodar no ponto de entrada.',
-    );
-  }
-  return clienteAtivo;
 }
 
 export async function disconnectDatabase(): Promise<void> {

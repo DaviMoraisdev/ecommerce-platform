@@ -26,7 +26,7 @@ const HOSTS_LOCAIS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 export class GuardaDeBancoError extends Error {
   constructor(message: string) {
     super(
-      'Suite de teste ABORTADA para proteger dados: ' +
+      'ABORTADO para proteger dados: ' +
         message +
         ' — nenhuma escrita destrutiva foi executada.',
     );

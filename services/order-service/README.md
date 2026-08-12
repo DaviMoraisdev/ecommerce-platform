@@ -9,13 +9,18 @@ Servico de pedidos (Fase 4). PostgreSQL via Prisma.
 4. `npm run dev`
 
 ## Testes
-- `npm test` — testes unitarios (nao tocam o banco; seguros em qualquer ambiente).
+- `npm test` — `typecheck` + testes unitarios. **Padrao seguro**; nao tocam o banco.
+- `npm run test:fast` — so os unitarios, sem type-check, para o loop interno.
+- `npm run verify` — `test` + `build`, sem depender de banco.
+- `npm run verify:integration` — `typecheck` + integracao (exige Docker de pe).
 - `npm run test:integration` — integracao contra um banco ISOLADO. Pre-requisitos:
   1. `cp .env.test.example .env.test` (mantenha ALLOW_TEST_DB_RESET=true).
   2. Criar o banco: `docker exec ecommerce-postgres psql -U postgres -c "CREATE DATABASE order_test_db;"`
   3. Aplicar migrations no banco de teste:
-     `DATABASE_URL="postgresql://postgres:postgres123@127.0.0.1:5432/order_test_db" npx prisma migrate deploy`
+     `npm run migrate:test` (valida o banco alvo e aborta se o `.env.test` nao carregar)
   4. `npm run test:integration`
 
-O teste de integracao tem um guard triplo (nome exato do banco + NODE_ENV=test +
-ALLOW_TEST_DB_RESET) que aborta se apontado para qualquer banco que nao seja o de teste.
+O teste de integracao tem um guard quadruplo (nome EXATO do banco lido do pathname da
+URL + NODE_ENV=test + ALLOW_TEST_DB_RESET=true + host local, salvo
+ALLOW_REMOTE_TEST_DB=true) que aborta antes de qualquer escrita destrutiva se apontado
+para qualquer banco que nao seja o de teste. Ver tests/helpers/testDbGuard.ts.
