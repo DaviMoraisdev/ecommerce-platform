@@ -79,7 +79,7 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 
 
 ### Bloco 10 — Fechamento
-- **README do payment-service** e revisão do README da raiz.
+- **Finalizar o README do payment-service e revisar o README da raiz.** Ambos foram *criados/marcados* no PR de manutenção pré-Bloco 3, com o estado daquele momento. O que falta e a revisão final: descrever os endpoints, o fluxo completo e trocar o marcador 🟡 por ✅ quando a fase fechar.
 - **PDF de revisão da fase** em `docs/phase-reviews/phase-05.pdf`.
 
 
