@@ -92,14 +92,29 @@ segredo que funcione: chave secreta entra sempre com valor vazio ou placeholder.
 
 ## Testes
 
-- `npm test` — unitarios. Nao tocam o banco; seguros em qualquer ambiente.
-- `npm run test:integration` — integracao contra banco **isolado**.
-- `npm run typecheck` — `tsc --noEmit` cobrindo `src/` **e** `tests/`.
-- `npm run verify` — `typecheck + build + test`. **Comando de referencia antes de commit.**
+| Comando | O que faz | Quando usar |
+|---|---|---|
+| `npm test` | `typecheck` + unitarios | **padrao seguro** — antes de commit |
+| `npm run test:fast` | so os unitarios, sem type-check | loop interno, enquanto escreve codigo |
+| `npm run typecheck` | `tsc --noEmit` cobrindo `src/` **e** `tests/` | isolado, para ver so erro de tipo |
+| `npm run verify` | `test` + `build` | gate completo, sem depender de banco |
+| `npm run test:integration` | integracao contra banco **isolado** | exige Docker de pe |
+| `npm run verify:integration` | `typecheck` + integracao | gate de integracao |
 
-`npm test` nao verifica tipos: o Jest roda com `diagnostics: false` para transpilar sem
-type-check, o que deixa a suite ~3,4x mais rapida. Erro de tipo aparece no `typecheck`,
-nao no `test` — por isso o `verify` existe e por isso ele e o gate, nao o `test`.
+O Jest roda com `diagnostics: false`: transpila sem type-check, o que deixou a suite
+~3,4x mais rapida (26,1s -> 7,8s). O type-check nao desapareceu — ele saiu do Jest e
+virou um passo proprio, que o `npm test` executa **antes** dos testes. Assim o comando
+padrao mantem a garantia que sempre teve, e quem quer velocidade no loop interno usa
+`test:fast` de forma consciente.
+
+`verify` nao roda a suite de integracao de proposito: ela exige Docker de pe, e um gate
+que falha por motivo ambiental deixa de ser usado. O `typecheck` cobre os **arquivos**
+de integracao de qualquer forma (o tsconfig inclui `tests/**`), entao erro de tipo neles
+aparece sem precisar de banco. Só a *execucao* fica em `verify:integration`.
+
+As suites rodam com `maxWorkers: 1`. Nao e limitacao: para suites deste tamanho o custo
+de subir um processo por worker supera o ganho de paralelismo — 1 worker roda em 2,3s
+contra 4,7s com 3. Medicao e justificativa no proprio `jest.config.ts`.
 
 ### Pre-requisitos da suite de integracao
 
@@ -107,7 +122,7 @@ nao no `test` — por isso o `verify` existe e por isso ele e o gate, nao o `tes
 2. Criar o banco:
    `docker exec ecommerce-postgres psql -U <usuario> -c "CREATE DATABASE payment_test_db;"`
 3. Aplicar as migrations no banco de teste:
-   `( set -a; . ./.env.test; set +a; npx prisma migrate deploy )`
+   `npm run migrate:test` (valida o banco alvo e aborta se o `.env.test` nao carregar)
 4. `npm run test:integration`
 
 ### A guarda de banco de teste
