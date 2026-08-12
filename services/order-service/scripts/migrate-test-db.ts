@@ -82,22 +82,59 @@ export function validarAlvoDeMigracao(opcoes: OpcoesDeValidacao = {}): NodeJS.Pr
   return { ...(opcoes.base ?? {}), ...doArquivo };
 }
 
-function main(): void {
+export interface DependenciasDeExecucao {
+  /** Injetavel para teste: assinatura compativel com child_process.spawnSync. */
+  spawn?: typeof spawnSync;
+  log?: (mensagem: string) => void;
+  reportarErro?: (mensagem: string) => void;
+}
+
+/**
+ * Valida o destino e, SO se ele for valido, executa a migration.
+ *
+ * Devolve o codigo de saida em vez de chamar process.exit, para que o comando,
+ * os argumentos, o ambiente entregue ao subprocesso e a propagacao do exit code
+ * sejam verificaveis em teste. O `main` abaixo e quem traduz para process.exit.
+ */
+export function executarMigracao(
+  opcoes: OpcoesDeValidacao & DependenciasDeExecucao = {},
+): number {
+  const spawn = opcoes.spawn ?? spawnSync;
+  const log = opcoes.log ?? ((m: string) => console.log(m));
+  const reportarErro = opcoes.reportarErro ?? ((m: string) => console.error(m));
+
+  let env: NodeJS.ProcessEnv;
   try {
-    const env = validarAlvoDeMigracao({ base: process.env });
-
-    console.log(`Aplicando migrations em ${BANCO_DE_TESTE}...`);
-
-    const resultado = spawnSync('npx', ['prisma', 'migrate', 'deploy'], {
-      stdio: 'inherit',
-      env,
-    });
-
-    process.exit(resultado.status ?? 1);
+    env = validarAlvoDeMigracao(opcoes);
   } catch (erro) {
-    console.error((erro as Error).message);
-    process.exit(1);
+    reportarErro((erro as Error).message);
+    // Retorno ANTES de qualquer spawn: validacao reprovada nao inicia migration.
+    return 1;
   }
+
+  log(`Aplicando migrations em ${BANCO_DE_TESTE}...`);
+
+  const resultado = spawn('npx', ['prisma', 'migrate', 'deploy'], {
+    stdio: 'inherit',
+    env,
+  });
+
+  if (resultado.error) {
+    // Reporta apenas o codigo do erro (ex.: ENOENT), nunca o objeto inteiro:
+    // ele pode carregar spawnargs e outros campos derivados do ambiente.
+    const codigo = (resultado.error as NodeJS.ErrnoException).code ?? resultado.error.name;
+    reportarErro(
+      `ABORTADO: nao foi possivel executar "npx prisma migrate deploy" (${codigo}). ` +
+        'Verifique se o Node e o npm estao no PATH.',
+    );
+    return 1;
+  }
+
+  return resultado.status ?? 1;
+}
+
+function main(): void {
+  process.exit(executarMigracao({ base: process.env }));
 }
 
 if (require.main === module) {
