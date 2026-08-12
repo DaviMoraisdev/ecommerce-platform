@@ -4,7 +4,6 @@ dotenv.config({ quiet: true });
 
 import type { Currency } from '../domain/money';
 
-export type { Currency };
 
 export interface AppConfig {
   port: number;
