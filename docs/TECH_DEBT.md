@@ -23,7 +23,7 @@ Trade-offs aceitos cujo **gatilho** de correção está explícito — não são
 
 Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro.
 
-- **`diagnostics: false` no Jest e DELIBERADO (todos os serviços):** o Jest transpila sem type-check, o que deixou a suíte do payment ~3,4× mais rápida (26,1s → 7,8s em cache quente). **Não reativar.** O type-check vive em `npm run typecheck` (cobre `src/` e `tests/`), e o gate antes de commit é `npm run verify` (= `typecheck + build + test`), **não** `npm test`. Comprovado: com um erro de tipo injetado, `npm test` passa e `verify` falha no primeiro passo, sem gastar a suíte inteira.
+- **`diagnostics: false` no Jest e DELIBERADO (todos os serviços):** o Jest transpila sem type-check, o que deixou a suíte do payment ~3,4× mais rápida (26,1s → 7,8s). **Não reativar.** O type-check não desapareceu: saiu do Jest e virou passo próprio. Semântica atual dos comandos — `npm test` = `typecheck + test:fast` (**padrão seguro**, ~5,3s); `npm run test:fast` = só o Jest, sem type-check (loop interno, uso consciente); `npm run verify` = `test + build`; `npm run verify:integration` = `typecheck + test:integration`. Comprovado nas duas direções: com erro de tipo injetado, `npm test` falha e `test:fast` passa.
 - **Drain de `reserved` órfão na migração do 7a:** a migration zerou `inventory.reserved` sem `reservation` (modelo antigo). Seguro por não haver pedidos reais; **com dados reais a estratégia seria backfill, não drain**.
 - **Redrive da DLQ respeita o TTL do claim:** um redrive `DLQ -> fila principal` antes do TTL expirar é visto como duplicata (ack sem reprocessar). **Procedimento:** redrive só após o TTL, ou limpar `notif:evt:<eventId>` antes.
 
@@ -140,9 +140,9 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 - **Ciclo de vida acoplado a efeitos globais:** `start()`/estado do publisher rodam no import, com `process.exit` embutido e estado de módulo global. Separar construção/start/stop + injetar conexão/logger/exit.
 
 ### Qualidade de testes / CI
-- **`inventory-service` com uma unica config de Jest:** unit e integração compartilham `jest.config.ts`, então a guarda de banco de teste se aplica a todos os testes, inclusive os que não tocam o banco. Funciona, mas acopla teste puro a configuração de infraestrutura. Separar em `jest.integration.config.ts` como nos demais serviços.
+- **`inventory-service` com uma unica config de Jest:** unit e integração compartilham `jest.config.ts`, então a guarda de banco de teste se aplica a todos os testes, inclusive os que não tocam o banco. Funciona, mas acopla teste puro a configuração de infraestrutura. Separar em `jest.integration.config.ts` como nos demais serviços. **Consequência prática:** como os testes que fazem `deleteMany` rodam no `npm test` dele, o `verify` dele exige Docker de pé e banco de teste — ao contrário dos outros seis, cujo `verify` é independente de infraestrutura. Quebra a uniformidade do comando transversal até a separação ser feita.
 - **Nome do tsconfig de teste divergente:** payment, order, inventory e auth usam `tsconfig.test.json`; notification usa `tsconfig.jest.json`; cart e product não têm. Atrapalha qualquer script transversal (ex.: `typecheck`). Padronizar em `tsconfig.test.json`.
-- **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham. **O pipeline deve rodar `npm run verify`, não `npm test`** — desde que o Jest transpila sem type-check, `test` sozinho não pega erro de tipo.
+- **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham. **O pipeline deve rodar `npm run verify`** (inclui type-check e build) **e `npm run verify:integration`** onde houver suíte separada — `npm test` sozinho não cobre build nem integração.
 - **Teste de config do `redis.ts`** (fallback quando `REDIS_URL` ausente).
 - **Teste de integração do `connectDatabase` (inventory):** `catch` sanitizado + `process.exit(1)`.
 - **Fixar versão do MongoDB no `mongodb-memory-server` + cache no CI (product).**
