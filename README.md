@@ -226,7 +226,7 @@ Banco: **PostgreSQL** (via Prisma).
 
 ---
 
-### `payment-service`
+### `payment-service` 🟡 Parcial — Fase 5 em andamento (Blocos 1 e 2: dominio monetario em centavos, schema com 11 invariantes no banco e a porta do provedor com adapter Fake). Endpoint de negocio ainda nao existe.
 
 Responsável pelo processamento de pagamentos.
 
@@ -238,7 +238,7 @@ Principais responsabilidades:
 - Publicar eventos de pagamento aprovado ou recusado.
 - Comunicar falhas para o fluxo de pedidos.
 
-Banco previsto: **PostgreSQL**.
+Banco: **PostgreSQL** (via Prisma). Ver `services/payment-service/README.md`.
 
 ---
 
