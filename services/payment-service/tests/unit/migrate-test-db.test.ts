@@ -1,8 +1,13 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import type { spawnSync, SpawnSyncReturns } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MigracaoAbortada, validarAlvoDeMigracao } from '../../scripts/migrate-test-db';
+import {
+  executarMigracao,
+  MigracaoAbortada,
+  validarAlvoDeMigracao,
+} from '../../scripts/migrate-test-db';
 import { BANCO_DE_TESTE } from '../helpers/testDbGuard';
 
 /**
@@ -18,8 +23,19 @@ import { BANCO_DE_TESTE } from '../helpers/testDbGuard';
 
 const SENHA = 'SenhaSuperSecretaDoTeste';
 
+// Cada arquivo de fixture cria um diretorio temporario. Sem limpeza, uma
+// execucao das tres suites deixa dezenas deles em /tmp.
+const temporarios: string[] = [];
+
+afterEach(() => {
+  while (temporarios.length > 0) {
+    rmSync(temporarios.pop() as string, { recursive: true, force: true });
+  }
+});
+
 function arquivoCom(pares: Record<string, string | undefined>): string {
   const dir = mkdtempSync(join(tmpdir(), 'migrate-alvo-'));
+  temporarios.push(dir);
   const arquivo = join(dir, '.env.test');
   const linhas = Object.entries(pares)
     .filter(([, valor]) => valor !== undefined)
@@ -200,5 +216,119 @@ describe('validarAlvoDeMigracao — a senha NUNCA aparece na mensagem', () => {
 
     expect(erro.message).not.toContain(SENHA);
     expect(erro.message).not.toContain('postgresql://');
+  });
+});
+
+// ==========================================================
+// A execucao: comando, ambiente, exit code e o caso mais
+// importante — validacao reprovada NAO inicia migration
+// ==========================================================
+
+describe('executarMigracao', () => {
+  function spawnFalso(retorno: Partial<SpawnSyncReturns<Buffer>> = {}) {
+    return jest.fn(() => ({
+      pid: 1,
+      output: [],
+      stdout: Buffer.from(''),
+      stderr: Buffer.from(''),
+      status: 0,
+      signal: null,
+      ...retorno,
+    })) as unknown as typeof spawnSync;
+  }
+
+  function coletores() {
+    const logs: string[] = [];
+    const erros: string[] = [];
+    return {
+      logs,
+      erros,
+      log: (m: string) => logs.push(m),
+      reportarErro: (m: string) => erros.push(m),
+    };
+  }
+
+  it('executa exatamente `npx prisma migrate deploy`', () => {
+    const spawn = spawnFalso();
+    const c = coletores();
+
+    const codigo = executarMigracao({ arquivo: valido(), spawn, ...c });
+
+    expect(codigo).toBe(0);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledWith(
+      'npx',
+      ['prisma', 'migrate', 'deploy'],
+      expect.objectContaining({ stdio: 'inherit' }),
+    );
+  });
+
+  it('entrega ao subprocesso o ambiente VALIDADO, com a URL do arquivo', () => {
+    const spawn = spawnFalso();
+    const c = coletores();
+
+    executarMigracao({
+      arquivo: valido(),
+      base: { PATH: '/caminho/de/teste' },
+      spawn,
+      ...c,
+    });
+
+    const opcoes = (spawn as unknown as jest.Mock).mock.calls[0][2];
+    expect(opcoes.env.DATABASE_URL).toContain(BANCO_DE_TESTE);
+    expect(opcoes.env.PATH).toBe('/caminho/de/teste');
+  });
+
+  it.each([0, 1, 2, 137])('propaga o exit code %i do Prisma', (status) => {
+    const spawn = spawnFalso({ status });
+    const c = coletores();
+
+    expect(executarMigracao({ arquivo: valido(), spawn, ...c })).toBe(status);
+  });
+
+  it('status null vira codigo 1 — nunca sucesso por omissao', () => {
+    const spawn = spawnFalso({ status: null });
+    const c = coletores();
+
+    expect(executarMigracao({ arquivo: valido(), spawn, ...c })).toBe(1);
+  });
+
+  it('falha de spawn produz diagnostico acionavel, sem vazar a senha', () => {
+    const erroDeSpawn: NodeJS.ErrnoException = new Error('spawn npx ENOENT');
+    erroDeSpawn.code = 'ENOENT';
+
+    const spawn = spawnFalso({ status: null, error: erroDeSpawn });
+    const c = coletores();
+
+    expect(executarMigracao({ arquivo: valido(), spawn, ...c })).toBe(1);
+    expect(c.erros.join('\n')).toContain('ENOENT');
+    expect(c.erros.join('\n')).toContain('PATH');
+    expect(c.erros.join('\n')).not.toContain(SENHA);
+  });
+
+  it('VALIDACAO REPROVADA nao chama spawn — nenhuma migration comeca', () => {
+    const spawn = spawnFalso();
+    const c = coletores();
+
+    const codigo = executarMigracao({
+      arquivo: valido({ DATABASE_URL: `postgresql://u:${SENHA}@db.remoto.exemplo/${BANCO_DE_TESTE}` }),
+      spawn,
+      ...c,
+    });
+
+    expect(codigo).toBe(1);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(c.logs).toHaveLength(0);
+    expect(c.erros.join('\n')).toContain('nao e local');
+    expect(c.erros.join('\n')).not.toContain(SENHA);
+  });
+
+  it('anuncia o banco alvo antes de executar', () => {
+    const spawn = spawnFalso();
+    const c = coletores();
+
+    executarMigracao({ arquivo: valido(), spawn, ...c });
+
+    expect(c.logs.join('\n')).toContain(BANCO_DE_TESTE);
   });
 });
