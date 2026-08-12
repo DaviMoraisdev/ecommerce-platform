@@ -4,7 +4,7 @@ Registro de decisões conscientes de adiamento, avaliadas nos code reviews e age
 
 Organizado por **destino**. Só pendências: dívidas pagas são removidas daqui (o histórico permanece nos PRs).
 
-Última atualização: **Fase 4 concluída** (Bloco 10 — fechamento).
+Última atualização: **Fase 5 em andamento** (Blocos 1 e 2 concluídos).
 
 ---
 
@@ -13,19 +13,17 @@ Organizado por **destino**. Só pendências: dívidas pagas são removidas daqui
 Trade-offs aceitos cujo **gatilho** de correção está explícito — não são trabalho agendado por data.
 
 - **Janela de crash claim-first (notification-service):** se o processo cair entre o `claim` e o `ack`, a reentrega é tratada como duplicata sem processar o efeito. Inerente ao at-least-once sem efeito transacional. **Gatilho:** quando o consumer deixar de ser stub e ganhar efeito real (e-mail/push), é obrigatório adotar efeito+claim atômicos (outbox no consumidor). Destino: **evolução do notification-service (Fase 6+/pós-MVP)**.
+- **Premissa de 2 casas decimais (payment-service):** `src/domain/money.ts` assume 100 centavos por unidade monetária. Verdadeiro para BRL, falso para JPY (0 casas) e dinares (3). Seguro enquanto `Currency = 'BRL'`. **Gatilho:** suporte a segunda moeda.
+- **Porta de pagamento sem passo de autenticação adicional (3DS/SCA):** A porta PaymentProvider nao expressa autenticacao adicional — `ChargeResult` não tem campo de próxima ação (redirect, desafio). O fluxo assume cartão tokenizado e captura automática. **Gatilho:** exigência de 3D Secure, SCA (Europa) ou qualquer método que precise de interação extra do cliente. Custo: variante nova em `ChargeResult` e ajuste em todos os consumidores.
 
 ---
-
-- **Premissa de 2 casas decimais (payment-service):** `src/domain/money.ts` assume 100 centavos por unidade monetária. Verdadeiro para BRL, falso para JPY (0 casas) e dinares (3). Seguro enquanto `Currency = 'BRL'`. **Gatilho:** suporte a segunda moeda.
-
-
-- **Porta de pagamento sem passo de autenticação adicional (3DS/SCA):** A porta PaymentProvider nao expressa autenticacao adicional — `ChargeResult` não tem campo de próxima ação (redirect, desafio). O fluxo assume cartão tokenizado e captura automática. **Gatilho:** exigência de 3D Secure, SCA (Europa) ou qualquer método que precise de interação extra do cliente. Custo: variante nova em `ChargeResult` e ajuste em todos os consumidores.
 
 
 ## Decisões e procedimentos documentados (sem trabalho pendente)
 
 Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro.
 
+- **`diagnostics: false` no Jest e DELIBERADO (todos os serviços):** o Jest transpila sem type-check, o que deixou a suíte do payment ~3,4× mais rápida (26,1s → 7,8s em cache quente). **Não reativar.** O type-check vive em `npm run typecheck` (cobre `src/` e `tests/`), e o gate antes de commit é `npm run verify` (= `typecheck + build + test`), **não** `npm test`. Comprovado: com um erro de tipo injetado, `npm test` passa e `verify` falha no primeiro passo, sem gastar a suíte inteira.
 - **Drain de `reserved` órfão na migração do 7a:** a migration zerou `inventory.reserved` sem `reservation` (modelo antigo). Seguro por não haver pedidos reais; **com dados reais a estratégia seria backfill, não drain**.
 - **Redrive da DLQ respeita o TTL do claim:** um redrive `DLQ -> fila principal` antes do TTL expirar é visto como duplicata (ack sem reprocessar). **Procedimento:** redrive só após o TTL, ou limpar `notif:evt:<eventId>` antes.
 
@@ -41,9 +39,49 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ## FASE 5 — fechar no Bloco 10 (dentro desta fase)
 
 
-
 - **`.env` da raiz defasado em relação ao container:** a credencial do `.env` da raiz não é a que o Postgres em execução aceita; os serviços usam outra. O `docker compose down -v` documentado no README recriaria o volume com a senha da raiz e **quebraria todos os serviços de uma vez**. Alinhar raiz e serviços, e validar no boot.
 - **`.env.example` ausente em `inventory-service` e `product-service`:** ambos concluídos, nenhum documenta as variáveis necessárias. Ninguém consegue subi-los em máquina nova, e as portas deles só são descobríveis lendo o código. Viola a regra do projeto de `.env.example` sempre versionado.
+
+
+## FASE 5 — critérios herdados entre blocos
+
+
+Compromissos assumidos em um bloco que **outro bloco** desta fase tem de cumprir. Antes
+viviam apenas em conversa e em descrição de PR — inclusive um controle de segurança.
+Mesmo ciclo das dívidas: removidos daqui quando entregues.
+
+
+### Bloco 3 — `POST /payments`
+- **A fábrica de provedor deve RECUSAR `fake` fora de dev/teste.** `PAYMENT_PROVIDER=fake` em produção significaria que qualquer token mágico aprova uma cobrança — pagamento sempre bem-sucedido, sem dinheiro nenhum. Falhar no boot, com teste. **É controle de segurança, não conveniência.**
+- **Shutdown gracioso:** `disconnectDatabase()` em `SIGTERM`/`SIGINT`. Hoje cada respawn do `ts-node-dev` pode deixar conexão pendurada.
+- **`PAYMENT_PROVIDER` e `PAYMENT_WEBHOOK_SECRET`** no config, com valor **vazio** no `.env.example` (nunca um segredo que funcione).
+- **Reintroduzir `getPrisma`** no mesmo commit do primeiro consumidor — removido por não ter uso.
+
+
+### Bloco 4 — Webhook e inbox
+- **Política fail-closed do `providerCreatedAt` nulo:** evento sem timestamp de origem não altera estado de pagamento; vai para o inbox como `IGNORED`. Já registrado como `it.todo` na suíte de integração do payment.
+- **`express.json()` NÃO pode alcançar a rota de webhook** — a assinatura HMAC é sobre os bytes exatos. Montar a rota com `express.raw()` antes do parser global.
+- **Cap de tamanho do `rawBody`** na rota (`express.raw({ limit })`).
+- **Sanitização em escrita** do payload do inbox e das mensagens de erro.
+
+
+### Bloco 5 — Integração payment ↔ order
+- **Primeiro consumer do order-service:** idempotência por `eventId` + DLQ, no padrão do notification-service. Hoje o order só produz eventos.
+
+
+### Bloco 6 — Reconciliação e expiração
+- **Definir TTL e limite de tentativas da janela de retentativa.** O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
+
+
+### Bloco 9 — Stripe e hardening
+- **Rodar a suíte de contrato (`payment-provider.contract.ts`) contra a Stripe.** É o que valida a abstração da porta.
+- **Sanitização de log**, rate limit no webhook, escopo PCI documentado.
+
+
+### Bloco 10 — Fechamento
+- **README do payment-service** e revisão do README da raiz.
+- **PDF de revisão da fase** em `docs/phase-reviews/phase-05.pdf`.
+
 
 
 ## FASE 7 — Gateway, Segurança e Infra
@@ -57,7 +95,7 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 - **Portas de dev em 0.0.0.0:** postgres/mongo/redis publicam em todas as interfaces (rabbitmq já restrito a 127.0.0.1). Restringir + credenciais fortes por ambiente. Dev-only, baixa.
 
 ### Infra / containerização
-- **payment-service no docker-compose:** nasceu fora do compose (só `npm run dev`), mesmo estado do notification-service. Dockerfile, entrada no compose e healthcheck. Tratar junto com o item acima.
+- **payment-service no docker-compose:** nasceu fora do compose (só `npm run dev`), mesmo estado do notification-service. Dockerfile, entrada no compose e healthcheck. Tratar junto com o item do notification-service, abaixo.
 - **notification-service no docker-compose:** Dockerfile, entrada no compose, healthcheck e observabilidade (hoje só `npm run dev`).
 - **Migração de args de fila durável (RabbitMQ):** args são imutáveis; adicionar a DLX exigiu deletar a fila (one-time manual). Padronizar via policy/quorum ou script de deploy.
 - **Automatizar o e2e via docker-compose:** a suíte `e2e/` (Bloco 9) roda contra o stack local subido manualmente (auth, product, inventory, cart, order, notification + infra). Containerizar permite rodar no CI.
@@ -93,7 +131,7 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
   - `idempotency_records` em `PROCESSING` → **bifurcar**: se o pedido existe, marcar `COMPLETED` (não liberar!); se não, `release` + `FAILED`.
   - `idempotency_records` `FAILED` → reexecutar `release(orderId)`.
   Tudo com retry/backoff, métricas e alerta.
-- **Retenção/limpeza da outbox:** [ver também o item de inbox abaixo] `SENT`/`FAILED` crescem sem política; o payload guarda userId/total. Definir arquivamento/cleanup e minimizar campos.
+- **Retenção/limpeza da outbox:** (ver o item de retenção do inbox, acima) `SENT`/`FAILED` crescem sem política; o payload guarda userId/total. Definir arquivamento/cleanup e minimizar campos.
 - **Backoff/quarentena/redrive no relay da outbox (produtor):** o publish falho volta a `PENDING` e é retentado em intervalo fixo (sem backoff exponencial, sem quarentena de "poison" nem redrive) — um evento inpublicável causaria head-of-line blocking. Eventos são bem-formados (produtor próprio) → risco baixo hoje; necessário sob carga real. Enum `FAILED` reservado. (PR #43/#44.)
 - **Limpeza do carrinho por versão/CAS:** hoje o checkout remove só os itens comprados por productId; um CAS por versão preservaria mudanças de quantidade. Exige versionamento no cart.
 
@@ -103,8 +141,8 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 
 ### Qualidade de testes / CI
 - **`inventory-service` com uma unica config de Jest:** unit e integração compartilham `jest.config.ts`, então a guarda de banco de teste se aplica a todos os testes, inclusive os que não tocam o banco. Funciona, mas acopla teste puro a configuração de infraestrutura. Separar em `jest.integration.config.ts` como nos demais serviços.
-- **Velocidade dos testes (ts-jest):** recompila+type-checa cada arquivo por run (o build já faz o type-check). `isolatedModules: true` ou `@swc/jest`/`esbuild-jest` → 3–5× mais rápido. Aplicar em order/inventory/cart/product.
-- **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham.
+- **Nome do tsconfig de teste divergente:** payment, order, inventory e auth usam `tsconfig.test.json`; notification usa `tsconfig.jest.json`; cart e product não têm. Atrapalha qualquer script transversal (ex.: `typecheck`). Padronizar em `tsconfig.test.json`.
+- **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham. **O pipeline deve rodar `npm run verify`, não `npm test`** — desde que o Jest transpila sem type-check, `test` sozinho não pega erro de tipo.
 - **Teste de config do `redis.ts`** (fallback quando `REDIS_URL` ausente).
 - **Teste de integração do `connectDatabase` (inventory):** `catch` sanitizado + `process.exit(1)`.
 - **Fixar versão do MongoDB no `mongodb-memory-server` + cache no CI (product).**
@@ -123,7 +161,7 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 - **DTO explícito `ProductWithAvailability`** para o retorno enriquecido do `findProductById`.
 - **Normalizar base URL do `inventory.client`** (`new URL()` ou tratar barra final).
 - **Mover helpers puros para `utils/` (product):** `parsePositiveInt`, `pickAllowedFields`.
-- **Precisão monetária:** representar dinheiro em centavos (inteiro), consistente entre serviços (hoje float com arredondamento).
+- **Precisão monetária:** representar dinheiro em centavos (inteiro), consistente entre serviços (hoje float com arredondamento em cart, product e order). **O payment-service JA usa centavos inteiros** (`src/domain/money.ts`) — não é alvo desta refatoração.
 
 ---
 
