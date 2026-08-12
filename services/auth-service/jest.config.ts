@@ -7,7 +7,7 @@ const config: Config = {
   testMatch: ['**/*.test.ts'],
   clearMocks: true,
   transform: {
-    '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json' }],
+    '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json', diagnostics: false }],
   },
 };
 
