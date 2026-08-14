@@ -86,7 +86,8 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ## FASE 7 — Gateway, Segurança e Infra
 
 ### Segurança
-- **JWT hardening:** `jwt.verify` com `algorithms`/`issuer`/`audience` explícitos + validar shape do payload antes de confiar no `role`. Aplicar em auth, product, inventory e cart.
+- **JWT hardening:** `jwt.verify` com `algorithms`/`issuer`/`audience` explícitos + validar shape do payload antes de confiar no `role`. Aplicar em auth, product, inventory e cart. **Nota:** a forca do segredo ja foi tratada — cart, order, inventory e product recusam placeholder conhecido em qualquer ambiente e exigem 32+ caracteres em producao. O que resta nesta entrada e outra coisa: `algorithms`/`issuer`/`audience` explicitos no `jwt.verify` e validacao do shape do payload antes de confiar no `role`.
+- **`auth-service` sem validacao de ambiente no boot:** e o unico dos cinco que usam JWT sem modulo de config — le `process.env.JWT_SECRET as string` direto em `src/utils/jwt.ts`, sem checar presenca, placeholder ou tamanho. Com a variavel ausente, o `as string` entrega `undefined` ao `jwt.sign`, que falha em tempo de requisicao em vez de no boot. Aplicar a mesma regra dos outros quatro. (Descoberto ao tratar o achado de placeholder no PR de manutencao.)
 - **403 genérico:** não vazar `required`/`current` no corpo (hoje alguns serviços retornam). Logar só server-side.
 - **Autenticação serviço-a-serviço:** token interno/mTLS entre serviços (product→inventory, cart→product, order→inventory). Modelar identidade de serviço.
 - **Separar `/health` (liveness) de `/ready` (readiness com check de DB):** quando houver health probes de orquestração.
