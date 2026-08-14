@@ -1,5 +1,11 @@
+import { assertTestDatabase } from './helpers/testDbGuard';
 import { prisma } from '../src/config/database';
 import { reserveStock, releaseByOrder, setStock } from '../src/services/stock.service';
+
+// Defesa em profundidade: o setup.integration.ts ja executou a guarda, mas a
+// config do Jest e sobrescrivivel por linha de comando, e este arquivo faz
+// deleteMany(). Guarda no ponto do perigo nao depende de qual config coletou.
+assertTestDatabase(process.env);
 
 describe('concorrencia', () => {
   const P = 'test-conc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
