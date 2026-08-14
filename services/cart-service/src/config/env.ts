@@ -6,12 +6,24 @@ export interface AppConfig {
   nodeEnv: string;
 }
 
-const WEAK_JWT_SECRETS = [
+// Valores publicados no repositorio ou genericos. Recusados em QUALQUER
+// ambiente: segredo que esta no repositorio e segredo publico.
+const JWT_PLACEHOLDERS = [
   'troque_este_segredo',
   'dev_jwt_secret_troque_em_producao',
+  'sua_chave_secreta_aqui',
+  'um_segredo_de_teste',
+  'coloque-um-segredo-de-teste-aqui',
   'changeme',
+  'change_me',
   'secret',
+  'segredo',
+  'test',
+  'teste',
 ];
+
+/** 32 caracteres. Recomendado: `openssl rand -hex 32` (64 caracteres). */
+const JWT_TAMANHO_MINIMO = 32;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const nodeEnv = env.NODE_ENV ?? 'development';
@@ -28,11 +40,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!jwtSecret || jwtSecret.trim() === '') {
     throw new Error('JWT_SECRET e obrigatoria');
   }
-  // Em producao, recusa placeholders conhecidos e segredos curtos.
-  if (nodeEnv === 'production') {
-    if (WEAK_JWT_SECRETS.includes(jwtSecret) || jwtSecret.length < 16) {
-      throw new Error('JWT_SECRET fraca ou placeholder — defina um segredo forte');
-    }
+  // Placeholder: recusado em QUALQUER ambiente. O cenario de risco e alguem
+  // copiar o .env.example e subir em desenvolvimento.
+  if (JWT_PLACEHOLDERS.includes(jwtSecret.trim().toLowerCase())) {
+    throw new Error(
+      'JWT_SECRET e um placeholder conhecido, publicado no repositorio. ' +
+        'Gere um segredo real: openssl rand -hex 32',
+    );
+  }
+
+  // Tamanho: so em producao. Segredo curto ESCOLHIDO pelo operador nao e
+  // publico, e exigir 32 em dev cria atrito sem ganho de seguranca.
+  if (nodeEnv === 'production' && jwtSecret.length < JWT_TAMANHO_MINIMO) {
+    throw new Error(
+      `JWT_SECRET tem menos de ${JWT_TAMANHO_MINIMO} caracteres — insuficiente em producao`,
+    );
   }
 
   const rawPort = env.CART_PORT;
