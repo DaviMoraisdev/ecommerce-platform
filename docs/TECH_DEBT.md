@@ -141,7 +141,6 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 
 ### Qualidade de testes / CI
 - **`inventory-service` com uma unica config de Jest:** unit e integração compartilham `jest.config.ts`, então a guarda de banco de teste se aplica a todos os testes, inclusive os que não tocam o banco. Funciona, mas acopla teste puro a configuração de infraestrutura. Separar em `jest.integration.config.ts` como nos demais serviços. **Consequência prática:** como os testes que fazem `deleteMany` rodam no `npm test` dele, o `verify` dele exige Docker de pé e banco de teste — ao contrário dos outros seis, cujo `verify` é independente de infraestrutura. Quebra a uniformidade do comando transversal até a separação ser feita.
-- **Nome do tsconfig de teste divergente:** payment, order, inventory e auth usam `tsconfig.test.json`; notification usa `tsconfig.jest.json`; cart e product não têm. Atrapalha qualquer script transversal (ex.: `typecheck`). Padronizar em `tsconfig.test.json`.
 - **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham. **O pipeline deve rodar `npm run verify`** (inclui type-check e build) **e `npm run verify:integration`** onde houver suíte separada — `npm test` sozinho não cobre build nem integração.
 - **Teste de config do `redis.ts`** (fallback quando `REDIS_URL` ausente).
 - **Teste de integração do `connectDatabase` (inventory):** `catch` sanitizado + `process.exit(1)`.
