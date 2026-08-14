@@ -40,7 +40,6 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ## FASE 5 — fechar no Bloco 10 (dentro desta fase)
 
 
-- **`.env.example` ausente em `inventory-service` e `product-service`:** ambos concluídos, nenhum documenta as variáveis necessárias. Ninguém consegue subi-los em máquina nova, e as portas deles só são descobríveis lendo o código. Viola a regra do projeto de `.env.example` sempre versionado.
 
 
 ## FASE 5 — critérios herdados entre blocos
