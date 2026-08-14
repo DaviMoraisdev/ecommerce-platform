@@ -15,7 +15,8 @@ const config: Config = {
   testMatch: ['**/*.test.ts'],
   clearMocks: true,
   setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
-  globalTeardown: '<rootDir>/tests/globalTeardown.ts',
+  // Integracao roda por jest.integration.config.ts, que tem guarda de banco.
+  testPathIgnorePatterns: ['/node_modules/', 'integration'],
   transform: {
     '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json', diagnostics: false }],
   },

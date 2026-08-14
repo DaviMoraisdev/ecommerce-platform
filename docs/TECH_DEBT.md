@@ -40,8 +40,6 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ## FASE 5 — fechar no Bloco 10 (dentro desta fase)
 
 
-- **`.env` da raiz defasado em relação ao container:** a credencial do `.env` da raiz não é a que o Postgres em execução aceita; os serviços usam outra. O `docker compose down -v` documentado no README recriaria o volume com a senha da raiz e **quebraria todos os serviços de uma vez**. Alinhar raiz e serviços, e validar no boot.
-- **`.env.example` ausente em `inventory-service` e `product-service`:** ambos concluídos, nenhum documenta as variáveis necessárias. Ninguém consegue subi-los em máquina nova, e as portas deles só são descobríveis lendo o código. Viola a regra do projeto de `.env.example` sempre versionado.
 
 
 ## FASE 5 — critérios herdados entre blocos
@@ -88,7 +86,8 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ## FASE 7 — Gateway, Segurança e Infra
 
 ### Segurança
-- **JWT hardening:** `jwt.verify` com `algorithms`/`issuer`/`audience` explícitos + validar shape do payload antes de confiar no `role`. Aplicar em auth, product, inventory e cart.
+- **JWT hardening:** `jwt.verify` com `algorithms`/`issuer`/`audience` explícitos + validar shape do payload antes de confiar no `role`. Aplicar em auth, product, inventory e cart. **Nota:** a forca do segredo ja foi tratada — cart, order, inventory e product recusam placeholder conhecido em qualquer ambiente e exigem 32+ caracteres em producao. O que resta nesta entrada e outra coisa: `algorithms`/`issuer`/`audience` explicitos no `jwt.verify` e validacao do shape do payload antes de confiar no `role`.
+- **`auth-service` sem validacao de ambiente no boot:** e o unico dos cinco que usam JWT sem modulo de config — le `process.env.JWT_SECRET as string` direto em `src/utils/jwt.ts`, sem checar presenca, placeholder ou tamanho. Com a variavel ausente, o `as string` entrega `undefined` ao `jwt.sign`, que falha em tempo de requisicao em vez de no boot. Aplicar a mesma regra dos outros quatro. (Descoberto ao tratar o achado de placeholder no PR de manutencao.)
 - **403 genérico:** não vazar `required`/`current` no corpo (hoje alguns serviços retornam). Logar só server-side.
 - **Autenticação serviço-a-serviço:** token interno/mTLS entre serviços (product→inventory, cart→product, order→inventory). Modelar identidade de serviço.
 - **Separar `/health` (liveness) de `/ready` (readiness com check de DB):** quando houver health probes de orquestração.
@@ -141,8 +140,6 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 - **Ciclo de vida acoplado a efeitos globais:** `start()`/estado do publisher rodam no import, com `process.exit` embutido e estado de módulo global. Separar construção/start/stop + injetar conexão/logger/exit.
 
 ### Qualidade de testes / CI
-- **`inventory-service` com uma unica config de Jest:** unit e integração compartilham `jest.config.ts`, então a guarda de banco de teste se aplica a todos os testes, inclusive os que não tocam o banco. Funciona, mas acopla teste puro a configuração de infraestrutura. Separar em `jest.integration.config.ts` como nos demais serviços. **Consequência prática:** como os testes que fazem `deleteMany` rodam no `npm test` dele, o `verify` dele exige Docker de pé e banco de teste — ao contrário dos outros seis, cujo `verify` é independente de infraestrutura. Quebra a uniformidade do comando transversal até a separação ser feita.
-- **Nome do tsconfig de teste divergente:** payment, order, inventory e auth usam `tsconfig.test.json`; notification usa `tsconfig.jest.json`; cart e product não têm. Atrapalha qualquer script transversal (ex.: `typecheck`). Padronizar em `tsconfig.test.json`.
 - **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham. **O pipeline deve rodar `npm run verify`** (inclui type-check e build) **e `npm run verify:integration`** onde houver suíte separada — `npm test` sozinho não cobre build nem integração.
 - **Teste de config do `redis.ts`** (fallback quando `REDIS_URL` ausente).
 - **Teste de integração do `connectDatabase` (inventory):** `catch` sanitizado + `process.exit(1)`.

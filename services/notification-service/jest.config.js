@@ -11,6 +11,6 @@ module.exports = {
   maxWorkers: 1,
   testMatch: ['**/tests/**/*.test.ts'],
   transform: {
-    '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.jest.json', diagnostics: false }],
+    '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json', diagnostics: false }],
   },
 };
