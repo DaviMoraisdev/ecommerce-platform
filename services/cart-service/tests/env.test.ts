@@ -4,6 +4,9 @@ describe('loadConfig', () => {
   const base = { NODE_ENV: 'test', JWT_SECRET: 'x' };
 
   it('lanca erro se REDIS_URL faltar fora de dev/test', () => {
+    // O segredo aqui e curto DE PROPOSITO: em producao ele tambem seria
+    // recusado. Como a asercao exige /REDIS_URL/, este teste prova que o Redis
+    // e verificado ANTES do JWT — com um segredo forte, a ordem nao seria testada.
     expect(() =>
       loadConfig({ NODE_ENV: 'production', JWT_SECRET: 'um_segredo_forte_123' })
     ).toThrow(/REDIS_URL/);
@@ -32,9 +35,9 @@ describe('loadConfig', () => {
     const cfg = loadConfig({
       NODE_ENV: 'production',
       REDIS_URL: 'redis://:s@host:6379',
-      JWT_SECRET: 'um_segredo_bem_forte_2026',
+      JWT_SECRET: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718',
     });
-    expect(cfg.jwtSecret).toBe('um_segredo_bem_forte_2026');
+    expect(cfg.jwtSecret).toBe('a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718');
   });
 
   it('lanca erro se CART_PORT for invalido', () => {
@@ -52,3 +55,47 @@ describe('loadConfig', () => {
     expect(cfg.port).toBe(3005);
   });
 });
+
+describe('JWT_SECRET — placeholder e forca', () => {
+  const FORTE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718';
+
+  // O cenario do achado de seguranca: alguem copia o .env.example e sobe em
+  // DESENVOLVIMENTO. Recusar so em producao nao pegaria este caso.
+  it.each([
+    'troque_este_segredo',
+    'dev_jwt_secret_troque_em_producao',
+    'sua_chave_secreta_aqui',
+    'changeme',
+    'secret',
+    'segredo',
+  ])('recusa o placeholder %p em desenvolvimento', (placeholder) => {
+    expect(() => chamar(placeholder, 'development')).toThrow(/placeholder/i);
+  });
+
+  it('recusa placeholder ignorando caixa e espacos', () => {
+    expect(() => chamar('  TROQUE_ESTE_SEGREDO  ', 'development')).toThrow(/placeholder/i);
+  });
+
+  it('aceita segredo forte em qualquer ambiente', () => {
+    expect(() => chamar(FORTE, 'development')).not.toThrow();
+    expect(() => chamar(FORTE, 'production')).not.toThrow();
+  });
+
+  it('em DESENVOLVIMENTO aceita segredo curto que nao e placeholder', () => {
+    expect(() => chamar('curto_mas_proprio', 'development')).not.toThrow();
+  });
+
+  it('em PRODUCAO recusa segredo com menos de 32 caracteres', () => {
+    expect(() => chamar('curto_mas_proprio', 'production')).toThrow(/32 caracteres/);
+  });
+
+  it('em PRODUCAO aceita exatamente 32 caracteres', () => {
+    expect(() => chamar('a'.repeat(32), 'production')).not.toThrow();
+  });
+});
+
+function chamar(s: string, e: string): void {
+  // REDIS_URL entra na linha de base: loadConfig a exige fora de development e
+  // test, e sem ela o caso de producao falharia por motivo alheio ao segredo.
+  loadConfig({ JWT_SECRET: s, NODE_ENV: e, REDIS_URL: 'redis://127.0.0.1:6379' });
+}
