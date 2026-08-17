@@ -6,6 +6,10 @@ const CONFIG: AppConfig = {
   port: 3007,
   databaseUrl: 'postgresql://u:p@127.0.0.1:5432/payment_db',
   defaultCurrency: 'BRL',
+  nodeEnv: 'test',
+  provider: 'fake',
+  webhookSecret: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718',
+  jwtSecret: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718',
 };
 
 function montarDeps(ordem: string[], overrides: Partial<BootstrapDeps> = {}) {
