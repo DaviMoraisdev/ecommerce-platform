@@ -1,20 +1,11 @@
 import { loadConfig, ConfigError } from '../../src/config/env';
+import { configDeTeste, envDeTeste } from '../helpers/config';
 
 /**
  * Segredo de 48 caracteres: passa o minimo de 32 e nao esta na lista de
  * placeholders. Usado como linha de base valida.
  */
-const SEGREDO = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718';
-
-const base: NodeJS.ProcessEnv = {
-  PAYMENT_PORT: '3007',
-  DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/payment_db',
-  DEFAULT_CURRENCY: 'BRL',
-  NODE_ENV: 'test',
-  PAYMENT_PROVIDER: 'fake',
-  PAYMENT_WEBHOOK_SECRET: SEGREDO,
-  JWT_SECRET: SEGREDO,
-};
+const base: NodeJS.ProcessEnv = envDeTeste();
 
 /** Remove chaves da linha de base sem mutar o objeto compartilhado. */
 function semAs(...chaves: string[]): NodeJS.ProcessEnv {
@@ -29,19 +20,16 @@ const OBRIGATORIAS = [
   'PAYMENT_PROVIDER',
   'PAYMENT_WEBHOOK_SECRET',
   'JWT_SECRET',
+  'ORDER_SERVICE_URL',
 ] as const;
 
 describe('loadConfig — caminho valido', () => {
   it('monta a config a partir de um ambiente valido', () => {
-    expect(loadConfig(base)).toEqual({
-      port: 3007,
-      databaseUrl: 'postgresql://u:p@127.0.0.1:5432/payment_db',
-      defaultCurrency: 'BRL',
-      nodeEnv: 'test',
-      provider: 'fake',
-      webhookSecret: SEGREDO,
-      jwtSecret: SEGREDO,
-    });
+    // Compara contra o builder compartilhado, nao contra um literal: era a
+    // TERCEIRA copia da forma do AppConfig nos testes. E como os segredos de
+    // webhook e JWT sao DIFERENTES no builder, uma troca entre os dois campos
+    // dentro do loadConfig faria este teste falhar.
+    expect(loadConfig(envDeTeste())).toEqual(configDeTeste());
   });
 
   it('assume BRL quando DEFAULT_CURRENCY nao e informada', () => {
@@ -211,3 +199,62 @@ describe.each(['PAYMENT_WEBHOOK_SECRET', 'JWT_SECRET'] as const)(
     });
   },
 );
+
+describe('loadConfig — ORDER_SERVICE_URL', () => {
+  it('nao tem fallback para localhost, ao contrario do INVENTORY_SERVICE_URL', () => {
+    const { ORDER_SERVICE_URL, ...semUrl } = base;
+    expect(() => loadConfig(semUrl)).toThrow(/ORDER_SERVICE_URL/);
+  });
+
+  it.each(['nao-e-url', 'localhost:3006', '://x', ' '])(
+    'recusa URL invalida %p',
+    (url) => {
+      expect(() => loadConfig({ ...base, ORDER_SERVICE_URL: url })).toThrow(
+        /ORDER_SERVICE_URL/,
+      );
+    },
+  );
+
+  it.each(['ftp://order:3006', 'file:///tmp/order', 'ws://order:3006'])(
+    'recusa protocolo %p',
+    (url) => {
+      expect(() => loadConfig({ ...base, ORDER_SERVICE_URL: url })).toThrow(/http ou https/);
+    },
+  );
+
+  it.each(['http://order:3006', 'https://order.interno'])('aceita %p', (url) => {
+    expect(loadConfig({ ...base, ORDER_SERVICE_URL: url }).orderServiceUrl).toBe(url);
+  });
+
+  it.each([
+    ['http://order:3006/', 'http://order:3006'],
+    ['http://order:3006///', 'http://order:3006'],
+  ])('normaliza a barra final de %p', (entrada, esperado) => {
+    // O cliente monta `${base}/orders/:id`; sem normalizar, viraria "//orders".
+    expect(loadConfig({ ...base, ORDER_SERVICE_URL: entrada }).orderServiceUrl).toBe(esperado);
+  });
+});
+
+describe('loadConfig — ORDER_SERVICE_TIMEOUT_MS', () => {
+  it('usa 5000 quando ausente', () => {
+    expect(loadConfig(base).orderServiceTimeoutMs).toBe(5000);
+  });
+
+  it('usa 5000 quando vazia', () => {
+    expect(loadConfig({ ...base, ORDER_SERVICE_TIMEOUT_MS: '  ' }).orderServiceTimeoutMs).toBe(
+      5000,
+    );
+  });
+
+  it.each(['0', '-1', 'abc', '1.5', '60001'])('recusa %p', (valor) => {
+    expect(() => loadConfig({ ...base, ORDER_SERVICE_TIMEOUT_MS: valor })).toThrow(
+      /ORDER_SERVICE_TIMEOUT_MS/,
+    );
+  });
+
+  it.each(['1', '3000', '60000'])('aceita o limite %p', (valor) => {
+    expect(loadConfig({ ...base, ORDER_SERVICE_TIMEOUT_MS: valor }).orderServiceTimeoutMs).toBe(
+      Number(valor),
+    );
+  });
+});
