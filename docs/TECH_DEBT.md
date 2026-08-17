@@ -57,6 +57,9 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 - **Reintroduzir `getPrisma`** no mesmo commit do primeiro consumidor — removido por não ter uso.
 
 
+### Procedimento — verificacao de ciclo de vida
+- **Verificacao de ciclo de vida exige binario compilado, porta livre e liveness.** Teste unitario com dependencia injetada nao cobre a FIACAO no ponto de entrada. Duas tentativas no Bloco 3a foram invalidadas: `npx`/`npm run dev` sao wrappers e o `kill` atinge o wrapper, nao o processo; e um orfao de execucao anterior na mesma porta faz o `curl` responder por outro processo. Procedimento: `npm run build` + `node dist/server.js`, conferir que a porta estava livre, checar liveness antes do `curl`, e so entao enviar o sinal.
+
 ### Bloco 4 — Webhook e inbox
 - **Política fail-closed do `providerCreatedAt` nulo:** evento sem timestamp de origem não altera estado de pagamento; vai para o inbox como `IGNORED`. Já registrado como `it.todo` na suíte de integração do payment.
 - **`express.json()` NÃO pode alcançar a rota de webhook** — a assinatura HMAC é sobre os bytes exatos. Montar a rota com `express.raw()` antes do parser global.
