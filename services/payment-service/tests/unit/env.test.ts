@@ -258,3 +258,50 @@ describe('loadConfig — ORDER_SERVICE_TIMEOUT_MS', () => {
     );
   });
 });
+
+describe('loadConfig — PAYMENT_WINDOW_MINUTES', () => {
+  it('usa 15 quando ausente', () => {
+    expect(loadConfig(base).paymentWindowMinutes).toBe(15);
+  });
+
+  it('usa 15 quando vazia', () => {
+    expect(loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: '  ' }).paymentWindowMinutes).toBe(15);
+  });
+
+  it.each(['0', '-1', 'abc', '1.5', '1441', '15,5'])('recusa %p', (valor) => {
+    expect(() => loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: valor })).toThrow(
+      /PAYMENT_WINDOW_MINUTES/,
+    );
+  });
+
+  it.each(['1', '15', '30', '1440'])('aceita o limite %p', (valor) => {
+    expect(loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: valor }).paymentWindowMinutes).toBe(
+      Number(valor),
+    );
+  });
+
+  it('tolera espaco ao redor', () => {
+    expect(loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: '  30  ' }).paymentWindowMinutes).toBe(
+      30,
+    );
+  });
+
+  it.each([
+    ['0x10', 16],
+    ['1e3', 1000],
+  ])('TOLERA a notacao %p como %i — comportamento do Number()', (valor, esperado) => {
+    // Documentado, nao desejado. Number() aceita hexadecimal e exponencial, e
+    // parseTimeout tem a MESMA tolerancia. Nao vale endurecer: hex num arquivo
+    // .env nao e acidente plausivel, e um parser proprio so para isso seria
+    // codigo a mais para manter. Se um dia recusarmos, e nos dois juntos.
+    expect(loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: valor }).paymentWindowMinutes).toBe(
+      esperado,
+    );
+  });
+
+  it('o teto de 1440 existe porque a janela prende estoque reservado', () => {
+    expect(() => loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: '10080' })).toThrow(
+      /entre 1 e 1440/,
+    );
+  });
+});

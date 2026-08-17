@@ -17,6 +17,15 @@ export interface AppConfig {
   jwtSecret: string;
   orderServiceUrl: string;
   orderServiceTimeoutMs: number;
+  /**
+   * Janela de retentativa (decisao 5 da fase). PROVISORIO: o valor definitivo
+   * sai no Bloco 6, com o job de expiracao na frente. Existe agora porque
+   * Payment.expiresAt e NOT NULL no schema.
+   *
+   * Custo de aumentar: estoque fica reservado por mais tempo. Custo de reduzir:
+   * cliente com cartao recusado tem menos tempo para tentar outro.
+   */
+  paymentWindowMinutes: number;
 }
 
 export class ConfigError extends Error {
@@ -106,6 +115,15 @@ function parseTimeout(raw: string | undefined, nome: string, padrao: number): nu
   return ms;
 }
 
+function parseMinutos(raw: string | undefined, nome: string, padrao: number): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const minutos = Number(raw);
+  if (!Number.isInteger(minutos) || minutos < 1 || minutos > 1440) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre 1 e 1440.`);
+  }
+  return minutos;
+}
+
 function parsePort(raw: string): number {
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -165,6 +183,11 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       source.ORDER_SERVICE_TIMEOUT_MS,
       'ORDER_SERVICE_TIMEOUT_MS',
       5000,
+    ),
+    paymentWindowMinutes: parseMinutos(
+      source.PAYMENT_WINDOW_MINUTES,
+      'PAYMENT_WINDOW_MINUTES',
+      15,
     ),
   };
 }

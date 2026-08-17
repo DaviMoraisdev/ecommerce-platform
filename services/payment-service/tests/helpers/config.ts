@@ -31,6 +31,7 @@ export function configDeTeste(overrides: Partial<AppConfig> = {}): AppConfig {
     jwtSecret: SEGREDO_JWT,
     orderServiceUrl: 'http://localhost:3006',
     orderServiceTimeoutMs: 5000,
+    paymentWindowMinutes: 15,
     ...overrides,
   };
 }
