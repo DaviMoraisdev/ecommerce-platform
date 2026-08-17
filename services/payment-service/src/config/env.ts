@@ -15,6 +15,8 @@ export interface AppConfig {
   provider: ProviderName;
   webhookSecret: string;
   jwtSecret: string;
+  orderServiceUrl: string;
+  orderServiceTimeoutMs: number;
 }
 
 export class ConfigError extends Error {
@@ -76,6 +78,34 @@ function assertSegredoForte(nome: string, valor: string, nodeEnv: string): void 
   }
 }
 
+/**
+ * Sem fallback para localhost, de proposito. O INVENTORY_SERVICE_URL do product
+ * tem esse fallback e e divida registrada (Fase 7: "fallback localhost so em
+ * dev"): um deploy sem a variavel apontaria silenciosamente para o proprio host.
+ */
+function parseUrlDeServico(raw: string, nome: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new ConfigError(`${nome} nao e uma URL valida`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new ConfigError(`${nome} deve usar http ou https, recebeu "${url.protocol}"`);
+  }
+  // Normaliza a barra final para o cliente montar caminho sem duplicar "/".
+  return raw.replace(/\/+$/, '');
+}
+
+function parseTimeout(raw: string | undefined, nome: string, padrao: number): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const ms = Number(raw);
+  if (!Number.isInteger(ms) || ms < 1 || ms > 60_000) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre 1 e 60000.`);
+  }
+  return ms;
+}
+
 function parsePort(raw: string): number {
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -127,5 +157,14 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     provider: parseProvider(requireEnv('PAYMENT_PROVIDER', source), nodeEnv),
     webhookSecret,
     jwtSecret,
+    orderServiceUrl: parseUrlDeServico(
+      requireEnv('ORDER_SERVICE_URL', source),
+      'ORDER_SERVICE_URL',
+    ),
+    orderServiceTimeoutMs: parseTimeout(
+      source.ORDER_SERVICE_TIMEOUT_MS,
+      'ORDER_SERVICE_TIMEOUT_MS',
+      5000,
+    ),
   };
 }
