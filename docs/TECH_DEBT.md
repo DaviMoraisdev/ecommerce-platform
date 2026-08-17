@@ -4,7 +4,7 @@ Registro de decisões conscientes de adiamento, avaliadas nos code reviews e age
 
 Organizado por **destino**. Só pendências: dívidas pagas são removidas daqui (o histórico permanece nos PRs).
 
-Última atualização: **Fase 5 em andamento** (Blocos 1 e 2 concluídos).
+Última atualização: **Fase 5 em andamento** (Blocos 1 e 2 concluídos; Bloco 3 em PR).
 
 ---
 
@@ -14,6 +14,7 @@ Trade-offs aceitos cujo **gatilho** de correção está explícito — não são
 
 - **Janela de crash claim-first (notification-service):** se o processo cair entre o `claim` e o `ack`, a reentrega é tratada como duplicata sem processar o efeito. Inerente ao at-least-once sem efeito transacional. **Gatilho:** quando o consumer deixar de ser stub e ganhar efeito real (e-mail/push), é obrigatório adotar efeito+claim atômicos (outbox no consumidor). Destino: **evolução do notification-service (Fase 6+/pós-MVP)**.
 - **Premissa de 2 casas decimais (payment-service):** `src/domain/money.ts` assume 100 centavos por unidade monetária. Verdadeiro para BRL, falso para JPY (0 casas) e dinares (3). Seguro enquanto `Currency = 'BRL'`. **Gatilho:** suporte a segunda moeda.
+- **`Number()` aceita hexadecimal e exponencial em `parseTimeout` e `parseMinutos` (payment-service):** `PAYMENT_WINDOW_MINUTES=0x10` vira 16 e `1e3` vira 1000. Documentado em teste, não corrigido: hexadecimal num `.env` não é acidente plausível, e um parser próprio só para isso é código a mais para manter. **Gatilho:** se um dos dois for endurecido, os dois vão juntos — corrigir só um cria divergência silenciosa entre parsers irmãos.
 - **Porta de pagamento sem passo de autenticação adicional (3DS/SCA):** A porta PaymentProvider nao expressa autenticacao adicional — `ChargeResult` não tem campo de próxima ação (redirect, desafio). O fluxo assume cartão tokenizado e captura automática. **Gatilho:** exigência de 3D Secure, SCA (Europa) ou qualquer método que precise de interação extra do cliente. Custo: variante nova em `ChargeResult` e ajuste em todos os consumidores.
 
 ---
@@ -50,13 +51,6 @@ viviam apenas em conversa e em descrição de PR — inclusive um controle de se
 Mesmo ciclo das dívidas: removidos daqui quando entregues.
 
 
-### Bloco 3 — `POST /payments`
-- **A fábrica de provedor deve RECUSAR `fake` fora de dev/teste.** `PAYMENT_PROVIDER=fake` em produção significaria que qualquer token mágico aprova uma cobrança — pagamento sempre bem-sucedido, sem dinheiro nenhum. Falhar no boot, com teste. **É controle de segurança, não conveniência.**
-- **Shutdown gracioso:** `disconnectDatabase()` em `SIGTERM`/`SIGINT`. Hoje cada respawn do `ts-node-dev` pode deixar conexão pendurada.
-- **`PAYMENT_PROVIDER` e `PAYMENT_WEBHOOK_SECRET`** no config, com valor **vazio** no `.env.example` (nunca um segredo que funcione).
-- **Reintroduzir `getPrisma`** no mesmo commit do primeiro consumidor — removido por não ter uso.
-
-
 ### Procedimento — verificacao de ciclo de vida
 - **Verificacao de ciclo de vida exige binario compilado, porta livre e liveness.** Teste unitario com dependencia injetada nao cobre a FIACAO no ponto de entrada. Duas tentativas no Bloco 3a foram invalidadas: `npx`/`npm run dev` sao wrappers e o `kill` atinge o wrapper, nao o processo; e um orfao de execucao anterior na mesma porta faz o `curl` responder por outro processo. Procedimento: `npm run build` + `node dist/server.js`, conferir que a porta estava livre, checar liveness antes do `curl`, e so entao enviar o sinal.
 
@@ -72,17 +66,25 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 
 
 ### Bloco 6 — Reconciliação e expiração
+- **Recuperar chave de idempotencia presa em PROCESSING.** Quando `createCharge` falha de forma TRANSIENTE (timeout, 5xx), o dinheiro pode ter se movido — a resposta se perdeu, nao necessariamente o efeito. O servico deliberadamente NAO marca a chave como FAILED, porque isso liberaria nova tentativa com `attemptCount + 1` e chave de provedor nova, causando SEGUNDA COBRANCA. O custo: a chave fica presa em PROCESSING e o cliente nao consegue pagar aquele pedido ate a reconciliacao rodar. **O job deste bloco e obrigatorio para fechar o ciclo:** repetir `createCharge` com a chave DERIVADA (`paymentId:attemptCount`) devolve a cobranca original, e o desfecho pode ser gravado.
 - **Definir TTL e limite de tentativas da janela de retentativa.** O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
+
+
+### Bloco 8 — Bateria de testes
+- **Provar ROLLBACK de escrita parcial no `$transaction` de `persistirTentativa`.** O que já está provado: o duble de Prisma cobre ordem das operações e decisões, e a integração cobre os `CHECK`, o `@unique` de `orderId` e concorrência real. O que **não** está provado: que uma falha *depois* de uma escrita bem-sucedida dentro da mesma transação desfaz a anterior. No teste de concorrência a falha acontece no primeiro `create`, então não há escrita prévia para desfazer. Exige injetar falha no meio da transação — por exemplo forçar violação de `CHECK` no `paymentTransaction.create` após o `payment.update` de `attemptCount`, e conferir que o contador volta ao valor anterior.
+- **Cobrir o `getPrisma` sem `connectDatabase` prévio.** O caminho de erro existe e tem mensagem explícita, mas nenhum teste o exercita.
 
 
 ### Bloco 9 — Stripe e hardening
 - **Rodar a suíte de contrato (`payment-provider.contract.ts`) contra a Stripe.** É o que valida a abstração da porta.
 - **Sanitização de log**, rate limit no webhook, escopo PCI documentado.
+- **A mensagem de indisponibilidade do order descarta a causa real.** Observado no smoke do Bloco 3, com o order-service fora do ar, o corpo do 503 foi exatamente `{"code":"DEPENDENCIA_INDISPONIVEL","error":"order-service indisponivel: TypeError"}`. O `order.client.ts` reporta `erro.name`, e falha de `fetch` no Node é sempre `TypeError: fetch failed` — a causa (`ECONNREFUSED`, `ENOTFOUND`, DNS) está em `erro.cause` e é descartada. São dois defeitos no mesmo ponto: **diagnosticabilidade**, porque "TypeError" não orienta quem está de plantão; e **vazamento leve de topologia**, porque o nome interno `order-service` vai no corpo da resposta ao cliente. Correção: corpo genérico ao cliente, causa completa (`erro.cause.code`) no log do servidor. Não corrigido no Bloco 3 por decisão de escopo — o bloco estava verde e verificado, e o arquivo é do 3b com testes próprios.
 
 
 ### Bloco 10 — Fechamento
 - **Finalizar o README do payment-service e revisar o README da raiz.** Ambos foram *criados/marcados* no PR de manutenção pré-Bloco 3, com o estado daquele momento. O que falta e a revisão final: descrever os endpoints, o fluxo completo e trocar o marcador 🟡 por ✅ quando a fase fechar.
 - **PDF de revisão da fase** em `docs/phase-reviews/phase-05.pdf`.
+- **Avaliar subir `lib` para `es2022` no tsconfig do payment-service.** Hoje `Array.prototype.at` não compila, e o teste teve de usar aritmética de índice. O Node 22 suporta. Mudança de configuração que afeta todo o serviço e pode revelar outros erros — não entra em PR de feature para não misturar escopo.
 
 
 
