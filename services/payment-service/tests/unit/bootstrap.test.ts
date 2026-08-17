@@ -50,6 +50,18 @@ describe('bootstrap', () => {
     expect(deps.connectDatabase).toHaveBeenCalledWith(CONFIG.databaseUrl);
   });
 
+  it('passa ao createApp a configuracao validada', async () => {
+    const ordem: string[] = [];
+    const { deps } = montarDeps(ordem);
+
+    await bootstrap(deps);
+
+    // Sem esta assercao, esquecer de repassar a config compilaria: em
+    // TypeScript uma funcao com MENOS parametros e atribuivel a um tipo que
+    // espera mais. O typecheck nao cobre este erro; o teste cobre.
+    expect(deps.createApp).toHaveBeenCalledWith(CONFIG);
+  });
+
   it('NAO abre a porta quando a configuracao e invalida', async () => {
     const ordem: string[] = [];
     const { deps, listen } = montarDeps(ordem, {

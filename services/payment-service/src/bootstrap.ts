@@ -8,7 +8,7 @@ import type { AppConfig } from './config/env';
 export interface BootstrapDeps {
   loadConfig: () => AppConfig;
   connectDatabase: (databaseUrl: string) => Promise<unknown>;
-  createApp: () => { listen(port: number, callback?: () => void): Server };
+  createApp: (config: AppConfig) => { listen(port: number, callback?: () => void): Server };
 }
 
 /**
@@ -21,7 +21,9 @@ export async function bootstrap(deps: BootstrapDeps): Promise<Server> {
 
   await deps.connectDatabase(config.databaseUrl);
 
-  const app = deps.createApp();
+  // A config e passada adiante: o composition root precisa dela para montar
+  // provedor, cliente do order e servico.
+  const app = deps.createApp(config);
 
   return app.listen(config.port, () => {
     console.log(`[payment-service] ouvindo na porta ${config.port}`);
