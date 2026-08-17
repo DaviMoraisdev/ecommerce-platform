@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { AppConfig } from '../../../src/config/env';
+import { configDeTeste } from '../../helpers/config';
 import { criarPaymentProvider, ProviderNaoImplementadoError } from '../../../src/providers/factory';
 import { FakeProvider } from '../../../src/providers/fake/fake.provider';
 import { FAKE_TOKENS } from '../../../src/providers/fake/fake.tokens';
@@ -10,16 +11,7 @@ const SEGREDO_A = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666';
 const SEGREDO_B = '6666ffff5555eeee4444dddd3333cccc2222bbbb1111aaaa';
 
 function config(overrides: Partial<AppConfig> = {}): AppConfig {
-  return {
-    port: 3007,
-    databaseUrl: 'postgresql://u:p@127.0.0.1:5432/payment_db',
-    defaultCurrency: 'BRL',
-    nodeEnv: 'test',
-    provider: 'fake',
-    webhookSecret: SEGREDO_A,
-    jwtSecret: SEGREDO_A,
-    ...overrides,
-  };
+  return configDeTeste({ webhookSecret: SEGREDO_A, jwtSecret: SEGREDO_A, ...overrides });
 }
 
 function entradaDeCobranca() {
