@@ -230,7 +230,10 @@ describe('criarPagamento contra Postgres — falha transiente deixa rastro recup
 });
 
 describe('criarPagamento contra Postgres — falha deterministica', () => {
-  it('marca transacao e chave como FAILED e permite nova chave', async () => {
+  // O nome anterior deste teste era 'permite nova chave' e ele NUNCA tentava uma
+  // nova chave — prometia mais do que verificava. Levantado no segundo review do
+  // PR #52, e foi por essa lacuna que a regressao do 4.1 passou.
+  it('marca transacao, chave E PAGAMENTO como FAILED', async () => {
     const { service, input, orderId } = cenario(FAKE_TOKENS.ERROR_INVALID);
 
     await expect(service.criarPagamento(input)).rejects.toMatchObject({
@@ -247,6 +250,51 @@ describe('criarPagamento contra Postgres — falha deterministica', () => {
       where: { key: input.idempotencyKey },
     });
     expect(registro.status).toBe('FAILED');
+
+    // O CAS moveu o Payment para PROCESSING antes de chamar o provedor. Numa
+    // falha DETERMINISTICA — o provedor recusou a requisicao sem tocar em
+    // dinheiro — ele tem de voltar para FAILED, senao o pedido fica travado.
+    expect(payment.status).toBe(PaymentStatus.FAILED);
+  });
+
+  it('permite de fato uma nova tentativa completa depois da falha deterministica', async () => {
+    const { service, input, orderId, userId } = cenario(FAKE_TOKENS.ERROR_INVALID);
+
+    await expect(service.criarPagamento(input)).rejects.toMatchObject({
+      code: 'REQUISICAO_INVALIDA',
+    });
+
+    // A prova que faltava: cobrar de verdade com chave e token novos.
+    const servicoQueFunciona = new PaymentService({
+      prisma,
+      orderClient: orderClientFalso(
+        jest.fn(async () => pedidoDeTeste({ id: orderId, userId })),
+      ),
+      provider: new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK }),
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+
+    const segunda = await servicoQueFunciona.criarPagamento({
+      ...input,
+      idempotencyKey: randomUUID(),
+      paymentMethodToken: FAKE_TOKENS.SUCCESS,
+    });
+
+    expect(segunda.status).toBe(PaymentStatus.CAPTURED);
+    expect(segunda.attemptCount).toBe(2);
+    expect(await prisma.payment.count({ where: { orderId } })).toBe(1);
+  });
+
+  it('tambem devolve o pagamento a FAILED quando a credencial do provedor e invalida', async () => {
+    const { service, input, orderId } = cenario(FAKE_TOKENS.ERROR_AUTHENTICATION);
+
+    await expect(service.criarPagamento(input)).rejects.toMatchObject({
+      code: 'DEPENDENCIA_INDISPONIVEL',
+    });
+
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId } });
+    expect(payment.status).toBe(PaymentStatus.FAILED);
   });
 });
 
@@ -317,9 +365,10 @@ describe('review 4.1 — retentativas concorrentes sobre Payment existente', () 
 
     const chaves = espiaoCharge.mock.calls.map((c) => c[0].idempotencyKey);
 
-    // NO HEAD ATUAL isto falha: ambas passam por assertNovaTentativaPermitida
-    // (PENDING e aceito), incrementam para 2 e 3, e o provedor recebe DUAS
-    // chaves distintas — duas cobrancas para o mesmo pedido.
+    // REGRESSAO do achado 4.1. Antes do compare-and-swap, ambas passavam por
+    // assertNovaTentativaPermitida (PENDING era aceito), incrementavam para 2 e
+    // 3, e o provedor recebia DUAS chaves distintas: duas cobrancas para o mesmo
+    // pedido. Medido na epoca como ["<id>:2", "<id>:3"].
     expect(chaves).toHaveLength(1);
     expect(espiaoCharge).toHaveBeenCalledTimes(1);
 
@@ -337,9 +386,9 @@ describe('review 4.1 — retentativas concorrentes sobre Payment existente', () 
       code: 'DEPENDENCIA_INDISPONIVEL',
     });
 
-    // Com o Payment preso em PROCESSING, uma chave NOVA nao pode abrir uma
-    // segunda cobranca enquanto a primeira esta ambigua. No head atual o
-    // Payment fica PENDING e a nova tentativa passa.
+    // REGRESSAO do achado 4.1. Com o Payment preso em PROCESSING, uma chave
+    // NOVA nao pode abrir segunda cobranca enquanto a primeira esta ambigua.
+    // Antes da correcao o Payment ficava PENDING e a nova tentativa passava.
     await expect(
       service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
     ).rejects.toMatchObject({ code: 'TENTATIVA_EM_ANDAMENTO' });

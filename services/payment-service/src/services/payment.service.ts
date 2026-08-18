@@ -59,7 +59,26 @@ export interface PagamentoCriado {
   currency: string;
   attemptCount: number;
   declineCode?: string;
-  /** true quando a resposta veio de replay idempotente, sem novo efeito. */
+  /**
+   * true quando a resposta veio de replay idempotente, sem novo efeito.
+   *
+   * SEMANTICA DECLARADA (achado 4.3 do segundo review do PR #52): o replay
+   * devolve o ESTADO ATUAL do pagamento, nao uma copia congelada da primeira
+   * resposta.
+   *
+   * Consequencia assumida: uma chave cuja tentativa foi recusada passa a
+   * devolver CAPTURED se OUTRA chave concluir uma tentativa bem-sucedida no
+   * mesmo pedido. O `replay: true` continua indicando corretamente que esta
+   * chamada nao produziu efeito novo.
+   *
+   * A escolha e deliberada — "qual e o estado do meu pagamento?" e a pergunta
+   * que o cliente costuma estar fazendo ao repetir. A alternativa (congelar a
+   * resposta) esta registrada no TECH_DEBT como decisao em aberto, com o custo
+   * anotado: coluna de resposta serializada e politica de retencao.
+   *
+   * O que NAO e ambiguo, e ja esta garantido pelo requestFingerprint: a chave so
+   * pode ser reusada para a MESMA requisicao.
+   */
   replay: boolean;
 }
 
@@ -138,7 +157,7 @@ export class PaymentService {
         reference: { paymentId: payment.id, orderId: payment.orderId },
       });
     } catch (erro) {
-      await this.tratarFalhaDoProvedor(registroId, transactionId, erro);
+      await this.tratarFalhaDoProvedor(payment.id, registroId, transactionId, erro);
       throw this.traduzirErroDoProvedor(erro);
     }
 
@@ -232,6 +251,20 @@ export class PaymentService {
     try {
       return await this.deps.orderClient.buscarPedido(input.orderId, input.authorization);
     } catch (erro) {
+      // Achado 5.1 do segundo review: OrderIndisponivelError passou a carregar
+      // `motivo` (ECONNREFUSED, "timeout de 5000ms", "HTTP 503"), mas ninguem
+      // consumia o campo. O cliente deixou de receber o detalhe — correto — e o
+      // operador tambem, que era justamente o que a correcao queria preservar.
+      //
+      // Registra orderId e motivo. NAO registra o Authorization nem dados do
+      // usuario: log de fluxo financeiro e alvo de leitura ampla.
+      if (erro instanceof OrderIndisponivelError) {
+        console.error('[payment-service] order-service indisponivel', {
+          orderId: input.orderId,
+          motivo: erro.motivo,
+        });
+      }
+
       const traduzido = this.traduzirErroDoOrder(erro);
       await this.encerrarClaimPreEfeito(registroId, traduzido);
       throw traduzido;
@@ -517,13 +550,17 @@ export class PaymentService {
    *
    * DETERMINISTICA (token desconhecido, requisicao malformada, credencial
    * invalida) — o provedor recusou antes de mover dinheiro. Marcar FAILED e
-   * seguro e libera o cliente para corrigir e tentar de novo.
+   * seguro e libera o cliente para corrigir e tentar de novo. Os TRES estados
+   * mudam juntos: Payment, PaymentTransaction e IdempotencyRecord. Deixar o
+   * Payment em PROCESSING travaria o pedido, porque nenhuma chave nova passaria
+   * pelo CAS.
    *
    * A recuperacao do caso transiente e possivel porque a chave de idempotencia do
    * provedor e DERIVADA (`paymentId:attemptCount`), nao aleatoria: o job pode
    * repetir createCharge com a mesma chave e receber a cobranca ORIGINAL.
    */
   private async tratarFalhaDoProvedor(
+    paymentId: string,
     registroId: string,
     transactionId: string,
     erro: unknown,
@@ -552,6 +589,23 @@ export class PaymentService {
     // encontra a transacao PENDING sem providerRef.
     try {
       await this.deps.prisma.$transaction([
+        // DESFAZ a reivindicacao do CAS. Levantado no segundo review do PR #52:
+        // foi REGRESSAO introduzida pela correcao do achado 4.1.
+        //
+        // O CAS move o Payment para PROCESSING antes da chamada externa. Numa
+        // falha DETERMINISTICA o provedor recusou a requisicao sem tocar em
+        // dinheiro, entao o pedido tem de voltar a aceitar tentativa. Sem esta
+        // linha, uma chave nova encontrava PROCESSING e recebia
+        // TENTATIVA_EM_ANDAMENTO para sempre: pedido impagavel ate a
+        // reconciliacao do Bloco 6 — que sequer o encontraria, porque a
+        // transacao ja esta FAILED e nao PENDING.
+        //
+        // Na mesma $transaction que os outros dois updates, de proposito: os
+        // tres estados tem de mudar juntos ou nenhum.
+        this.deps.prisma.payment.update({
+          where: { id: paymentId },
+          data: { status: PaymentStatus.FAILED },
+        }),
         this.deps.prisma.paymentTransaction.update({
           where: { id: transactionId },
           data: { status: TransactionStatus.FAILED, failureCode: codigo },

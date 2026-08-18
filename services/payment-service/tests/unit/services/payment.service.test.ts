@@ -571,6 +571,15 @@ describe('criarPagamento — falha DETERMINISTICA do provedor', () => {
       }),
     );
     expect(chaveMarcadaFalhada(falso)).toBe(true);
+
+    // O CAS deixou o Payment em PROCESSING antes da chamada. Sem devolve-lo a
+    // FAILED, uma chave nova encontra PROCESSING e recebe TENTATIVA_EM_ANDAMENTO
+    // para sempre — o pedido fica impagavel ate a reconciliacao do Bloco 6.
+    expect(falso.payment.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: PaymentStatus.FAILED }),
+      }),
+    );
   });
 
   it('marca FAILED quando a credencial do provedor e invalida', async () => {
@@ -589,7 +598,11 @@ describe('criarPagamento — falha DETERMINISTICA do provedor', () => {
 });
 
 // ============================================================
-// ACHADOS DO REVIEW DO PR #52 — estes testes falham no head atual
+// REGRESSOES DOS ACHADOS DO REVIEW DO PR #52
+//
+// Cada um destes testes falhou antes da correcao correspondente e foi validado
+// por sabotagem depois dela. Nao descrevem defeito presente: descrevem defeito
+// que nao pode voltar.
 // ============================================================
 
 describe('review 4.2 — erro DESCONHECIDO do provedor deve ser AMBIGUO', () => {
@@ -648,6 +661,37 @@ describe('review 4.3 — valor capturado precisa casar com o autorizado', () => 
       ([arg]) => (arg as { data?: { status?: string } })?.data?.status === 'COMPLETED',
     );
     expect(concluiuAChave).toBe(false);
+  });
+});
+
+describe('review 5.1 — a causa da falha do order chega ao LOG, nao ao cliente', () => {
+  it('registra orderId e motivo no servidor, sem vazar nada na excecao', async () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { service } = montar({
+      buscarPedido: jest.fn(async () => {
+        throw new OrderIndisponivelError('ECONNREFUSED');
+      }),
+    });
+
+    const erro = await service.criarPagamento(entrada()).catch((e) => e);
+
+    // Para o operador: causa e pedido, para a investigacao comecar em algum
+    // lugar. O campo `motivo` era calculado e nunca consumido.
+    expect(spy).toHaveBeenCalledWith(
+      expect.stringContaining('order-service indisponivel'),
+      { orderId: 'ord_1', motivo: 'ECONNREFUSED' },
+    );
+
+    // Para o cliente: nem a causa, nem o nome do servico interno.
+    expect(erro.message).not.toContain('ECONNREFUSED');
+    expect(erro.message).not.toContain('order-service');
+
+    // E o log NAO pode carregar o token do usuario.
+    const tudoQueFoiLogado = JSON.stringify(spy.mock.calls);
+    expect(tudoQueFoiLogado).not.toContain('Bearer');
+    expect(tudoQueFoiLogado).not.toContain('token.do.usuario');
+
+    spy.mockRestore();
   });
 });
 
