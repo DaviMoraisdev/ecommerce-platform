@@ -28,6 +28,9 @@ const STATUS_POR_CODIGO: Record<CodigoDeErroDePagamento, number> = {
   PEDIDO_JA_PAGO: 409,
   TENTATIVA_EM_ANDAMENTO: 409,
   JANELA_EXPIRADA: 409,
+  // 422, nao 409: a requisicao e sintaticamente valida, mas conflita com o uso
+  // anterior daquela chave. 409 diria "o estado atual impede", que nao e o caso.
+  IDEMPOTENCIA_CONFLITANTE: 422,
   VALOR_DO_PEDIDO_INVALIDO: 422,
   DEPENDENCIA_INDISPONIVEL: 503,
 };

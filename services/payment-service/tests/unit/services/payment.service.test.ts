@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { PaymentStatus, TransactionStatus, TransactionType } from '@prisma/client';
 
 import { FakeProvider } from '../../../src/providers/fake/fake.provider';
@@ -14,6 +16,7 @@ import {
   OrderRespostaInvalidaError,
 } from '../../../src/clients/order.client';
 import { SEGREDO_WEBHOOK } from '../../helpers/config';
+import { providerStub } from '../../helpers/provider-stub';
 import {
   AGORA,
   chaveMarcadaFalhada,
@@ -169,12 +172,61 @@ describe('criarPagamento — posse do pedido', () => {
 // ============================================================
 
 describe('criarPagamento — idempotencia', () => {
+  /**
+   * DUPLICA a receita do fingerprint de proposito.
+   *
+   * Mesma razao da tabela de status duplicada no teste do controller: se alguem
+   * trocar o algoritmo em producao sem pensar, esta copia discorda e o teste
+   * quebra. Importar a funcao do servico concordaria com qualquer mudanca.
+   */
+  function fingerprintDe(orderId: string): string {
+    return createHash('sha256').update(`v1:${orderId}`).digest('hex');
+  }
+
   function comColisao(registro: Record<string, unknown> | null) {
     const falso = prismaFalso();
     falso.idempotencyRecord.create.mockRejectedValue(erroP2002());
-    falso.idempotencyRecord.findUnique.mockResolvedValue(registro);
+    // O registro existente precisa carregar o fingerprint da MESMA requisicao,
+    // senao todo teste de colisao cairia no ramo de conflito.
+    falso.idempotencyRecord.findUnique.mockResolvedValue(
+      registro === null ? null : { requestFingerprint: fingerprintDe('ord_1'), ...registro },
+    );
     return falso;
   }
+
+  it('review 4.4 — recusa a MESMA chave usada para outro pedido', async () => {
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      requestFingerprint: fingerprintDe('ord_OUTRO'),
+    });
+    const { service, espiaoCharge } = montar({ prisma: falso });
+
+    // Sem esta checagem o cliente recebia 200 com o pagamento do pedido ANTERIOR
+    // — silenciosamente, sem nenhum sinal de que a chave estava sendo reusada.
+    await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+      code: 'IDEMPOTENCIA_CONFLITANTE',
+      retryable: false,
+    });
+    expect(espiaoCharge).not.toHaveBeenCalled();
+  });
+
+  it('review 4.4 — o conflito e detectado ANTES do ramo de status', async () => {
+    // Registro em PROCESSING daria IDEMPOTENCIA_EM_ANDAMENTO; com fingerprint
+    // divergente, o conflito tem precedencia, porque a requisicao e outra.
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'PROCESSING',
+      paymentId: null,
+      requestFingerprint: fingerprintDe('ord_OUTRO'),
+    });
+    const { service } = montar({ prisma: falso });
+
+    await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+      code: 'IDEMPOTENCIA_CONFLITANTE',
+    });
+  });
 
   it('devolve replay sem novo efeito quando a chave ja foi COMPLETED', async () => {
     const falso = comColisao({ id: 'rec_1', status: 'COMPLETED', paymentId: 'pay_1' });
@@ -345,11 +397,37 @@ describe('criarPagamento — nova tentativa sobre Payment existente', () => {
     // Duas requisicoes para o mesmo pedido com chaves DIFERENTES passam as duas
     // checagens de idempotencia e colidem no @unique de orderId. Sem traducao,
     // o Prisma subia cru e o cliente recebia 500.
+    //
+    // retryable TRUE desde a correcao do achado 4.5: nada financeiro aconteceu,
+    // entao a claim e LIBERADA e repetir a mesma chave funciona de verdade.
+    // Antes era `false` porque a chave era queimada — a decisao estava presa a
+    // uma limitacao que deixou de existir.
     await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
       code: 'TENTATIVA_EM_ANDAMENTO',
-      retryable: false,
+      retryable: true,
     });
-    expect(chaveMarcadaFalhada(falso)).toBe(true);
+    expect(chaveMarcadaFalhada(falso)).toBe(false);
+    expect(falso.idempotencyRecord.delete).toHaveBeenCalled();
+  });
+
+  it('recusa como RETENTAVEL quando o compare-and-swap da tentativa PERDE', async () => {
+    const falso = prismaFalso();
+    falso.payment.findUnique.mockResolvedValue(
+      paymentDeTeste({ status: PaymentStatus.FAILED, attemptCount: 1 }),
+    );
+    // count 0 = outra requisicao reivindicou a tentativa entre o nosso findUnique
+    // e o nosso update. E o cenario do achado 4.1 visto de dentro.
+    falso.payment.updateMany.mockResolvedValue({ count: 0 });
+    const { service, espiaoCharge } = montar({ prisma: falso });
+
+    await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+      code: 'TENTATIVA_EM_ANDAMENTO',
+      retryable: true,
+    });
+
+    // O provedor NAO pode ser chamado: e exatamente a segunda cobranca que o CAS
+    // existe para impedir.
+    expect(espiaoCharge).not.toHaveBeenCalled();
   });
 
   it('recusa quando o total do pedido mudou entre tentativas', async () => {
@@ -511,35 +589,150 @@ describe('criarPagamento — falha DETERMINISTICA do provedor', () => {
 });
 
 // ============================================================
+// ACHADOS DO REVIEW DO PR #52 — estes testes falham no head atual
+// ============================================================
+
+describe('review 4.2 — erro DESCONHECIDO do provedor deve ser AMBIGUO', () => {
+  it('NAO marca nada como falhado quando o erro nao e classificado', async () => {
+    const falso = prismaFalso();
+    const service = new PaymentService({
+      prisma: comoPrisma(falso),
+      orderClient: orderClientFalso(jest.fn(async () => pedidoDeTeste())),
+      // Error generico: pode ter sido lancado DEPOIS de o provedor receber a
+      // cobranca (bug no adapter, falha ao desserializar a resposta). O dinheiro
+      // pode ter se movido.
+      provider: providerStub(async () => {
+        throw new Error('falha inesperada no adapter');
+      }),
+      currency: 'BRL',
+      windowMinutes: 15,
+      now: () => AGORA,
+    });
+
+    await expect(service.criarPagamento(entrada())).rejects.toThrow(
+      'falha inesperada no adapter',
+    );
+
+    // Fail-closed exige ALLOWLIST: so classes comprovadamente anteriores ao
+    // efeito financeiro liberam nova tentativa. Hoje o codigo usa denylist
+    // (so retryable e ambiguo), entao desconhecido vira FAILED e abre caminho
+    // para SEGUNDA COBRANCA.
+    expect(falso.paymentTransaction.update).not.toHaveBeenCalled();
+    expect(chaveMarcadaFalhada(falso)).toBe(false);
+  });
+});
+
+describe('review 4.3 — valor capturado precisa casar com o autorizado', () => {
+  it('NAO conclui a chave quando o provedor captura valor diferente do cobrado', async () => {
+    const falso = prismaFalso();
+    const service = new PaymentService({
+      prisma: comoPrisma(falso),
+      orderClient: orderClientFalso(jest.fn(async () => pedidoDeTeste())),
+      provider: providerStub(async () => ({
+        state: 'SUCCEEDED',
+        providerRef: 'ch_stub_1',
+        capturedAmountCents: 9990, // pedido vale 12990
+        refundedAmountCents: 0,
+      }) as never),
+      currency: 'BRL',
+      windowMinutes: 15,
+      now: () => AGORA,
+    });
+
+    // O CHECK payment_captured_dentro_do_total barra captura ACIMA do total.
+    // Captura PARCIAL passa pelo banco: o pagamento viraria CAPTURED com menos
+    // dinheiro do que o pedido, silenciosamente.
+    await expect(service.criarPagamento(entrada())).rejects.toBeDefined();
+
+    const concluiuAChave = falso.idempotencyRecord.update.mock.calls.some(
+      ([arg]) => (arg as { data?: { status?: string } })?.data?.status === 'COMPLETED',
+    );
+    expect(concluiuAChave).toBe(false);
+  });
+});
+
+describe('review 4.5 — falha RETENTAVEL do order nao pode queimar a chave', () => {
+  it('libera a claim em vez de marcar FAILED quando o order esta indisponivel', async () => {
+    const { service, falso } = montar({
+      buscarPedido: jest.fn(async () => {
+        throw new OrderIndisponivelError('HTTP 503');
+      }),
+    });
+
+    await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+      code: 'DEPENDENCIA_INDISPONIVEL',
+      retryable: true,
+    });
+
+    // Contradicao de contrato: o controller manda Retry-After, mas repetir a
+    // MESMA chave encontra FAILED e devolve IDEMPOTENCIA_JA_FALHOU. Nada
+    // financeiro aconteceu, entao a claim deve ser LIBERADA.
+    expect(chaveMarcadaFalhada(falso)).toBe(false);
+    expect(falso.idempotencyRecord.delete).toHaveBeenCalledWith({
+      where: { id: 'rec_1' },
+    });
+  });
+
+  it('CONTINUA queimando a chave quando a falha do order e definitiva', async () => {
+    const { service, falso } = montar({
+      buscarPedido: jest.fn(async () => {
+        throw new OrderNaoEncontradoError();
+      }),
+    });
+
+    await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+      code: 'PEDIDO_NAO_ENCONTRADO',
+    });
+
+    // Repetir a mesma requisicao nunca vai funcionar: queimar e correto.
+    expect(chaveMarcadaFalhada(falso)).toBe(true);
+  });
+});
+
+// ============================================================
 // Traducao dos erros do order-service
 // ============================================================
 
 describe('criarPagamento — traducao de erro do order', () => {
   // Rotulo, codigo e retryable ANTES do erro: os %s do titulo consomem os
   // argumentos em ordem, e com o Error no meio o titulo sai ilegivel.
-  const CASOS: Array<[string, string, boolean, Error]> = [
-    ['nao encontrado', 'PEDIDO_NAO_ENCONTRADO', false, new OrderNaoEncontradoError()],
-    ['nao autorizado', 'NAO_AUTORIZADO', false, new OrderNaoAutorizadoError()],
-    ['indisponivel', 'DEPENDENCIA_INDISPONIVEL', true, new OrderIndisponivelError('HTTP 503')],
+  // O destino da claim passou a depender da CLASSE da falha (achado 4.5):
+  // retentavel libera, definitiva queima. A tabela precisa expressar isso, senao
+  // volta a afirmar comportamento uniforme que nao existe mais.
+  const CASOS: Array<[string, string, boolean, 'liberada' | 'queimada', Error]> = [
+    ['nao encontrado', 'PEDIDO_NAO_ENCONTRADO', false, 'queimada', new OrderNaoEncontradoError()],
+    ['nao autorizado', 'NAO_AUTORIZADO', false, 'queimada', new OrderNaoAutorizadoError()],
+    ['indisponivel', 'DEPENDENCIA_INDISPONIVEL', true, 'liberada', new OrderIndisponivelError('HTTP 503')],
     [
       'resposta invalida',
       'DEPENDENCIA_INDISPONIVEL',
       false,
+      'queimada',
       new OrderRespostaInvalidaError('corpo nao e JSON valido'),
     ],
   ];
 
-  it.each(CASOS)('%s -> %s (retryable=%s)', async (_rotulo, code, retryable, erroDoOrder) => {
-    const { service, falso } = montar({
-      buscarPedido: jest.fn(async () => {
-        throw erroDoOrder;
-      }),
-    });
+  it.each(CASOS)(
+    '%s -> %s (retryable=%s, claim %s)',
+    async (_rotulo, code, retryable, destinoDaClaim, erroDoOrder) => {
+      const { service, falso } = montar({
+        buscarPedido: jest.fn(async () => {
+          throw erroDoOrder;
+        }),
+      });
 
-    await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
-      code,
-      retryable,
-    });
-    expect(chaveMarcadaFalhada(falso)).toBe(true);
-  });
+      await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+        code,
+        retryable,
+      });
+
+      if (destinoDaClaim === 'liberada') {
+        expect(falso.idempotencyRecord.delete).toHaveBeenCalled();
+        expect(chaveMarcadaFalhada(falso)).toBe(false);
+      } else {
+        expect(chaveMarcadaFalhada(falso)).toBe(true);
+        expect(falso.idempotencyRecord.delete).not.toHaveBeenCalled();
+      }
+    },
+  );
 });

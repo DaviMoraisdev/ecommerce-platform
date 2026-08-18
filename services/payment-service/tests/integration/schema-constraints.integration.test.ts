@@ -45,6 +45,13 @@ function webhookValido(
   };
 }
 
+/**
+ * Estes testes verificam CONSTRAINTS, nao a receita do fingerprint. Valor fixo
+ * deixa explicito que o campo nao e o objeto do teste — a receita real
+ * (sha256 de "v1:<orderId>") e verificada no teste do servico.
+ */
+const FINGERPRINT_DE_TESTE = 'fp_de_teste';
+
 function outboxValido(
   overrides: Partial<Prisma.OutboxEventCreateInput> = {},
 ): Prisma.OutboxEventCreateInput {
@@ -312,7 +319,7 @@ describe('outbox_events', () => {
 describe('idempotency_records', () => {
   it('CLAIM-FIRST: aceita reserva de chave sem pagamento associado', async () => {
     const criado = await prisma.idempotencyRecord.create({
-      data: { userId: randomUUID(), key: randomUUID() },
+      data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID() },
     });
 
     expect(criado.paymentId).toBeNull();
@@ -322,20 +329,20 @@ describe('idempotency_records', () => {
   it('recusa a mesma chave para o mesmo usuario', async () => {
     const userId = randomUUID();
     const key = randomUUID();
-    await prisma.idempotencyRecord.create({ data: { userId, key } });
+    await prisma.idempotencyRecord.create({ data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId, key } });
 
     const erro = await capturarViolacao(() =>
-      prisma.idempotencyRecord.create({ data: { userId, key } }),
+      prisma.idempotencyRecord.create({ data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId, key } }),
     );
     expect(erro.message).toMatch(/userId|key|unique/i);
   });
 
   it('permite a mesma chave para usuarios diferentes', async () => {
     const key = randomUUID();
-    await prisma.idempotencyRecord.create({ data: { userId: randomUUID(), key } });
+    await prisma.idempotencyRecord.create({ data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key } });
 
     const outro = await prisma.idempotencyRecord.create({
-      data: { userId: randomUUID(), key },
+      data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key },
     });
     expect(outro.key).toBe(key);
   });
@@ -344,7 +351,7 @@ describe('idempotency_records', () => {
     'aceita %s sem paymentId',
     async (status) => {
       const criado = await prisma.idempotencyRecord.create({
-        data: { userId: randomUUID(), key: randomUUID(), status },
+        data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID(), status },
       });
       expect(criado.paymentId).toBeNull();
     },
@@ -353,7 +360,7 @@ describe('idempotency_records', () => {
   it('recusa COMPLETED sem paymentId na criacao', async () => {
     const erro = await capturarViolacao(() =>
       prisma.idempotencyRecord.create({
-        data: { userId: randomUUID(), key: randomUUID(), status: 'COMPLETED' },
+        data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID(), status: 'COMPLETED' },
       }),
     );
     expect(erro.message).toContain('idempotency_completed_exige_pagamento');
@@ -361,7 +368,7 @@ describe('idempotency_records', () => {
 
   it('recusa transicao para COMPLETED deixando paymentId nulo', async () => {
     const registro = await prisma.idempotencyRecord.create({
-      data: { userId: randomUUID(), key: randomUUID() },
+      data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID() },
     });
 
     const erro = await capturarViolacao(() =>
@@ -377,7 +384,7 @@ describe('idempotency_records', () => {
     const pagamento = await prisma.payment.create({ data: pagamentoValido() });
 
     const registro = await prisma.idempotencyRecord.create({
-      data: { userId: randomUUID(), key: randomUUID() },
+      data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID() },
     });
 
     const concluido = await prisma.idempotencyRecord.update({
@@ -392,7 +399,7 @@ describe('idempotency_records', () => {
   it('recusa paymentId que nao existe (integridade referencial)', async () => {
     const erro = await capturarViolacao(() =>
       prisma.idempotencyRecord.create({
-        data: { userId: randomUUID(), key: randomUUID(), paymentId: randomUUID() },
+        data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID(), paymentId: randomUUID() },
       }),
     );
     expect(erro).toBeInstanceOf(Prisma.PrismaClientKnownRequestError);
@@ -434,7 +441,7 @@ describe('regras estruturais', () => {
   it('recusa apagar pagamento referenciado por registro de idempotencia', async () => {
     const pagamento = await prisma.payment.create({ data: pagamentoValido() });
     await prisma.idempotencyRecord.create({
-      data: { userId: randomUUID(), key: randomUUID(), paymentId: pagamento.id },
+      data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID(), paymentId: pagamento.id },
     });
 
     const erro = await capturarViolacao(() =>

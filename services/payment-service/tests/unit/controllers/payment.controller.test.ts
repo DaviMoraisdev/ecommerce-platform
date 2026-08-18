@@ -169,6 +169,7 @@ describe('POST /payments — mapeamento de erro de dominio para HTTP', () => {
     ['PEDIDO_JA_PAGO', 409],
     ['TENTATIVA_EM_ANDAMENTO', 409],
     ['JANELA_EXPIRADA', 409],
+    ['IDEMPOTENCIA_CONFLITANTE', 422],
     ['VALOR_DO_PEDIDO_INVALIDO', 422],
     ['DEPENDENCIA_INDISPONIVEL', 503],
   ];

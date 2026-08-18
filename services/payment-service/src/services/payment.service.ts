@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import {
   PaymentStatus,
   Prisma,
@@ -15,7 +17,7 @@ import {
   OrderRespostaInvalidaError,
   type PedidoDoOrder,
 } from '../clients/order.client';
-import { erroDeDominio } from '../domain/errors';
+import { erroDeDominio, PaymentDomainError } from '../domain/errors';
 import type { Currency } from '../domain/money';
 import {
   PedidoNaoCobravelError,
@@ -153,7 +155,11 @@ export class PaymentService {
   ): Promise<{ registroId: string } | { replay: PagamentoCriado }> {
     try {
       const registro = await this.deps.prisma.idempotencyRecord.create({
-        data: { userId: input.userId, key: input.idempotencyKey },
+        data: {
+          userId: input.userId,
+          key: input.idempotencyKey,
+          requestFingerprint: this.fingerprintDaRequisicao(input),
+        },
       });
       return { registroId: registro.id };
     } catch (erro) {
@@ -171,6 +177,18 @@ export class PaymentService {
         'IDEMPOTENCIA_EM_ANDAMENTO',
         'Requisicao concorrente com a mesma chave; repita',
         true,
+      );
+    }
+
+    // Achado 4.4 do review: a chave so pode ser reusada para a MESMA requisicao.
+    // Sem esta comparacao, reutilizar a chave com outro orderId devolvia
+    // silenciosamente o pagamento anterior — o cliente recebia 200 e o pagamento
+    // do pedido errado. Vem ANTES dos ramos de status porque vale para qualquer
+    // um deles.
+    if (existente.requestFingerprint !== this.fingerprintDaRequisicao(input)) {
+      throw erroDeDominio(
+        'IDEMPOTENCIA_CONFLITANTE',
+        'Esta Idempotency-Key ja foi usada com outra requisicao; use uma nova chave',
       );
     }
 
@@ -214,8 +232,9 @@ export class PaymentService {
     try {
       return await this.deps.orderClient.buscarPedido(input.orderId, input.authorization);
     } catch (erro) {
-      await this.marcarChaveFalhada(registroId);
-      throw this.traduzirErroDoOrder(erro);
+      const traduzido = this.traduzirErroDoOrder(erro);
+      await this.encerrarClaimPreEfeito(registroId, traduzido);
+      throw traduzido;
     }
   }
 
@@ -223,16 +242,16 @@ export class PaymentService {
     try {
       return resolverValorDoPedido(pedido);
     } catch (erro) {
+      const traduzido =
+        erro instanceof PedidoNaoCobravelError
+          ? erroDeDominio('PEDIDO_NAO_COBRAVEL', erro.message)
+          : erro instanceof ValorDoPedidoInvalidoError
+            ? erroDeDominio('VALOR_DO_PEDIDO_INVALIDO', erro.message)
+            : erro;
       // await, nao `void`: promessa solta pode nao completar antes do erro subir,
       // e a chave ficaria PROCESSING para sempre.
-      await this.marcarChaveFalhada(registroId);
-      if (erro instanceof PedidoNaoCobravelError) {
-        throw erroDeDominio('PEDIDO_NAO_COBRAVEL', erro.message);
-      }
-      if (erro instanceof ValorDoPedidoInvalidoError) {
-        throw erroDeDominio('VALOR_DO_PEDIDO_INVALIDO', erro.message);
-      }
-      throw erro;
+      await this.encerrarClaimPreEfeito(registroId, traduzido);
+      throw traduzido;
     }
   }
 
@@ -266,6 +285,10 @@ export class PaymentService {
               provider: this.deps.provider.name,
               expiresAt,
               attemptCount: 1,
+              // PROCESSING desde a criacao, nao PENDING: vamos chamar o provedor
+              // em seguida, e o estado tem de refletir "tentativa em voo" ANTES
+              // do efeito externo. Nascer PENDING abria a janela do achado 4.1.
+              status: PaymentStatus.PROCESSING,
             },
           });
         } else {
@@ -280,10 +303,40 @@ export class PaymentService {
             );
           }
 
-          payment = await tx.payment.update({
-            where: { id: existente.id },
-            data: { attemptCount: { increment: 1 } },
+          // COMPARE-AND-SWAP. O assert acima existe para dar MENSAGEM boa; a
+          // corretude vem daqui.
+          //
+          // Achado 4.1 do review do PR #52: sem isto, duas requisicoes com
+          // chaves diferentes sobre um Payment em PENDING passavam as duas pelo
+          // assert, incrementavam para 2 e 3, e o provedor recebia DUAS chaves
+          // derivadas distintas — duas cobrancas para o mesmo pedido. Medido:
+          // ["<id>:2", "<id>:3"].
+          //
+          // O WHERE inclui status E attemptCount. Em READ COMMITTED, a segunda
+          // transacao bloqueia no lock da linha e reavalia o predicado depois do
+          // commit da primeira; encontrando PROCESSING e o contador ja movido,
+          // afeta ZERO linhas.
+          const claim = await tx.payment.updateMany({
+            where: {
+              id: existente.id,
+              status: { in: [PaymentStatus.PENDING, PaymentStatus.FAILED] },
+              attemptCount: existente.attemptCount,
+            },
+            data: {
+              status: PaymentStatus.PROCESSING,
+              attemptCount: { increment: 1 },
+            },
           });
+
+          if (claim.count !== 1) {
+            throw erroDeDominio(
+              'TENTATIVA_EM_ANDAMENTO',
+              'Outra tentativa para este pedido foi reivindicada em paralelo',
+              true,
+            );
+          }
+
+          payment = await tx.payment.findUniqueOrThrow({ where: { id: existente.id } });
         }
 
         const transacao = await tx.paymentTransaction.create({
@@ -305,8 +358,6 @@ export class PaymentService {
         return { payment, transactionId: transacao.id };
       });
     } catch (erro) {
-      await this.marcarChaveFalhada(registroId);
-
       // P2002 AQUI so pode vir de Payment.orderId: e a unica chave unica escrita
       // nesta transacao (paymentTransaction nao tem unique, e o
       // idempotencyRecord e atualizado por id).
@@ -320,14 +371,16 @@ export class PaymentService {
       // retryable FALSE de proposito: a chave acabou de ser marcada FAILED, entao
       // repetir a MESMA requisicao daria IDEMPOTENCIA_JA_FALHOU. O cliente precisa
       // de uma Idempotency-Key nova, e a mensagem diz isso.
-      if (this.ehViolacaoDeUnique(erro)) {
-        throw erroDeDominio(
-          'TENTATIVA_EM_ANDAMENTO',
-          'Outra tentativa de pagamento para este pedido foi criada em paralelo; repita com uma nova Idempotency-Key',
-        );
-      }
+      const traduzido = this.ehViolacaoDeUnique(erro)
+        ? erroDeDominio(
+            'TENTATIVA_EM_ANDAMENTO',
+            'Outra tentativa para este pedido foi criada em paralelo; repita',
+            true,
+          )
+        : erro;
 
-      throw erro;
+      await this.encerrarClaimPreEfeito(registroId, traduzido);
+      throw traduzido;
     }
   }
 
@@ -367,6 +420,8 @@ export class PaymentService {
     const novoStatus = mapearEstadoDoProvedor(resultado.state);
     assertTransicao(payment.status, novoStatus);
 
+    this.assertValoresCoerentes(payment, resultado);
+
     const declineCode = resultado.state === 'DECLINED' ? resultado.declineCode : undefined;
 
     const atualizado = await this.deps.prisma.$transaction(async (tx) => {
@@ -374,6 +429,12 @@ export class PaymentService {
         where: { id: transactionId },
         data: {
           providerRef: resultado.providerRef,
+          // Achado 4.6 do review NAO se aplica aqui, e o compilador prova:
+          // `resultado.state === 'CANCELED'` nao compila, porque ChargeResult
+          // (retorno de createCharge) so admite SUCCEEDED, PROCESSING e DECLINED.
+          // CANCELED existe em ChargeState, que e o conjunto largo usado por
+          // getCharge e por webhook — e la a incoerencia apontada e REAL.
+          // Registrado como criterio herdado dos Blocos 4 e 6.
           status:
             resultado.state === 'SUCCEEDED'
               ? TransactionStatus.SUCCEEDED
@@ -467,10 +528,25 @@ export class PaymentService {
     transactionId: string,
     erro: unknown,
   ): Promise<void> {
-    const transiente = erro instanceof PaymentProviderError && erro.retryable;
-    if (transiente) return;
+    // ALLOWLIST, nao denylist. Achado 4.2 do review do PR #52.
+    //
+    // Antes: `erro instanceof PaymentProviderError && erro.retryable` decidia o
+    // que era ambiguo. Consequencia: um Error GENERICO — bug no adapter, falha ao
+    // desserializar a resposta, qualquer coisa lancada DEPOIS de o provedor ter
+    // recebido a cobranca — caia no ramo "deterministico" e era marcado FAILED,
+    // liberando nova tentativa com chave de provedor nova: SEGUNDA COBRANCA.
+    //
+    // Agora so estas duas classes liberam nova tentativa, porque em ambas o
+    // provedor recusou a REQUISICAO antes de tocar em dinheiro. Qualquer outro
+    // erro, conhecido ou nao, e tratado como financeiramente ambiguo.
+    const seguro =
+      erro instanceof PaymentProviderError &&
+      (erro.name === 'ProviderInvalidRequestError' ||
+        erro.name === 'ProviderAuthenticationError');
 
-    const codigo = erro instanceof PaymentProviderError ? erro.name : 'ERRO_DESCONHECIDO';
+    if (!seguro) return;
+
+    const codigo = (erro as PaymentProviderError).name;
 
     // Best effort: se a gravacao da falha tambem falhar, o job do Bloco 6 ainda
     // encontra a transacao PENDING sem providerRef.
@@ -485,8 +561,83 @@ export class PaymentService {
           data: { status: 'FAILED' },
         }),
       ]);
-    } catch {
-      // Silencio deliberado: o erro original e mais informativo que este.
+    } catch (secundario) {
+      // O erro ORIGINAL continua subindo — e mais informativo para o cliente.
+      // Mas a falha secundaria precisa deixar evidencia: sem ela, uma transacao
+      // presa em PENDING nao tem nenhum sinal de por que ficou assim.
+      console.error('[payment-service] falha ao gravar desfecho de erro do provedor', {
+        registroId,
+        transactionId,
+        causa: secundario instanceof Error ? secundario.message : String(secundario),
+      });
+    }
+  }
+
+  /**
+   * Valores devolvidos pelo provedor tem de ser coerentes com o autorizado.
+   *
+   * Achado 4.3 do review. O CHECK `payment_captured_dentro_do_total` barra
+   * captura ACIMA do total, mas captura PARCIAL passa pelo banco: o pagamento
+   * viraria CAPTURED com menos dinheiro do que o pedido, sem ninguem notar.
+   *
+   * Lancar aqui e ANTES de qualquer escrita, entao a transacao permanece PENDING
+   * sem providerRef e a chave permanece PROCESSING — o mesmo rastro que o job do
+   * Bloco 6 procura. O providerRef vai para o log para que a investigacao tenha
+   * onde comecar.
+   */
+  private assertValoresCoerentes(
+    payment: Payment,
+    resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
+  ): void {
+    const capturado = resultado.capturedAmountCents;
+    const esperado = resultado.state === 'SUCCEEDED' ? payment.amountCents : 0;
+
+    if (capturado === esperado) return;
+
+    console.error('[payment-service] provedor devolveu valores incoerentes', {
+      paymentId: payment.id,
+      state: resultado.state,
+      esperado,
+      recebido: capturado,
+    });
+
+    throw erroDeDominio(
+      'DEPENDENCIA_INDISPONIVEL',
+      'Provedor devolveu valor capturado incoerente com o autorizado',
+      false,
+    );
+  }
+
+  /**
+   * Encerra a claim de uma falha ANTERIOR ao efeito financeiro.
+   *
+   * Achado 4.5 do review: antes, QUALQUER falha pre-efeito queimava a chave. Com
+   * o order-service fora do ar isso produzia contradicao de contrato — o
+   * controller mandava `Retry-After`, e repetir a mesma chave batia em
+   * IDEMPOTENCIA_JA_FALHOU. Nada financeiro aconteceu, entao a chave e LIBERADA
+   * e a repeticao funciona de verdade.
+   *
+   * Falha definitiva continua queimando: repetir a mesma requisicao nunca vai
+   * funcionar, e liberar so gastaria carga do servico.
+   */
+  private async encerrarClaimPreEfeito(registroId: string, erro: unknown): Promise<void> {
+    if (erro instanceof PaymentDomainError && erro.retryable) {
+      await this.liberarChave(registroId);
+      return;
+    }
+    await this.marcarChaveFalhada(registroId);
+  }
+
+  private async liberarChave(registroId: string): Promise<void> {
+    try {
+      await this.deps.prisma.idempotencyRecord.delete({ where: { id: registroId } });
+    } catch (erro) {
+      // Achado 5.1: catch vazio deixava registro preso sem NENHUMA evidencia
+      // operacional. Em fluxo financeiro isso inviabiliza reconciliacao.
+      console.error('[payment-service] falha ao liberar claim de idempotencia', {
+        registroId,
+        causa: erro instanceof Error ? erro.message : String(erro),
+      });
     }
   }
 
@@ -496,9 +647,29 @@ export class PaymentService {
         where: { id: registroId },
         data: { status: 'FAILED' },
       });
-    } catch {
-      // idem
+    } catch (erro) {
+      console.error('[payment-service] falha ao marcar claim como FAILED', {
+        registroId,
+        causa: erro instanceof Error ? erro.message : String(erro),
+      });
     }
+  }
+
+  /**
+   * Impressao da requisicao que reivindicou a chave.
+   *
+   * So o orderId entra na receita v1. Duas exclusoes deliberadas:
+   *
+   * - `amountCents` NAO cabe: a claim acontece no passo 1, ANTES de o pedido ser
+   *   buscado no passo 2, entao o valor ainda nao existe aqui. A divergencia de
+   *   valor entre tentativas ja e barrada em persistirTentativa.
+   * - `paymentMethodToken` fica FORA de proposito: trocar de cartao reusando a
+   *   mesma chave deve bater como replay. Se o token entrasse, um cliente que
+   *   regenera token a cada clique furaria a protecao contra duplo clique, que e
+   *   o caso mais comum de uso indevido.
+   */
+  private fingerprintDaRequisicao(input: CriarPagamentoInput): string {
+    return createHash('sha256').update(`v1:${input.orderId}`).digest('hex');
   }
 
   private ehViolacaoDeUnique(erro: unknown): boolean {

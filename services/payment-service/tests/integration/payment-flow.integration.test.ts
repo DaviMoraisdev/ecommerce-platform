@@ -170,10 +170,17 @@ describe('criarPagamento contra Postgres — concorrencia no mesmo pedido', () =
     // A perdedora recebia PrismaClientKnownRequestError CRU (P2002), que subia
     // sem traducao e virava 500 no controller. Medido neste teste antes da
     // correcao. Agora e erro de dominio, e o controller devolve 409.
+    //
+    // retryable TRUE apos o achado 4.5: nada financeiro aconteceu, entao a claim
+    // e liberada e repetir a MESMA chave funciona.
     expect((falhas[0] as PromiseRejectedResult).reason).toMatchObject({
       code: 'TENTATIVA_EM_ANDAMENTO',
-      retryable: false,
+      retryable: true,
     });
+
+    // Prova de que a claim foi liberada e nao queimada: sobrou apenas o registro
+    // da vencedora. Se a perdedora tivesse sido marcada FAILED, seriam dois.
+    expect(await prisma.idempotencyRecord.count()).toBe(1);
   });
 });
 
@@ -280,5 +287,89 @@ describe('criarPagamento contra Postgres — retentativa na janela', () => {
     await expect(
       service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
     ).rejects.toMatchObject({ code: 'PEDIDO_JA_PAGO' });
+  });
+});
+
+describe('review 4.1 — retentativas concorrentes sobre Payment existente', () => {
+  it('duas chaves diferentes sobre Payment PENDING produzem UMA cobranca', async () => {
+    const { service, espiaoCharge, input, userId, orderId } = cenario();
+
+    // Semeia o estado que a corrida exige: Payment ja existente em PENDING,
+    // dentro da janela. E o estado deixado por uma tentativa que sofreu falha
+    // transiente — nada no head atual move o Payment para PROCESSING antes de
+    // chamar o provedor.
+    await prisma.payment.create({
+      data: {
+        orderId,
+        userId,
+        amountCents: 12990,
+        currency: 'BRL',
+        provider: 'fake',
+        attemptCount: 1,
+        expiresAt: new Date(Date.now() + 15 * 60_000),
+      },
+    });
+
+    const resultados = await Promise.allSettled([
+      service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
+      service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
+    ]);
+
+    const chaves = espiaoCharge.mock.calls.map((c) => c[0].idempotencyKey);
+
+    // NO HEAD ATUAL isto falha: ambas passam por assertNovaTentativaPermitida
+    // (PENDING e aceito), incrementam para 2 e 3, e o provedor recebe DUAS
+    // chaves distintas — duas cobrancas para o mesmo pedido.
+    expect(chaves).toHaveLength(1);
+    expect(espiaoCharge).toHaveBeenCalledTimes(1);
+
+    const perdedoras = resultados.filter((r) => r.status === 'rejected');
+    expect(perdedoras).toHaveLength(1);
+    expect((perdedoras[0] as PromiseRejectedResult).reason).toMatchObject({
+      code: 'TENTATIVA_EM_ANDAMENTO',
+    });
+  });
+
+  it('falha transiente deixa o Payment em estado que BLOQUEIA nova tentativa', async () => {
+    const { service, input } = cenario(FAKE_TOKENS.ERROR_UNAVAILABLE);
+
+    await expect(service.criarPagamento(input)).rejects.toMatchObject({
+      code: 'DEPENDENCIA_INDISPONIVEL',
+    });
+
+    // Com o Payment preso em PROCESSING, uma chave NOVA nao pode abrir uma
+    // segunda cobranca enquanto a primeira esta ambigua. No head atual o
+    // Payment fica PENDING e a nova tentativa passa.
+    await expect(
+      service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
+    ).rejects.toMatchObject({ code: 'TENTATIVA_EM_ANDAMENTO' });
+  });
+});
+
+describe('review 4.4 — a chave fica vinculada a requisicao que a criou', () => {
+  it('recusa a MESMA chave aplicada a outro pedido, sem cobrar', async () => {
+    const { service, espiaoCharge, input, userId } = cenario();
+
+    await service.criarPagamento(input);
+
+    const outroPedido = randomUUID();
+    const servicoDoOutroPedido = new PaymentService({
+      prisma,
+      orderClient: orderClientFalso(
+        jest.fn(async () => pedidoDeTeste({ id: outroPedido, userId })),
+      ),
+      provider: new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK }),
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+
+    // MESMA Idempotency-Key, pedido DIFERENTE. Antes do achado 4.4 isto
+    // devolvia 200 com o pagamento do primeiro pedido.
+    await expect(
+      servicoDoOutroPedido.criarPagamento({ ...input, orderId: outroPedido }),
+    ).rejects.toMatchObject({ code: 'IDEMPOTENCIA_CONFLITANTE' });
+
+    expect(espiaoCharge).toHaveBeenCalledTimes(1);
+    expect(await prisma.payment.count({ where: { orderId: outroPedido } })).toBe(0);
   });
 });

@@ -12,6 +12,14 @@ export type CodigoDeErroDePagamento =
   | 'IDEMPOTENCIA_EM_ANDAMENTO'
   /** A mesma Idempotency-Key ja foi usada numa requisicao que falhou. */
   | 'IDEMPOTENCIA_JA_FALHOU'
+  /**
+   * A mesma Idempotency-Key foi reusada para uma requisicao DIFERENTE.
+   *
+   * Distinto de IDEMPOTENCIA_JA_FALHOU: la a requisicao era a mesma e o
+   * resultado foi ruim; aqui a chave esta sendo aplicada a outro pedido, o que
+   * quebraria a idempotencia devolvendo o pagamento errado.
+   */
+  | 'IDEMPOTENCIA_CONFLITANTE'
   /** O pedido nao existe OU nao pertence ao usuario — indistinguivel. */
   | 'PEDIDO_NAO_ENCONTRADO'
   /** O pedido nao esta em estado que aceite cobranca. */

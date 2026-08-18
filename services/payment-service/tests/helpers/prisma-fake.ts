@@ -45,8 +45,19 @@ export function erroP2002(): Prisma.PrismaClientKnownRequestError {
 }
 
 export interface PrismaFalso {
-  idempotencyRecord: { create: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
-  payment: { findUnique: jest.Mock; create: jest.Mock; update: jest.Mock };
+  idempotencyRecord: {
+    create: jest.Mock;
+    findUnique: jest.Mock;
+    update: jest.Mock;
+    delete: jest.Mock;
+  };
+  payment: {
+    findUnique: jest.Mock;
+    findUniqueOrThrow: jest.Mock;
+    create: jest.Mock;
+    update: jest.Mock;
+    updateMany: jest.Mock;
+  };
   paymentTransaction: { create: jest.Mock; update: jest.Mock };
   $transaction: jest.Mock;
 }
@@ -68,9 +79,19 @@ export function prismaFalso(): PrismaFalso {
       create: jest.fn(async () => ({ id: 'rec_1' })),
       findUnique: jest.fn(async () => null),
       update: jest.fn(async () => ({ id: 'rec_1' })),
+      delete: jest.fn(async () => ({ id: 'rec_1' })),
     },
     payment: {
       findUnique: jest.fn(async () => null),
+      // Representa a linha DEPOIS do compare-and-swap: status PROCESSING e
+      // contador incrementado. Explicito em vez de deduzido do findUnique — o
+      // duble nao deve conter logica de banco, ou o teste passa a medir o duble.
+      findUniqueOrThrow: jest.fn(async () =>
+        paymentDeTeste({ status: PaymentStatus.PROCESSING, attemptCount: 2 }),
+      ),
+      // count 1 = o CAS venceu. Testes de perda sobrescrevem para { count: 0 }.
+      // A semantica REAL de concorrencia so o Postgres prova (integracao).
+      updateMany: jest.fn(async () => ({ count: 1 })),
       create: jest.fn(async (args: { data: Partial<Payment> }) =>
         paymentDeTeste(args.data),
       ),
