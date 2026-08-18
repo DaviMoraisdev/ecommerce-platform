@@ -92,7 +92,20 @@ function assertSegredoForte(nome: string, valor: string, nodeEnv: NodeEnv): void
  * tem esse fallback e e divida registrada (Fase 7: "fallback localhost so em
  * dev"): um deploy sem a variavel apontaria silenciosamente para o proprio host.
  */
-function parseUrlDeServico(raw: string, nome: string): string {
+function parseBooleano(raw: string | undefined, nome: string): boolean {
+  const valor = raw?.trim();
+  if (valor === undefined || valor === '') return false;
+  if (valor === 'true') return true;
+  if (valor === 'false') return false;
+  throw new ConfigError(`${nome} deve ser "true" ou "false", recebeu: ${valor}`);
+}
+
+function parseUrlDeServico(
+  raw: string,
+  nome: string,
+  nodeEnv: NodeEnv,
+  permitirInseguro: boolean,
+): string {
   let url: URL;
   try {
     url = new URL(raw);
@@ -110,6 +123,23 @@ function parseUrlDeServico(raw: string, nome: string): string {
   //
   // Credenciais embutidas sao recusadas por motivo separado: acabariam em log de
   // configuracao e em mensagem de erro.
+  // Achado 3.3 do review do PR #52, elevado a ALTA na terceira rodada.
+  //
+  // O OrderClient repassa o Authorization do usuario nesta chamada. Em texto
+  // claro, quem estiver na rede captura o bearer token e age como o usuario.
+  //
+  // Exigir https direto quebraria malha com mTLS, onde http:// entre servicos e
+  // o padrao — por isso a saida nao e proibir, e OBRIGAR A DECLARAR. O default e
+  // fail-closed, e a excecao vira configuracao explicita, verificavel e testada,
+  // em vez de uma linha no TECH_DEBT que ninguem executa.
+  if (url.protocol === 'http:' && nodeEnv === 'production' && !permitirInseguro) {
+    throw new ConfigError(
+      `${nome} usa http em producao, e o token do usuario e repassado nesta ` +
+        'chamada. Use https, ou declare ORDER_SERVICE_ALLOW_INSECURE=true se o ' +
+        'transporte for protegido por mTLS ou malha de servico.',
+    );
+  }
+
   if (url.username !== '' || url.password !== '') {
     throw new ConfigError(`${nome} nao pode conter credenciais embutidas`);
   }
@@ -237,6 +267,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     orderServiceUrl: parseUrlDeServico(
       requireEnv('ORDER_SERVICE_URL', source),
       'ORDER_SERVICE_URL',
+      nodeEnv,
+      parseBooleano(source.ORDER_SERVICE_ALLOW_INSECURE, 'ORDER_SERVICE_ALLOW_INSECURE'),
     ),
     orderServiceTimeoutMs: parseTimeout(
       source.ORDER_SERVICE_TIMEOUT_MS,

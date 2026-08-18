@@ -14,6 +14,22 @@ function semAs(...chaves: string[]): NodeJS.ProcessEnv {
   return copia;
 }
 
+/**
+ * Ambiente valido para um NODE_ENV especifico.
+ *
+ * Em producao a URL do order vira https: desde o achado 3.3, http em producao
+ * exige ORDER_SERVICE_ALLOW_INSECURE. Fixture de producao que usa http estava
+ * testando duas coisas ao mesmo tempo sem dizer.
+ */
+function ambiente(nodeEnv: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    NODE_ENV: nodeEnv,
+    ...(nodeEnv === 'production' ? { ORDER_SERVICE_URL: 'https://order.interno' } : {}),
+    ...overrides,
+  };
+}
+
 const OBRIGATORIAS = [
   'NODE_ENV',
   'PAYMENT_PORT',
@@ -128,9 +144,9 @@ describe('loadConfig — fabrica de provedor', () => {
   });
 
   it.each(['development', 'test', 'production'])('aceita stripe em %s', (nodeEnv) => {
-    expect(
-      loadConfig({ ...base, NODE_ENV: nodeEnv, PAYMENT_PROVIDER: 'stripe' }).provider,
-    ).toBe('stripe');
+    expect(loadConfig(ambiente(nodeEnv, { PAYMENT_PROVIDER: 'stripe' })).provider).toBe(
+      'stripe',
+    );
   });
 
   it.each(['Fake', 'FAKE', 'mock', 'paypal', ''])(
@@ -200,12 +216,9 @@ describe.each(['PAYMENT_WEBHOOK_SECRET', 'JWT_SECRET'] as const)(
 
     it('em PRODUCAO aceita exatamente 32 caracteres', () => {
       expect(() =>
-        loadConfig({
-          ...base,
-          NODE_ENV: 'production',
-          PAYMENT_PROVIDER: 'stripe',
-          [chave]: 'a'.repeat(32),
-        }),
+        loadConfig(
+          ambiente('production', { PAYMENT_PROVIDER: 'stripe', [chave]: 'a'.repeat(32) }),
+        ),
       ).not.toThrow();
     });
 
@@ -250,6 +263,47 @@ describe('loadConfig — ORDER_SERVICE_URL', () => {
     expect(() => loadConfig({ ...base, ORDER_SERVICE_URL: url })).toThrow(
       /credenciais|query|fragmento/,
     );
+  });
+
+  describe('transporte do token em producao (achado 3.3)', () => {
+    const producao = { ...base, NODE_ENV: 'production', PAYMENT_PROVIDER: 'stripe' };
+
+    it('RECUSA http em producao sem declaracao explicita', () => {
+      expect(() =>
+        loadConfig({ ...producao, ORDER_SERVICE_URL: 'http://order:3006' }),
+      ).toThrow(/usa http em producao/);
+    });
+
+    it('aceita http em producao quando o transporte protegido e DECLARADO', () => {
+      // A excecao vira configuracao explicita e auditavel, em vez de uma linha
+      // de documentacao que ninguem executa.
+      expect(
+        loadConfig({
+          ...producao,
+          ORDER_SERVICE_URL: 'http://order:3006',
+          ORDER_SERVICE_ALLOW_INSECURE: 'true',
+        }).orderServiceUrl,
+      ).toBe('http://order:3006');
+    });
+
+    it('aceita https em producao sem declaracao nenhuma', () => {
+      expect(
+        loadConfig({ ...producao, ORDER_SERVICE_URL: 'https://order.interno' }).orderServiceUrl,
+      ).toBe('https://order.interno');
+    });
+
+    it.each(['development', 'test'])('permite http em %s', (nodeEnv) => {
+      expect(
+        loadConfig({ ...base, NODE_ENV: nodeEnv, ORDER_SERVICE_URL: 'http://order:3006' })
+          .orderServiceUrl,
+      ).toBe('http://order:3006');
+    });
+
+    it.each(['sim', '1', 'TRUE', 'yes'])('recusa valor ambiguo na flag: %p', (valor) => {
+      expect(() =>
+        loadConfig({ ...producao, ORDER_SERVICE_ALLOW_INSECURE: valor }),
+      ).toThrow(/ORDER_SERVICE_ALLOW_INSECURE/);
+    });
   });
 
   it.each(['http://order:3006', 'https://order.interno'])('aceita %p', (url) => {
