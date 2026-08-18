@@ -71,11 +71,11 @@ function cliente(fetchImpl: typeof fetch, timeoutMs = 5000): OrderClient {
  */
 async function capturar(
   fn: () => Promise<unknown>,
-): Promise<Error & { retryable?: boolean }> {
+): Promise<Error & { retryable?: boolean; motivo?: string }> {
   try {
     await fn();
   } catch (erro) {
-    return erro as Error & { retryable?: boolean };
+    return erro as Error & { retryable?: boolean; motivo?: string };
   }
   throw new Error('esperava rejeicao, mas a chamada RESOLVEU');
 }
@@ -167,7 +167,10 @@ describe('OrderClient — rede e timeout', () => {
     const erro = await capturar(() => cliente(fetchQueTrava, 25).buscarPedido('ord_1', TOKEN));
 
     expect(erro).toBeInstanceOf(OrderIndisponivelError);
-    expect(erro.message).toContain('timeout de 25ms');
+    // O detalhe migrou de `message` para `motivo` no achado 3.3: a mensagem vai
+    // no corpo da resposta ao cliente e nao pode carregar diagnostico interno.
+    expect(erro.motivo).toContain('timeout de 25ms');
+    expect(erro.message).not.toContain('timeout');
     expect(erro.retryable).toBe(true);
   });
 });
@@ -222,5 +225,59 @@ describe('OrderClient — validacao da resposta', () => {
 
     expect(erro).toBeInstanceOf(OrderRespostaInvalidaError);
     expect(erro.message).toContain('items[0]');
+  });
+});
+
+describe('OrderClient — achados do review do PR #52', () => {
+  /** Entrega os cabecalhos na hora e TRAVA no corpo, ate o signal abortar. */
+  const fetchComCorpoTravado = (async (_url: string, init?: { signal?: AbortSignal }) => ({
+    status: 200,
+    ok: true,
+    json: () =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(
+            Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }),
+          );
+        });
+      }),
+  })) as unknown as typeof fetch;
+
+  /** Formato real de falha de rede no Node: TypeError com a causa aninhada. */
+  const fetchComRecusaDeConexao = (async () => {
+    throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+  }) as unknown as typeof fetch;
+
+  it(
+    'aplica o timeout tambem a LEITURA DO CORPO, nao so aos cabecalhos',
+    async () => {
+      // ANTES da correcao este teste falhava por ESTOURO DE TEMPO, nao por
+      // assercao: `fetch()` resolve nos cabecalhos, o clearTimeout ficava logo
+      // depois dele, o abort nunca disparava e a promessa nunca se resolvia.
+      // Um vermelho aqui com "Exceeded timeout" significa regressao do
+      // temporizador, nao teste lento.
+      const erro = await capturar(() =>
+        cliente(fetchComCorpoTravado, 50).buscarPedido('ord_1', TOKEN),
+      );
+
+      expect(erro).toBeInstanceOf(OrderIndisponivelError);
+      expect(erro.motivo).toContain('lendo o corpo');
+      expect(erro.retryable).toBe(true);
+    },
+    1000,
+  );
+
+  it('reporta a CAUSA da falha de rede e nao vaza topologia ao cliente', async () => {
+    const erro = await capturar(() =>
+      cliente(fetchComRecusaDeConexao, 50).buscarPedido('ord_1', TOKEN),
+    );
+
+    // Para o operador: a causa util. O smoke do Bloco 3 media "TypeError" aqui,
+    // que nao orienta ninguem de plantao.
+    expect(erro.motivo).toBe('ECONNREFUSED');
+    // Para o cliente: nada de nome de servico interno nem de detalhe de rede.
+    expect(erro.message).not.toContain('order-service');
+    expect(erro.message).not.toContain('ECONNREFUSED');
+    expect(erro.message).not.toContain('TypeError');
   });
 });

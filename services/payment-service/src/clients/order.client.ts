@@ -33,10 +33,34 @@ export class OrderNaoAutorizadoError extends Error {
 
 export class OrderIndisponivelError extends Error {
   readonly retryable = true;
+  /** Detalhe para LOG. Nunca vai para o corpo da resposta. */
+  readonly motivo: string;
+
   constructor(motivo: string) {
-    super(`order-service indisponivel: ${motivo}`);
+    // Mensagem GENERICA. Achado 3.3 do review do PR #52: o service repassa esta
+    // string ao controller, que a devolve no campo `error`. A versao anterior
+    // era `order-service indisponivel: ${motivo}`, expondo o nome do servico
+    // interno e detalhes como "TypeError" ou o status da dependencia.
+    super('Servico de pedidos temporariamente indisponivel');
     this.name = 'OrderIndisponivelError';
+    this.motivo = motivo;
   }
+}
+
+/**
+ * Extrai a causa UTIL de uma falha de fetch.
+ *
+ * Falha de rede no Node e sempre `TypeError: fetch failed`; o motivo real
+ * (ECONNREFUSED, ENOTFOUND, EAI_AGAIN) vive em `erro.cause.code`. Reportar
+ * `erro.name` — o que o codigo fazia — entregava "TypeError" a quem estivesse de
+ * plantao, medido no smoke do Bloco 3.
+ */
+function detalharFalhaDeRede(erro: unknown): string {
+  const e = erro as {
+    name?: string;
+    cause?: { code?: string; message?: string };
+  };
+  return e?.cause?.code ?? e?.cause?.message ?? e?.name ?? 'falha de rede';
 }
 
 export class OrderRespostaInvalidaError extends Error {
@@ -155,43 +179,57 @@ export class OrderClient {
     const controle = new AbortController();
     const temporizador = setTimeout(() => controle.abort(), this.timeoutMs);
 
-    let resposta: Response;
+    // O clearTimeout cobre a chamada INTEIRA, nao so o fetch.
+    //
+    // Achado do review do PR #52: `fetch()` resolve assim que os CABECALHOS
+    // chegam. Limpar o temporizador logo depois deixava `resposta.json()` sem
+    // teto nenhum — um order-service que enviasse os headers e travasse no meio
+    // do corpo penduraria a requisicao de pagamento indefinidamente, segurando a
+    // claim de idempotencia junto. O ORDER_SERVICE_TIMEOUT_MS nao limitava o que
+    // dizia limitar.
     try {
-      resposta = await this.fetchImpl(
-        `${this.baseUrl}/orders/${encodeURIComponent(orderId)}`,
-        {
-          method: 'GET',
-          headers: { Authorization: authorization, Accept: 'application/json' },
-          signal: controle.signal,
-        },
-      );
-    } catch (erro) {
-      const nome = (erro as Error)?.name;
-      // AbortError e o timeout: transiente, e o chamador pode retentar.
-      throw new OrderIndisponivelError(
-        nome === 'AbortError' ? `timeout de ${this.timeoutMs}ms` : String(nome ?? 'falha de rede'),
-      );
+      let resposta: Response;
+      try {
+        resposta = await this.fetchImpl(
+          `${this.baseUrl}/orders/${encodeURIComponent(orderId)}`,
+          {
+            method: 'GET',
+            headers: { Authorization: authorization, Accept: 'application/json' },
+            signal: controle.signal,
+          },
+        );
+      } catch (erro) {
+        // AbortError e o timeout: transiente, e o chamador pode retentar.
+        throw new OrderIndisponivelError(
+          (erro as Error)?.name === 'AbortError'
+            ? `timeout de ${this.timeoutMs}ms`
+            : detalharFalhaDeRede(erro),
+        );
+      }
+
+      if (resposta.status === 401) throw new OrderNaoAutorizadoError();
+      if (resposta.status === 404) throw new OrderNaoEncontradoError();
+      if (resposta.status === 403) throw new OrderNaoEncontradoError();
+      if (resposta.status >= 500) {
+        throw new OrderIndisponivelError(`HTTP ${resposta.status}`);
+      }
+      if (!resposta.ok) {
+        throw new OrderRespostaInvalidaError(`HTTP ${resposta.status}`);
+      }
+
+      let corpo: unknown;
+      try {
+        corpo = await resposta.json();
+      } catch (erro) {
+        if ((erro as Error)?.name === 'AbortError') {
+          throw new OrderIndisponivelError(`timeout de ${this.timeoutMs}ms lendo o corpo`);
+        }
+        throw new OrderRespostaInvalidaError('corpo nao e JSON valido');
+      }
+
+      return traduzir(corpo);
     } finally {
       clearTimeout(temporizador);
     }
-
-    if (resposta.status === 401) throw new OrderNaoAutorizadoError();
-    if (resposta.status === 404) throw new OrderNaoEncontradoError();
-    if (resposta.status === 403) throw new OrderNaoEncontradoError();
-    if (resposta.status >= 500) {
-      throw new OrderIndisponivelError(`HTTP ${resposta.status}`);
-    }
-    if (!resposta.ok) {
-      throw new OrderRespostaInvalidaError(`HTTP ${resposta.status}`);
-    }
-
-    let corpo: unknown;
-    try {
-      corpo = await resposta.json();
-    } catch {
-      throw new OrderRespostaInvalidaError('corpo nao e JSON valido');
-    }
-
-    return traduzir(corpo);
   }
 }
