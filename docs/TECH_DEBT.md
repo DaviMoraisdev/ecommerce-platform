@@ -4,7 +4,7 @@ Registro de decisões conscientes de adiamento, avaliadas nos code reviews e age
 
 Organizado por **destino**. Só pendências: dívidas pagas são removidas daqui (o histórico permanece nos PRs).
 
-Última atualização: **Fase 5 em andamento** (Blocos 1 e 2 concluídos).
+Última atualização: **Fase 5 em andamento** (Blocos 1 e 2 concluídos; Bloco 3 em PR).
 
 ---
 
@@ -14,6 +14,7 @@ Trade-offs aceitos cujo **gatilho** de correção está explícito — não são
 
 - **Janela de crash claim-first (notification-service):** se o processo cair entre o `claim` e o `ack`, a reentrega é tratada como duplicata sem processar o efeito. Inerente ao at-least-once sem efeito transacional. **Gatilho:** quando o consumer deixar de ser stub e ganhar efeito real (e-mail/push), é obrigatório adotar efeito+claim atômicos (outbox no consumidor). Destino: **evolução do notification-service (Fase 6+/pós-MVP)**.
 - **Premissa de 2 casas decimais (payment-service):** `src/domain/money.ts` assume 100 centavos por unidade monetária. Verdadeiro para BRL, falso para JPY (0 casas) e dinares (3). Seguro enquanto `Currency = 'BRL'`. **Gatilho:** suporte a segunda moeda.
+- **`Number()` aceita hexadecimal e exponencial em `parseTimeout` e `parseMinutos` (payment-service):** `PAYMENT_WINDOW_MINUTES=0x10` vira 16 e `1e3` vira 1000. Documentado em teste, não corrigido: hexadecimal num `.env` não é acidente plausível, e um parser próprio só para isso é código a mais para manter. **Gatilho:** se um dos dois for endurecido, os dois vão juntos — corrigir só um cria divergência silenciosa entre parsers irmãos.
 - **Porta de pagamento sem passo de autenticação adicional (3DS/SCA):** A porta PaymentProvider nao expressa autenticacao adicional — `ChargeResult` não tem campo de próxima ação (redirect, desafio). O fluxo assume cartão tokenizado e captura automática. **Gatilho:** exigência de 3D Secure, SCA (Europa) ou qualquer método que precise de interação extra do cliente. Custo: variante nova em `ChargeResult` e ajuste em todos os consumidores.
 
 ---
@@ -31,6 +32,8 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 ---
 
 ## Exceções de segurança aceitas (→ Fase 7)
+
+- **Token do usuário trafega por HTTP entre payment e order.** Levantado no review do PR #52 (achado 3.2): `parseUrlDeServico` aceita `http:` e `https:`, e o `OrderClient` repassa o `Authorization` do usuário para o endereço configurado. Se HTTP for usado sem camada externa segura, o JWT pode ser interceptado. **Não corrigido exigindo HTTPS**, e o motivo é de topologia: `http://` entre serviços dentro de um cluster com mTLS de malha é o padrão normal, e exigir `https` em produção quebraria justamente a arquitetura que a Fase 7 vai montar. A decisão correta é junto do gateway/malha: ou exigir HTTPS, ou exigir e **documentar** mTLS comprovado. Mesmo raciocínio do token de serviço ADMIN acima.
 
 - **Token de serviço ADMIN (order → inventory):** o order assina um token ADMIN com o segredo compartilhado para chamar `reserve/release`. Mitigação aceita, não dívida paga: o segredo compartilhado já permite forjar qualquer token, então usar ADMIN não amplia o raio de ataque. Correção real: identidade por serviço (mTLS/chaves assimétricas) + issuer/audience/scopes (ex.: `inventory:reserve`). (PR #41.)
 - **Authz por dono/serviço da reserva:** a posse **estrutural** foi paga no 7a (reservas amarradas ao `orderId`; `release(orderId)` só toca o que é do pedido). A **autorização** ainda é incompleta: qualquer ADMIN/SELLER libera qualquer `orderId`; qualquer papel logado reserva com `orderId` arbitrário. Exposição conhecida e aceita para este estágio. Correção: auth serviço-a-serviço + `orderId` vindo de claims confiáveis.
@@ -50,18 +53,15 @@ viviam apenas em conversa e em descrição de PR — inclusive um controle de se
 Mesmo ciclo das dívidas: removidos daqui quando entregues.
 
 
-### Bloco 3 — `POST /payments`
-- **A fábrica de provedor deve RECUSAR `fake` fora de dev/teste.** `PAYMENT_PROVIDER=fake` em produção significaria que qualquer token mágico aprova uma cobrança — pagamento sempre bem-sucedido, sem dinheiro nenhum. Falhar no boot, com teste. **É controle de segurança, não conveniência.**
-- **Shutdown gracioso:** `disconnectDatabase()` em `SIGTERM`/`SIGINT`. Hoje cada respawn do `ts-node-dev` pode deixar conexão pendurada.
-- **`PAYMENT_PROVIDER` e `PAYMENT_WEBHOOK_SECRET`** no config, com valor **vazio** no `.env.example` (nunca um segredo que funcione).
-- **Reintroduzir `getPrisma`** no mesmo commit do primeiro consumidor — removido por não ter uso.
-
+### Procedimento — verificacao de ciclo de vida
+- **Verificacao de ciclo de vida exige binario compilado, porta livre e liveness.** Teste unitario com dependencia injetada nao cobre a FIACAO no ponto de entrada. Duas tentativas no Bloco 3a foram invalidadas: `npx`/`npm run dev` sao wrappers e o `kill` atinge o wrapper, nao o processo; e um orfao de execucao anterior na mesma porta faz o `curl` responder por outro processo. Procedimento: `npm run build` + `node dist/server.js`, conferir que a porta estava livre, checar liveness antes do `curl`, e so entao enviar o sinal.
 
 ### Bloco 4 — Webhook e inbox
 - **Política fail-closed do `providerCreatedAt` nulo:** evento sem timestamp de origem não altera estado de pagamento; vai para o inbox como `IGNORED`. Já registrado como `it.todo` na suíte de integração do payment.
 - **`express.json()` NÃO pode alcançar a rota de webhook** — a assinatura HMAC é sobre os bytes exatos. Montar a rota com `express.raw()` antes do parser global.
 - **Cap de tamanho do `rawBody`** na rota (`express.raw({ limit })`).
 - **Sanitização em escrita** do payload do inbox e das mensagens de erro.
+- **`CANCELED` precisa de trilha de transação coerente.** Levantado no review do PR #52 (achado 4.6). Não se aplica ao `POST /payments`, e o compilador prova: `resultado.state === 'CANCELED'` **não compila** em `registrarDesfecho`, porque `ChargeResult` (retorno de `createCharge`) só admite `SUCCEEDED`, `PROCESSING` e `DECLINED`. Mas `CANCELED` existe em `ChargeState`, o conjunto largo que **webhook e `getCharge` usam** — e lá o risco é real: o pagamento vira `CANCELED` (terminal) enquanto a `PaymentTransaction` fica `PENDING`, dizendo que a autorização segue em aberto. `TransactionStatus` só tem `PENDING`, `SUCCEEDED` e `FAILED`, então a saída é `FAILED` + `failureCode` explícito, ou uma variante nova no enum.
 
 
 ### Bloco 5 — Integração payment ↔ order
@@ -69,7 +69,14 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 
 
 ### Bloco 6 — Reconciliação e expiração
-- **Definir TTL e limite de tentativas da janela de retentativa.** O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
+- **Recuperar chave de idempotencia presa em PROCESSING.** Quando `createCharge` falha de forma TRANSIENTE (timeout, 5xx), o dinheiro pode ter se movido — a resposta se perdeu, nao necessariamente o efeito. O servico deliberadamente NAO marca a chave como FAILED, porque isso liberaria nova tentativa com `attemptCount + 1` e chave de provedor nova, causando SEGUNDA COBRANCA. O custo: a chave fica presa em PROCESSING e o cliente nao consegue pagar aquele pedido ate a reconciliacao rodar. **O job deste bloco e obrigatorio para fechar o ciclo:** repetir `createCharge` com a chave DERIVADA (`paymentId:attemptCount`) devolve a cobranca original, e o desfecho pode ser gravado.
+- **Definir TTL e limite de tentativas da janela de retentativa.**
+- **DECISÃO EM ABERTO: congelar a resposta do replay.** Levantado no review do PR #52 (achado 4.4, segunda metade). O vínculo requisição↔chave foi pago no Bloco 3 (coluna `requestFingerprint`), mas o replay ainda **lê o `Payment` vivo** em vez de devolver uma resposta congelada. Consequência: uma chave cuja tentativa foi recusada passa a devolver `CAPTURED` depois que **outra** chave efetuar tentativa bem-sucedida no mesmo pedido. Há contra-argumento real — refletir o estado atual é mais útil ao cliente em vários casos — então é decisão de produto, não defeito óbvio. Custo se adotado: coluna de resposta serializada e política de retenção. O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
+
+
+### Bloco 8 — Bateria de testes
+- **Provar ROLLBACK de escrita parcial no `$transaction` de `persistirTentativa`.** O que já está provado: o duble de Prisma cobre ordem das operações e decisões, e a integração cobre os `CHECK`, o `@unique` de `orderId` e concorrência real. O que **não** está provado: que uma falha *depois* de uma escrita bem-sucedida dentro da mesma transação desfaz a anterior. No teste de concorrência a falha acontece no primeiro `create`, então não há escrita prévia para desfazer. Exige injetar falha no meio da transação — por exemplo forçar violação de `CHECK` no `paymentTransaction.create` após o `payment.update` de `attemptCount`, e conferir que o contador volta ao valor anterior.
+- **Cobrir o `getPrisma` sem `connectDatabase` prévio.** O caminho de erro existe e tem mensagem explícita, mas nenhum teste o exercita.
 
 
 ### Bloco 9 — Stripe e hardening
@@ -80,13 +87,14 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ### Bloco 10 — Fechamento
 - **Finalizar o README do payment-service e revisar o README da raiz.** Ambos foram *criados/marcados* no PR de manutenção pré-Bloco 3, com o estado daquele momento. O que falta e a revisão final: descrever os endpoints, o fluxo completo e trocar o marcador 🟡 por ✅ quando a fase fechar.
 - **PDF de revisão da fase** em `docs/phase-reviews/phase-05.pdf`.
+- **Avaliar subir `lib` para `es2022` no tsconfig do payment-service.** Hoje `Array.prototype.at` não compila, e o teste teve de usar aritmética de índice. O Node 22 suporta. Mudança de configuração que afeta todo o serviço e pode revelar outros erros — não entra em PR de feature para não misturar escopo.
 
 
 
 ## FASE 7 — Gateway, Segurança e Infra
 
 ### Segurança
-- **JWT hardening:** `jwt.verify` com `algorithms`/`issuer`/`audience` explícitos + validar shape do payload antes de confiar no `role`. Aplicar em auth, product, inventory e cart. **Nota:** a forca do segredo ja foi tratada — cart, order, inventory e product recusam placeholder conhecido em qualquer ambiente e exigem 32+ caracteres em producao. O que resta nesta entrada e outra coisa: `algorithms`/`issuer`/`audience` explicitos no `jwt.verify` e validacao do shape do payload antes de confiar no `role`.
+- **JWT hardening — `issuer`/`audience` e shape do payload.** O que resta aqui e apenas isto: `jwt.verify` com `issuer` e `audience` explicitos, e validacao do shape do payload antes de confiar no `role`. A forca do segredo **ja foi paga** (cart, order, inventory e product recusam placeholder em qualquer ambiente e exigem 32+ caracteres em producao), e o `algorithms` explicito **ja existe no payment-service** desde o Bloco 3, junto da validacao de claims. Falta aplicar `algorithms` em auth, product, inventory e cart, e `issuer`/`audience` nos cinco. **Exposicao hoje:** o segredo e compartilhado, entao um token emitido para outro destino e aceito por qualquer servico — mas quem tem o segredo ja forja qualquer token, o mesmo raciocinio da excecao do token de servico ADMIN. Passa a importar quando existir identidade por servico, e a correcao e conjunta com escopos. (Levantado no quarto review do PR #52.)
 - **`auth-service` sem validacao de ambiente no boot:** e o unico dos cinco que usam JWT sem modulo de config — le `process.env.JWT_SECRET as string` direto em `src/utils/jwt.ts`, sem checar presenca, placeholder ou tamanho. Com a variavel ausente, o `as string` entrega `undefined` ao `jwt.sign`, que falha em tempo de requisicao em vez de no boot. Aplicar a mesma regra dos outros quatro. (Descoberto ao tratar o achado de placeholder no PR de manutencao.)
 - **403 genérico:** não vazar `required`/`current` no corpo (hoje alguns serviços retornam). Logar só server-side.
 - **Autenticação serviço-a-serviço:** token interno/mTLS entre serviços (product→inventory, cart→product, order→inventory). Modelar identidade de serviço.
@@ -140,6 +148,7 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 - **Ciclo de vida acoplado a efeitos globais:** `start()`/estado do publisher rodam no import, com `process.exit` embutido e estado de módulo global. Separar construção/start/stop + injetar conexão/logger/exit.
 
 ### Qualidade de testes / CI
+- **Não existe CI neste repositório.** Levantado indiretamente no review do PR #52: o `statusCheckRollup` do PR vem **vazio**, e o revisor registrou por três vezes que "não é possível confirmar apenas com base no diff se os testes foram executados". Hoje a única evidência de que a bateria passou é o output colado na descrição do PR — que é palavra do autor, não verificação independente. Mínimo necessário: workflow rodando `npm run verify` e `npm run verify:integration` com Postgres de serviço, por serviço alterado.
 - **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham. **O pipeline deve rodar `npm run verify`** (inclui type-check e build) **e `npm run verify:integration`** onde houver suíte separada — `npm test` sozinho não cobre build nem integração.
 - **Teste de config do `redis.ts`** (fallback quando `REDIS_URL` ausente).
 - **Teste de integração do `connectDatabase` (inventory):** `catch` sanitizado + `process.exit(1)`.
@@ -151,6 +160,7 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ---
 
 ## Refatoração transversal (→ Fase 7, pass de qualidade)
+- **`PaymentService` concentra invariantes demais.** Levantado no review do PR #52 (achado 5.2): a classe reúne claim idempotente, autorização por posse, validação monetária, controle de concorrência, persistência, tradução de dependências, estado financeiro e composição da resposta. Não é observação estética — é o **diagnóstico da causa** dos achados 4.1, 4.2 e 4.5, que viviam nas interações entre esses invariantes e não dentro de nenhum deles. Separar a aquisição atômica da tentativa, a classificação do resultado do provedor e o armazenamento/replay idempotente em componentes menores. Fazer **depois** dos invariantes corrigidos, nunca junto.
 
 
 - **Alinhar `database.ts` do inventory ao padrão do order:** exit centralizado no `server.ts`, não na camada de banco.

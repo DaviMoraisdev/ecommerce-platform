@@ -1,12 +1,9 @@
 import type { Server } from 'node:http';
 import { bootstrap, type BootstrapDeps } from '../../src/bootstrap';
 import type { AppConfig } from '../../src/config/env';
+import { configDeTeste } from '../helpers/config';
 
-const CONFIG: AppConfig = {
-  port: 3007,
-  databaseUrl: 'postgresql://u:p@127.0.0.1:5432/payment_db',
-  defaultCurrency: 'BRL',
-};
+const CONFIG: AppConfig = configDeTeste();
 
 function montarDeps(ordem: string[], overrides: Partial<BootstrapDeps> = {}) {
   const listen = jest.fn((_porta: number, callback?: () => void) => {
@@ -51,6 +48,18 @@ describe('bootstrap', () => {
     await bootstrap(deps);
 
     expect(deps.connectDatabase).toHaveBeenCalledWith(CONFIG.databaseUrl);
+  });
+
+  it('passa ao createApp a configuracao validada', async () => {
+    const ordem: string[] = [];
+    const { deps } = montarDeps(ordem);
+
+    await bootstrap(deps);
+
+    // Sem esta assercao, esquecer de repassar a config compilaria: em
+    // TypeScript uma funcao com MENOS parametros e atribuivel a um tipo que
+    // espera mais. O typecheck nao cobre este erro; o teste cobre.
+    expect(deps.createApp).toHaveBeenCalledWith(CONFIG);
   });
 
   it('NAO abre a porta quando a configuracao e invalida', async () => {

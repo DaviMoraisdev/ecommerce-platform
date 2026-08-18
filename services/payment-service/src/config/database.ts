@@ -32,6 +32,23 @@ export async function connectDatabase(databaseUrl: string): Promise<PrismaClient
   }
 }
 
+/**
+ * Cliente do processo. Lanca se ninguem chamou connectDatabase antes.
+ *
+ * Foi REMOVIDO no PR de manutencao por nao ter consumidor — codigo sem uso nao
+ * se justifica por intencao futura, como a revisao do PR #47 apontou em
+ * connectDatabase. Volta agora, no mesmo commit do primeiro consumidor real
+ * (payment.service), cumprindo o critério herdado registrado no TECH_DEBT.
+ */
+export function getPrisma(): PrismaClient {
+  if (!clienteAtivo) {
+    throw new Error(
+      'PrismaClient nao inicializado: connectDatabase() deve rodar no ponto de entrada.',
+    );
+  }
+  return clienteAtivo;
+}
+
 export async function disconnectDatabase(): Promise<void> {
   if (clienteAtivo) {
     await clienteAtivo.$disconnect();

@@ -200,6 +200,19 @@ model IdempotencyRecord {
   paymentId String?
   payment   Payment? @relation(fields: [paymentId], references: [id], onDelete: Restrict)
 
+  /// Impressao da REQUISICAO que reivindicou esta chave: sha256("v1:<orderId>").
+  ///
+  /// Achado 4.4 do review do PR #52: sem isto, a mesma Idempotency-Key usada
+  /// para OUTRO pedido devolvia silenciosamente o pagamento anterior — falha de
+  /// contrato de idempotencia.
+  ///
+  /// So o orderId entra na receita: a chave e reivindicada ANTES de o pedido ser
+  /// buscado, entao o valor ainda nao e conhecido neste ponto. A divergencia de
+  /// valor entre tentativas ja e barrada em persistirTentativa.
+  ///
+  /// O prefixo "v1:" permite trocar a receita no futuro sem ambiguidade sobre
+  /// linhas gravadas com a receita antiga.
+  requestFingerprint String
   status    IdempotencyStatus @default(PROCESSING)
   createdAt DateTime          @default(now())
   updatedAt DateTime          @updatedAt
