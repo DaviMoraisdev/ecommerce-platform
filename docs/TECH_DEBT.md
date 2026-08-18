@@ -33,6 +33,8 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 
 ## Exceções de segurança aceitas (→ Fase 7)
 
+- **Token do usuário trafega por HTTP entre payment e order.** Levantado no review do PR #52 (achado 3.2): `parseUrlDeServico` aceita `http:` e `https:`, e o `OrderClient` repassa o `Authorization` do usuário para o endereço configurado. Se HTTP for usado sem camada externa segura, o JWT pode ser interceptado. **Não corrigido exigindo HTTPS**, e o motivo é de topologia: `http://` entre serviços dentro de um cluster com mTLS de malha é o padrão normal, e exigir `https` em produção quebraria justamente a arquitetura que a Fase 7 vai montar. A decisão correta é junto do gateway/malha: ou exigir HTTPS, ou exigir e **documentar** mTLS comprovado. Mesmo raciocínio do token de serviço ADMIN acima.
+
 - **Token de serviço ADMIN (order → inventory):** o order assina um token ADMIN com o segredo compartilhado para chamar `reserve/release`. Mitigação aceita, não dívida paga: o segredo compartilhado já permite forjar qualquer token, então usar ADMIN não amplia o raio de ataque. Correção real: identidade por serviço (mTLS/chaves assimétricas) + issuer/audience/scopes (ex.: `inventory:reserve`). (PR #41.)
 - **Authz por dono/serviço da reserva:** a posse **estrutural** foi paga no 7a (reservas amarradas ao `orderId`; `release(orderId)` só toca o que é do pedido). A **autorização** ainda é incompleta: qualquer ADMIN/SELLER libera qualquer `orderId`; qualquer papel logado reserva com `orderId` arbitrário. Exposição conhecida e aceita para este estágio. Correção: auth serviço-a-serviço + `orderId` vindo de claims confiáveis.
 
@@ -59,6 +61,7 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 - **`express.json()` NÃO pode alcançar a rota de webhook** — a assinatura HMAC é sobre os bytes exatos. Montar a rota com `express.raw()` antes do parser global.
 - **Cap de tamanho do `rawBody`** na rota (`express.raw({ limit })`).
 - **Sanitização em escrita** do payload do inbox e das mensagens de erro.
+- **`CANCELED` precisa de trilha de transação coerente.** Levantado no review do PR #52 (achado 4.6). Não se aplica ao `POST /payments`, e o compilador prova: `resultado.state === 'CANCELED'` **não compila** em `registrarDesfecho`, porque `ChargeResult` (retorno de `createCharge`) só admite `SUCCEEDED`, `PROCESSING` e `DECLINED`. Mas `CANCELED` existe em `ChargeState`, o conjunto largo que **webhook e `getCharge` usam** — e lá o risco é real: o pagamento vira `CANCELED` (terminal) enquanto a `PaymentTransaction` fica `PENDING`, dizendo que a autorização segue em aberto. `TransactionStatus` só tem `PENDING`, `SUCCEEDED` e `FAILED`, então a saída é `FAILED` + `failureCode` explícito, ou uma variante nova no enum.
 
 
 ### Bloco 5 — Integração payment ↔ order
@@ -67,7 +70,8 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 
 ### Bloco 6 — Reconciliação e expiração
 - **Recuperar chave de idempotencia presa em PROCESSING.** Quando `createCharge` falha de forma TRANSIENTE (timeout, 5xx), o dinheiro pode ter se movido — a resposta se perdeu, nao necessariamente o efeito. O servico deliberadamente NAO marca a chave como FAILED, porque isso liberaria nova tentativa com `attemptCount + 1` e chave de provedor nova, causando SEGUNDA COBRANCA. O custo: a chave fica presa em PROCESSING e o cliente nao consegue pagar aquele pedido ate a reconciliacao rodar. **O job deste bloco e obrigatorio para fechar o ciclo:** repetir `createCharge` com a chave DERIVADA (`paymentId:attemptCount`) devolve a cobranca original, e o desfecho pode ser gravado.
-- **Definir TTL e limite de tentativas da janela de retentativa.** O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
+- **Definir TTL e limite de tentativas da janela de retentativa.**
+- **DECISÃO EM ABERTO: congelar a resposta do replay.** Levantado no review do PR #52 (achado 4.4, segunda metade). O vínculo requisição↔chave foi pago no Bloco 3 (coluna `requestFingerprint`), mas o replay ainda **lê o `Payment` vivo** em vez de devolver uma resposta congelada. Consequência: uma chave cuja tentativa foi recusada passa a devolver `CAPTURED` depois que **outra** chave efetuar tentativa bem-sucedida no mesmo pedido. Há contra-argumento real — refletir o estado atual é mais útil ao cliente em vários casos — então é decisão de produto, não defeito óbvio. Custo se adotado: coluna de resposta serializada e política de retenção. O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
 
 
 ### Bloco 8 — Bateria de testes
@@ -145,6 +149,7 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 - **Ciclo de vida acoplado a efeitos globais:** `start()`/estado do publisher rodam no import, com `process.exit` embutido e estado de módulo global. Separar construção/start/stop + injetar conexão/logger/exit.
 
 ### Qualidade de testes / CI
+- **Não existe CI neste repositório.** Levantado indiretamente no review do PR #52: o `statusCheckRollup` do PR vem **vazio**, e o revisor registrou por três vezes que "não é possível confirmar apenas com base no diff se os testes foram executados". Hoje a única evidência de que a bateria passou é o output colado na descrição do PR — que é palavra do autor, não verificação independente. Mínimo necessário: workflow rodando `npm run verify` e `npm run verify:integration` com Postgres de serviço, por serviço alterado.
 - **CI prover env de teste:** `.env.test` não é versionado (`JWT_SECRET` etc.); o pipeline precisa setar, senão os testes de autorização falham. **O pipeline deve rodar `npm run verify`** (inclui type-check e build) **e `npm run verify:integration`** onde houver suíte separada — `npm test` sozinho não cobre build nem integração.
 - **Teste de config do `redis.ts`** (fallback quando `REDIS_URL` ausente).
 - **Teste de integração do `connectDatabase` (inventory):** `catch` sanitizado + `process.exit(1)`.
@@ -156,6 +161,7 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ---
 
 ## Refatoração transversal (→ Fase 7, pass de qualidade)
+- **`PaymentService` concentra invariantes demais.** Levantado no review do PR #52 (achado 5.2): a classe reúne claim idempotente, autorização por posse, validação monetária, controle de concorrência, persistência, tradução de dependências, estado financeiro e composição da resposta. Não é observação estética — é o **diagnóstico da causa** dos achados 4.1, 4.2 e 4.5, que viviam nas interações entre esses invariantes e não dentro de nenhum deles. Separar a aquisição atômica da tentativa, a classificação do resultado do provedor e o armazenamento/replay idempotente em componentes menores. Fazer **depois** dos invariantes corrigidos, nunca junto.
 
 
 - **Alinhar `database.ts` do inventory ao padrão do order:** exit centralizado no `server.ts`, não na camada de banco.
