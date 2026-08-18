@@ -15,7 +15,7 @@
     "verify": "npm run test && npm run build",
     "verify:integration": "npm run typecheck && npm run test:integration",
     "reset:test": "ts-node scripts/reset-test-db.ts",
-    "verify:migration": "bash scripts/verify-fingerprint-migration.sh"
+    "verify:migration": "ts-node scripts/verify-fingerprint-migration.ts"
   },
   "author": "DaviMoraisdev",
   "license": "ISC",
