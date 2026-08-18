@@ -401,9 +401,13 @@ export class PaymentService {
       // segunda. E o caso do duplo clique com chave nova por clique — comum, nao
       // exotico. Sem esta traducao o cliente recebia 500.
       //
-      // retryable FALSE de proposito: a chave acabou de ser marcada FAILED, entao
-      // repetir a MESMA requisicao daria IDEMPOTENCIA_JA_FALHOU. O cliente precisa
-      // de uma Idempotency-Key nova, e a mensagem diz isso.
+      // retryable TRUE: nada financeiro aconteceu, entao encerrarClaimPreEfeito
+      // LIBERA a claim perdedora e repetir com a MESMA chave funciona de verdade.
+      //
+      // Este comentario dizia o oposto — retryable false, chave queimada — e
+      // sobreviveu a correcao do achado 4.5. Apontado no terceiro review do
+      // PR #52: comentario que contradiz o codigo faz a proxima pessoa raciocinar
+      // sobre um contrato que nao existe.
       const traduzido = this.ehViolacaoDeUnique(erro)
         ? erroDeDominio(
             'TENTATIVA_EM_ANDAMENTO',
