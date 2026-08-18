@@ -82,7 +82,6 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ### Bloco 9 — Stripe e hardening
 - **Rodar a suíte de contrato (`payment-provider.contract.ts`) contra a Stripe.** É o que valida a abstração da porta.
 - **Sanitização de log**, rate limit no webhook, escopo PCI documentado.
-- **A mensagem de indisponibilidade do order descarta a causa real.** Observado no smoke do Bloco 3, com o order-service fora do ar, o corpo do 503 foi exatamente `{"code":"DEPENDENCIA_INDISPONIVEL","error":"order-service indisponivel: TypeError"}`. O `order.client.ts` reporta `erro.name`, e falha de `fetch` no Node é sempre `TypeError: fetch failed` — a causa (`ECONNREFUSED`, `ENOTFOUND`, DNS) está em `erro.cause` e é descartada. São dois defeitos no mesmo ponto: **diagnosticabilidade**, porque "TypeError" não orienta quem está de plantão; e **vazamento leve de topologia**, porque o nome interno `order-service` vai no corpo da resposta ao cliente. Correção: corpo genérico ao cliente, causa completa (`erro.cause.code`) no log do servidor. Não corrigido no Bloco 3 por decisão de escopo — o bloco estava verde e verificado, e o arquivo é do 3b com testes próprios.
 
 
 ### Bloco 10 — Fechamento
