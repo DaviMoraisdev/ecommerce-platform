@@ -83,6 +83,15 @@ export function validarAlvoDeMigracao(opcoes: OpcoesDeValidacao = {}): NodeJS.Pr
 }
 
 export interface DependenciasDeExecucao {
+  /**
+   * Argumentos do npx. Default: aplicar migrations.
+   *
+   * Existe para que o RESET do banco de teste passe pela MESMA guarda, em vez de
+   * replicar a politica num comando solto. Tentei a replicacao inline uma vez e
+   * ela quebrou por expansao de historico do bash — reimplementar politica de
+   * seguranca em outro lugar e o erro, nao o detalhe de sintaxe.
+   */
+  argumentos?: string[];
   /** Injetavel para teste: assinatura compativel com child_process.spawnSync. */
   spawn?: typeof spawnSync;
   log?: (mensagem: string) => void;
@@ -112,9 +121,11 @@ export function executarMigracao(
     return 1;
   }
 
-  log(`Aplicando migrations em ${BANCO_DE_TESTE}...`);
+  const argumentos = opcoes.argumentos ?? ['prisma', 'migrate', 'deploy'];
 
-  const resultado = spawn('npx', ['prisma', 'migrate', 'deploy'], {
+  log(`Executando "npx ${argumentos.join(' ')}" em ${BANCO_DE_TESTE}...`);
+
+  const resultado = spawn('npx', argumentos, {
     stdio: 'inherit',
     env,
   });
@@ -124,7 +135,7 @@ export function executarMigracao(
     // ele pode carregar spawnargs e outros campos derivados do ambiente.
     const codigo = (resultado.error as NodeJS.ErrnoException).code ?? resultado.error.name;
     reportarErro(
-      `ABORTADO: nao foi possivel executar "npx prisma migrate deploy" (${codigo}). ` +
+      `ABORTADO: nao foi possivel executar "npx ${argumentos.join(' ')}" (${codigo}). ` +
         'Verifique se o Node e o npm estao no PATH.',
     );
     return 1;

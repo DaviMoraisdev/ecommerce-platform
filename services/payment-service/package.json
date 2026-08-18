@@ -13,7 +13,9 @@
     "test:fast": "jest --ci",
     "test:integration": "jest --ci --config jest.integration.config.ts",
     "verify": "npm run test && npm run build",
-    "verify:integration": "npm run typecheck && npm run test:integration"
+    "verify:integration": "npm run typecheck && npm run test:integration",
+    "reset:test": "ts-node scripts/reset-test-db.ts",
+    "verify:migration": "bash scripts/verify-fingerprint-migration.sh"
   },
   "author": "DaviMoraisdev",
   "license": "ISC",
