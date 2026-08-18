@@ -11,7 +11,7 @@ export interface AppConfig {
   port: number;
   databaseUrl: string;
   defaultCurrency: Currency;
-  nodeEnv: string;
+  nodeEnv: NodeEnv;
   provider: ProviderName;
   webhookSecret: string;
   jwtSecret: string;
@@ -72,7 +72,7 @@ function requireEnv(name: string, source: NodeJS.ProcessEnv): string {
  * copiar o .env.example e subir localmente. Tamanho minimo so em producao, onde
  * segredo curto ESCOLHIDO pelo operador importa.
  */
-function assertSegredoForte(nome: string, valor: string, nodeEnv: string): void {
+function assertSegredoForte(nome: string, valor: string, nodeEnv: NodeEnv): void {
   if (SEGREDOS_PLACEHOLDER.includes(valor.trim().toLowerCase())) {
     throw new ConfigError(
       `${nome} e um placeholder conhecido, publicado no repositorio. ` +
@@ -102,6 +102,24 @@ function parseUrlDeServico(raw: string, nome: string): string {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new ConfigError(`${nome} deve usar http ou https, recebeu "${url.protocol}"`);
   }
+
+  // Achado 4.7 do review do PR #52: `new URL` era usado so para VALIDAR, e o
+  // retorno era o texto cru. Uma base como `https://order.internal?cluster=a`
+  // passava no boot e o cliente montava `.../?cluster=a/orders/<id>` — o caminho
+  // caindo DENTRO da query. A falha so apareceria na primeira cobranca.
+  //
+  // Credenciais embutidas sao recusadas por motivo separado: acabariam em log de
+  // configuracao e em mensagem de erro.
+  if (url.username !== '' || url.password !== '') {
+    throw new ConfigError(`${nome} nao pode conter credenciais embutidas`);
+  }
+  if (url.search !== '') {
+    throw new ConfigError(`${nome} nao pode conter query string`);
+  }
+  if (url.hash !== '') {
+    throw new ConfigError(`${nome} nao pode conter fragmento`);
+  }
+
   // Normaliza a barra final para o cliente montar caminho sem duplicar "/".
   return raw.replace(/\/+$/, '');
 }
@@ -132,7 +150,48 @@ function parsePort(raw: string): number {
   return port;
 }
 
-function parseProvider(raw: string, nodeEnv: string): ProviderName {
+/**
+ * NODE_ENV e OBRIGATORIO e so aceita a lista fechada. Achado 3.1 do review do
+ * PR #52, com um segundo furo encontrado ao corrigi-lo.
+ *
+ * Furo 1 — o default era `development`, e development ACEITA
+ * PAYMENT_PROVIDER=fake. Como o .env.example traz `PAYMENT_PROVIDER=fake`, uma
+ * implantacao que copiasse o exemplo e esquecesse NODE_ENV subia com o provedor
+ * falso: todo pagamento aprovado, nenhum dinheiro movido. Verificado: o proprio
+ * .env deste repositorio NAO define NODE_ENV. "Fail-closed" com default
+ * permissivo e so uma frase em comentario.
+ *
+ * Furo 2 — sem lista fechada, `NODE_ENV=prod` passava. Nao e dev/test, entao
+ * `fake` era recusado; mas assertSegredoForte compara com 'production' EXATO,
+ * entao a exigencia de 32 caracteres era pulada. Um typo de quatro letras
+ * liberava segredo fraco em producao.
+ */
+const AMBIENTES = ['development', 'test', 'production'] as const;
+export type NodeEnv = (typeof AMBIENTES)[number];
+
+function parseNodeEnv(raw: string | undefined): NodeEnv {
+  const valor = raw?.trim();
+
+  if (!valor) {
+    throw new ConfigError(
+      'NODE_ENV e obrigatorio. Nao ha default: assumir development aceitaria ' +
+        'PAYMENT_PROVIDER=fake, que aprova pagamentos sem movimentar dinheiro. ' +
+        'Use development, test ou production.',
+    );
+  }
+
+  if (!(AMBIENTES as readonly string[]).includes(valor)) {
+    throw new ConfigError(
+      `NODE_ENV invalido: ${valor}. Use development, test ou production. ` +
+        'Valores fora da lista escapam da exigencia de segredo forte, que ' +
+        'compara com "production" exato.',
+    );
+  }
+
+  return valor as NodeEnv;
+}
+
+function parseProvider(raw: string, nodeEnv: NodeEnv): ProviderName {
   if (raw === 'stripe') {
     return 'stripe';
   }
@@ -154,7 +213,7 @@ function parseProvider(raw: string, nodeEnv: string): ProviderName {
 }
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
-  const nodeEnv = (source.NODE_ENV ?? 'development').trim();
+  const nodeEnv = parseNodeEnv(source.NODE_ENV);
 
   const currency = (source.DEFAULT_CURRENCY ?? 'BRL').trim();
   if (currency !== 'BRL') {

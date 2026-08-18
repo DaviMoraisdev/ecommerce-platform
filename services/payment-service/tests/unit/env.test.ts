@@ -15,6 +15,7 @@ function semAs(...chaves: string[]): NodeJS.ProcessEnv {
 }
 
 const OBRIGATORIAS = [
+  'NODE_ENV',
   'PAYMENT_PORT',
   'DATABASE_URL',
   'PAYMENT_PROVIDER',
@@ -36,8 +37,27 @@ describe('loadConfig — caminho valido', () => {
     expect(loadConfig(semAs('DEFAULT_CURRENCY')).defaultCurrency).toBe('BRL');
   });
 
-  it('assume development quando NODE_ENV nao e informada', () => {
-    expect(loadConfig(semAs('NODE_ENV')).nodeEnv).toBe('development');
+  it('RECUSA ambiente ausente em vez de assumir development', () => {
+    // Este teste era o oposto ate o review do PR #52: ele FIXAVA o default
+    // inseguro. Com PAYMENT_PROVIDER=fake no .env.example, assumir development
+    // fazia uma implantacao sem NODE_ENV aprovar pagamentos sem mover dinheiro.
+    expect(() => loadConfig(semAs('NODE_ENV'))).toThrow(/NODE_ENV e obrigatorio/);
+  });
+
+  it.each(['prod', 'PRODUCTION', 'staging', 'homolog', 'dev'])(
+    'RECUSA ambiente fora da lista fechada: %p',
+    (valor) => {
+      // 'prod' era o pior caso: nao e dev/test, entao fake era recusado, mas
+      // assertSegredoForte compara com 'production' EXATO — a exigencia de 32
+      // caracteres era pulada e o segredo fraco passava em producao.
+      expect(() => loadConfig({ ...base, NODE_ENV: valor })).toThrow(/NODE_ENV invalido/);
+    },
+  );
+
+  it('um typo em NODE_ENV nao pode liberar segredo fraco', () => {
+    expect(() =>
+      loadConfig({ ...base, NODE_ENV: 'prod', JWT_SECRET: 'curto_mas_proprio' }),
+    ).toThrow(/NODE_ENV invalido/);
   });
 
   it('remove espacos ao redor dos valores', () => {
@@ -101,14 +121,11 @@ describe('loadConfig — fabrica de provedor', () => {
     );
   });
 
-  it.each(['production', 'staging', 'homolog', 'PRODUCTION'])(
-    'RECUSA fake com NODE_ENV=%p',
-    (nodeEnv) => {
-      expect(() =>
-        loadConfig({ ...base, NODE_ENV: nodeEnv, PAYMENT_PROVIDER: 'fake' }),
-      ).toThrow(/proibido/);
-    },
-  );
+  it('RECUSA fake em producao', () => {
+    expect(() =>
+      loadConfig({ ...base, NODE_ENV: 'production', PAYMENT_PROVIDER: 'fake' }),
+    ).toThrow(/proibido/);
+  });
 
   it.each(['development', 'test', 'production'])('aceita stripe em %s', (nodeEnv) => {
     expect(
@@ -221,6 +238,19 @@ describe('loadConfig — ORDER_SERVICE_URL', () => {
       expect(() => loadConfig({ ...base, ORDER_SERVICE_URL: url })).toThrow(/http ou https/);
     },
   );
+
+  it.each([
+    'https://order.interno?cluster=a',
+    'https://order.interno#frag',
+    'https://usuario:senha@order.interno',
+    'http://usuario@order.interno',
+  ])('recusa base com credencial, query ou fragmento: %p', (url) => {
+    // O cliente concatena `${base}/orders/:id`. Com query na base, o caminho cai
+    // DENTRO da query e a falha so aparece na primeira cobranca.
+    expect(() => loadConfig({ ...base, ORDER_SERVICE_URL: url })).toThrow(
+      /credenciais|query|fragmento/,
+    );
+  });
 
   it.each(['http://order:3006', 'https://order.interno'])('aceita %p', (url) => {
     expect(loadConfig({ ...base, ORDER_SERVICE_URL: url }).orderServiceUrl).toBe(url);
