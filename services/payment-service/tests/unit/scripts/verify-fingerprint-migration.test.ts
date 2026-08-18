@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 
+import type { Executor, ResultadoDeComando } from '../../../scripts/verify-fingerprint-migration';
 import {
+  verificar,
   argumentosPsql,
   assertIdentificadorSeguro,
   fingerprintEsperado,
@@ -73,4 +75,76 @@ describe('receita do fingerprint', () => {
       createHash('sha256').update('v1:ord-alpha').digest('hex'),
     );
   });
+});
+
+describe('limpeza dos bancos descartaveis', () => {
+  interface Chamada {
+    comando: string;
+    args: string[];
+    entrada?: string;
+  }
+
+  function executorFalso(
+    responder: (c: Chamada, indice: number) => ResultadoDeComando,
+  ): { executor: Executor; chamadas: Chamada[] } {
+    const chamadas: Chamada[] = [];
+    const executor: Executor = (comando, args, _env, entrada) => {
+      const chamada: Chamada = { comando, args, entrada };
+      chamadas.push(chamada);
+      return responder(chamada, chamadas.length - 1);
+    };
+    return { executor, chamadas };
+  }
+
+  const ok: ResultadoDeComando = { status: 0, stdout: '', stderr: '' };
+  const falha: ResultadoDeComando = { status: 1, stdout: '', stderr: 'erro simulado' };
+
+  function dropsEmitidos(chamadas: Chamada[]): string[] {
+    return chamadas
+      .map((c) => c.entrada ?? '')
+      .filter((e) => e.includes('DROP DATABASE'));
+  }
+
+  beforeEach(() => {
+    jest.spyOn(console, 'log').mockImplementation(() => undefined);
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  it('NAO emite DROP quando o CREATE DATABASE falha por colisao', () => {
+    // Cenario do bloqueante: o nome ja existe, o CREATE falha, e o script deve
+    // apenas parar. Registrar o nome ANTES da criacao fazia o finally apagar o
+    // banco preexistente — o oposto da propriedade anunciada.
+    const { executor, chamadas } = executorFalso((c) =>
+      c.entrada?.includes('CREATE DATABASE') ? falha : ok,
+    );
+
+    expect(verificar(executor)).toBe(1);
+    expect(chamadas.some((c) => c.entrada?.includes('CREATE DATABASE'))).toBe(true);
+    expect(dropsEmitidos(chamadas)).toEqual([]);
+  });
+
+  it('EMITE DROP do banco que esta execucao criou, quando a falha vem depois', () => {
+    // Controle. Sem ele, o teste acima passaria mesmo que o script nunca
+    // limpasse nada — "nenhum DROP" seria verdade pelo motivo errado.
+    const { executor, chamadas } = executorFalso((c) =>
+      c.comando === 'npx' ? falha : ok,
+    );
+
+    expect(verificar(executor)).toBe(1);
+
+    const drops = dropsEmitidos(chamadas);
+    expect(drops).toHaveLength(1);
+    expect(drops[0]).toContain('payment_migration_check_');
+  });
+
+  // NAO existe aqui um teste de "os dois cenarios completam e removem dois
+  // bancos". Para o duble chegar ao fim, ele teria de devolver o stdout de cada
+  // consulta com o valor exato que a assercao espera — ou seja, eu simularia o
+  // Postgres e o teste passaria a medir a simulacao, nao o script. Pior: os
+  // valores esperados ficariam escritos em dois lugares e divergiriam em
+  // silencio.
+  //
+  // Esse caminho e coberto pela execucao REAL, `npm run verify:migration`, que
+  // roda os dois cenarios contra o Postgres e remove os dois bancos. O que os
+  // dois testes acima cobrem e a decisao de LIMPEZA, que independe do banco.
 });
