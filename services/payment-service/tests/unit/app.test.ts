@@ -12,7 +12,13 @@ function rotasDeTeste(overrides: Partial<RotasDaAplicacao> = {}): RotasDaAplicac
   payments.post('/', (req, res) => {
     res.status(201).json({ recebido: req.body });
   });
-  return { payments, ...overrides };
+  // Duble do webhook: o app so precisa provar que montou o Router. O
+  // comportamento real esta na suite de integracao.
+  const webhooks: Router = express.Router();
+  webhooks.post('/:provider', (_req, res) => {
+    res.status(202).json({ ok: true });
+  });
+  return { payments, webhooks, ...overrides };
 }
 
 describe('GET /health', () => {
@@ -55,7 +61,7 @@ describe('handler de erro', () => {
     payments.post('/', () => {
       throw erro;
     });
-    return createApp({ payments });
+    return createApp({ payments, webhooks: express.Router() });
   }
 
   it('responde 500 generico e NAO vaza a mensagem interna', async () => {

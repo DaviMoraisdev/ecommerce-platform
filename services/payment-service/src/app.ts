@@ -3,6 +3,7 @@ import helmet from 'helmet';
 
 export interface RotasDaAplicacao {
   payments: Router;
+  webhooks: Router;
 }
 
 /**
@@ -25,11 +26,16 @@ export function createApp(rotas: RotasDaAplicacao): Express {
 
   app.use(helmet());
 
-  // ATENCAO (Bloco 4): este parser NAO pode alcancar a rota de webhook — a
-  // verificacao de assinatura HMAC exige o corpo CRU. Quando ela entrar, sera
-  // montada ANTES deste middleware, com express.raw().
+  // ORDEM CRITICA: a rota de webhook e montada ANTES do parser global.
+  // A assinatura HMAC e verificada sobre os BYTES EXATOS; se o express.json()
+  // parseasse e reserializasse o corpo, a verificacao falharia para sempre —
+  // a armadilha numero um de integracao de webhook.
   //
-  // O limite existe agora porque corpo sem teto e vetor de exaustao de memoria.
+  // O express.raw() correspondente vive DENTRO do webhookRouter, e nao aqui,
+  // para que o corpo cru nunca vaze para nenhuma outra rota.
+  app.use('/webhooks', rotas.webhooks);
+
+  // O limite existe porque corpo sem teto e vetor de exaustao de memoria.
   app.use(express.json({ limit: '10kb' }));
 
   app.get('/health', (_req: Request, res: Response) => {

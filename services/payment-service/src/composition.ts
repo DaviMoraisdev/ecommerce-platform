@@ -8,7 +8,9 @@ import { criarPaymentController } from './controllers/payment.controller';
 import { criarAuthMiddleware } from './middlewares/auth.middleware';
 import { criarPaymentProvider } from './providers/factory';
 import { criarPaymentRouter } from './routes/payment.routes';
+import { criarWebhookRouter } from './routes/webhook.routes';
 import { PaymentService } from './services/payment.service';
+import { WebhookService } from './services/webhook.service';
 
 /**
  * Composition root: o unico lugar que conhece todas as pecas e as liga.
@@ -18,6 +20,7 @@ import { PaymentService } from './services/payment.service';
  * ele lancaria com mensagem explicita em vez de falhar na primeira consulta.
  */
 export function construirApp(config: AppConfig): Express {
+  const prisma = getPrisma();
   const provider = criarPaymentProvider(config);
 
   const orderClient = new OrderClient({
@@ -26,7 +29,7 @@ export function construirApp(config: AppConfig): Express {
   });
 
   const service = new PaymentService({
-    prisma: getPrisma(),
+    prisma,
     orderClient,
     provider,
     currency: config.defaultCurrency,
@@ -38,5 +41,13 @@ export function construirApp(config: AppConfig): Express {
     controller: criarPaymentController(service),
   });
 
-  return createApp({ payments: router });
+  // O provider e o MESMO objeto usado para criar cobranca: verifyWebhook
+  // valida com o segredo que veio do config, sem segunda fonte de verdade.
+  return createApp({
+    payments: router,
+    webhooks: criarWebhookRouter({
+      provider,
+      service: new WebhookService({ prisma }),
+    }),
+  });
 }

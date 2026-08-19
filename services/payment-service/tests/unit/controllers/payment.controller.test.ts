@@ -1,4 +1,4 @@
-import type { RequestHandler } from 'express';
+import express, { type RequestHandler } from 'express';
 import request from 'supertest';
 
 import { createApp } from '../../../src/app';
@@ -33,6 +33,8 @@ function montarApp(
       authMiddleware,
       controller: criarPaymentController(service),
     }),
+    // Este arquivo testa o controller de pagamento; o webhook nao participa.
+    webhooks: express.Router(),
   });
 }
 
