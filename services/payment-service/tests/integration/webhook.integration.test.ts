@@ -621,6 +621,11 @@ describe('webhook — achados do review', () => {
     expect(intacto.capturedAmountCents).toBe(VALOR);
   });
 
+  // NAO-DETERMINISTICO: com Promise.all, se as duas requisicoes serializarem, a
+  // segunda ja le o estado atualizado e o caso passa MESMO COM O DEFEITO. Vale
+  // como invariante ponta a ponta, nao como prova. Quem prova a reavaliacao
+  // apos CAS perdido e tests/unit/services/webhook.service.test.ts, onde o
+  // dublê forca count: 0 de forma deterministica.
   it('CASO 22: reembolsos CONCORRENTES nao perdem o maior total', async () => {
     const { app, provider } = montarApp();
     const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);

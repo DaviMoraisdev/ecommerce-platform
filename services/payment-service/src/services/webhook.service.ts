@@ -299,11 +299,32 @@ export class WebhookService {
     });
 
     if (!aplicado) {
-      return this.encerrar(
-        registroId,
-        WebhookStatus.IGNORED,
-        'estado do pagamento mudou durante o processamento',
-      );
+      // ACHADO 4.2 do review: perder o CAS nao prova que o evento e obsoleto.
+      // Recarrega e refaz a decisao sobre o estado REAL.
+      const atual = await this.deps.prisma.payment.findUniqueOrThrow({
+        where: { id: payment.id },
+      });
+
+      // Outro evento ja aplicou o MESMO desfecho: nao houve recusa.
+      if (novoStatus === atual.status) {
+        return this.encerrar(registroId, WebhookStatus.PROCESSED);
+      }
+
+      // O estado avancou para algo que nao aceita mais esta transicao: obsoleto.
+      if (!podeTransicionar(atual.status, novoStatus)) {
+        return this.encerrar(
+          registroId,
+          WebhookStatus.IGNORED,
+          `transicao ${atual.status} -> ${novoStatus} nao permitida apos releitura`,
+        );
+      }
+
+      // Ainda aplicavel — so perdemos a corrida. Retentavel, nunca terminal.
+      return {
+        status: WebhookStatus.RECEIVED,
+        motivo: 'corrida no compare-and-swap do status',
+        retentavel: true,
+      };
     }
     return { status: WebhookStatus.PROCESSED };
   }
@@ -375,69 +396,90 @@ export class WebhookService {
     }
   }
 
+  /** Teto de reavaliacoes apos CAS perdido. Acima disso e contencao real. */
+  private static readonly MAX_REAVALIACOES = 3;
+
   private async aplicarReembolso(
     registroId: string,
     evento: EventoDeReembolso,
-    payment: Payment,
+    paymentInicial: Payment,
   ): Promise<ResultadoDeWebhook> {
-    if (payment.status !== PaymentStatus.CAPTURED) {
-      return this.encerrar(
-        registroId,
-        WebhookStatus.IGNORED,
-        `reembolso exige CAPTURED, status atual ${payment.status}`,
-      );
-    }
+    let payment = paymentInicial;
 
-    // Fail-closed sobre dinheiro: o wire so valida nao-negativo e teto
-    // absoluto. Reembolsar mais do que se capturou e incoerencia financeira.
-    if (evento.refundedAmountCents > payment.capturedAmountCents) {
-      return this.encerrar(
-        registroId,
-        WebhookStatus.IGNORED,
-        'reembolso acima do valor capturado',
-      );
-    }
+    // ACHADO 4.1 do review. Perder o CAS NAO prova que o evento e obsoleto:
+    // pode ser que um reembolso concorrente de valor MENOR tenha chegado
+    // primeiro. Encerrar como IGNORED com 200 fazia o provedor nao retentar e o
+    // banco ficar ABAIXO do total realmente reembolsado. Aqui o estado e
+    // RECARREGADO e a decisao refeita sobre ele.
+    for (let tentativa = 0; tentativa <= WebhookService.MAX_REAVALIACOES; tentativa += 1) {
+      if (payment.status !== PaymentStatus.CAPTURED) {
+        return this.encerrar(
+          registroId,
+          WebhookStatus.IGNORED,
+          `reembolso exige CAPTURED, status atual ${payment.status}`,
+        );
+      }
 
-    // O evento carrega o TOTAL reembolsado; a linha da trilha registra ESTA
-    // movimentacao. A diferenca e o que efetivamente se moveu agora.
-    const delta = evento.refundedAmountCents - payment.refundedAmountCents;
-    if (delta <= 0) {
-      return this.encerrar(registroId, WebhookStatus.PROCESSED);
-    }
+      // Fail-closed sobre dinheiro: o wire so valida nao-negativo e teto
+      // absoluto, e nao conhece o NOSSO estado.
+      if (evento.refundedAmountCents > payment.capturedAmountCents) {
+        return this.encerrar(
+          registroId,
+          WebhookStatus.IGNORED,
+          'reembolso acima do valor capturado',
+        );
+      }
 
-    const aplicado = await this.deps.prisma.$transaction(async (tx) => {
-      // CAS sobre o VALOR, nao sobre o status: CAPTURED e terminal e nao muda
-      // (decisao 9 da fase — reembolso e aritmetica, nao transicao).
-      const { count } = await tx.payment.updateMany({
-        where: { id: payment.id, refundedAmountCents: payment.refundedAmountCents },
-        data: { refundedAmountCents: evento.refundedAmountCents },
+      // O evento carrega o TOTAL reembolsado; a linha da trilha registra ESTA
+      // movimentacao. Delta <= 0 significa que o total ja esta refletido:
+      // replay ou evento obsoleto, e isso e PROCESSED, nao recusa.
+      const delta = evento.refundedAmountCents - payment.refundedAmountCents;
+      if (delta <= 0) {
+        return this.encerrar(registroId, WebhookStatus.PROCESSED);
+      }
+
+      const baseDoCas = payment.refundedAmountCents;
+      const idDoPagamento = payment.id;
+
+      const aplicado = await this.deps.prisma.$transaction(async (tx) => {
+        // CAS sobre o VALOR, nao sobre o status: CAPTURED e terminal e nao muda
+        // (decisao 9 da fase — reembolso e aritmetica, nao transicao).
+        const { count } = await tx.payment.updateMany({
+          where: { id: idDoPagamento, refundedAmountCents: baseDoCas },
+          data: { refundedAmountCents: evento.refundedAmountCents },
+        });
+        if (count === 0) return false;
+
+        await tx.paymentTransaction.create({
+          data: {
+            paymentId: idDoPagamento,
+            type: TransactionType.REFUND,
+            status: TransactionStatus.SUCCEEDED,
+            amountCents: delta,
+            providerRef: evento.providerRef,
+          },
+        });
+        await tx.webhookEvent.update({
+          where: { id: registroId },
+          data: { status: WebhookStatus.PROCESSED, processedAt: new Date(), lastError: null },
+        });
+        return true;
       });
-      if (count === 0) return false;
 
-      await tx.paymentTransaction.create({
-        data: {
-          paymentId: payment.id,
-          type: TransactionType.REFUND,
-          status: TransactionStatus.SUCCEEDED,
-          amountCents: delta,
-          providerRef: evento.providerRef,
-        },
-      });
-      await tx.webhookEvent.update({
-        where: { id: registroId },
-        data: { status: WebhookStatus.PROCESSED, processedAt: new Date(), lastError: null },
-      });
-      return true;
-    });
+      if (aplicado) return { status: WebhookStatus.PROCESSED };
 
-    if (!aplicado) {
-      return this.encerrar(
-        registroId,
-        WebhookStatus.IGNORED,
-        'refundedAmountCents mudou durante o processamento',
-      );
+      payment = await this.deps.prisma.payment.findUniqueOrThrow({
+        where: { id: idDoPagamento },
+      });
     }
-    return { status: WebhookStatus.PROCESSED };
+
+    // Contencao alta demais para resolver nesta entrega. NAO e recusa: a linha
+    // fica RECEIVED e a rota devolve 5xx para o provedor retentar.
+    return {
+      status: WebhookStatus.RECEIVED,
+      motivo: 'contencao no compare-and-swap do reembolso',
+      retentavel: true,
+    };
   }
 
   private async encerrar(
