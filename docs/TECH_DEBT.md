@@ -80,6 +80,9 @@ e que nao estavam na lista original do bloco:
 
 - `podeTransicionar(X, X)` devolve `true` de proposito, porque replay nao e transicao. Sem curto-circuito quando o estado alvo ja e o atual, dois eventos DISTINTOS reportando o mesmo estado criariam uma segunda linha `CAPTURE`, e a trilha diria que o dinheiro foi capturado duas vezes. Coberto pelo CASO 7, sabotagem S1.
 - Colisao no `@@unique` do inbox nao pode ser tratada como duplicata incondicional: uma linha `RECEIVED` ou `FAILED` significa que o efeito NUNCA aconteceu, e responder 200 prenderia o pagamento para sempre por uma falha transitoria. Coberto pelo CASO 8, sabotagem S2.
+- A guarda `Buffer.isBuffer` na rota estava sem NENHUM teste. Descoberta pela sabotagem S9, que nao derrubou nada. Coberta pelo CASO 15.
+- `payment.succeeded` nao validava o valor capturado contra o cobrado, embora o `POST /payments` faca isso em `assertValoresCoerentes`. Assinatura valida prova ORIGEM, nao COERENCIA. Coberto pelo CASO 18, sabotagem S14.
+- `refund.succeeded` nao validava o reembolso contra o `capturedAmountCents` do NOSSO banco. Invariante distinta da do `fake.wire`, que so compara campos do payload entre si e nao conhece o nosso estado. Coberto pelo CASO 19, sabotagem S15.
 
 ### Bloco 5 — Integração payment ↔ order
 - **Primeiro consumer do order-service:** idempotência por `eventId` + DLQ, no padrão do notification-service. Hoje o order só produz eventos.
@@ -91,6 +94,7 @@ e que nao estavam na lista original do bloco:
 - **DECISÃO EM ABERTO: congelar a resposta do replay.** Levantado no review do PR #52 (achado 4.4, segunda metade). O vínculo requisição↔chave foi pago no Bloco 3 (coluna `requestFingerprint`), mas o replay ainda **lê o `Payment` vivo** em vez de devolver uma resposta congelada. Consequência: uma chave cuja tentativa foi recusada passa a devolver `CAPTURED` depois que **outra** chave efetuar tentativa bem-sucedida no mesmo pedido. Há contra-argumento real — refletir o estado atual é mais útil ao cliente em vários casos — então é decisão de produto, não defeito óbvio. Custo se adotado: coluna de resposta serializada e política de retenção. O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
 - **`attempts` do inbox sem teto.** Um evento que falha de forma DETERMINISTICA (bug no handler, ou dado que nunca vai validar) e reprocessado a cada reentrega do provedor. Hoje `WebhookEvent.attempts` apenas conta; nao ha quarentena nem parada. Definir teto e destino (parking/DLQ) junto com o job deste bloco, que ja vai varrer `RECEIVED` orfao e `IGNORED`. Levantado ao desenhar o handler do Bloco 4.
 - **Ordenacao fina entre eventos de MESMO tipo.** A defesa contra evento fora de ordem no Bloco 4 e a maquina de estados: evento que nao encontra transicao permitida vira `IGNORED`. Isso basta enquanto cada estado e alcancado uma vez, mas nao distingue dois eventos do mesmo tipo com `providerCreatedAt` diferentes. Custo: coluna `lastProviderEventAt` no `Payment` e comparacao antes do compare-and-swap. Fica neste bloco porque e o que ja mexe em reconciliacao.
+- **Claim de posse na linha do inbox.** Duas entregas CONCORRENTES do mesmo evento: a segunda colide no `@@unique`, encontra a linha ainda em `RECEIVED` e prossegue. O compare-and-swap a barra (`count = 0`) e o dinheiro fica protegido, mas ela marca a linha como `IGNORED` quando o evento na verdade foi PROCESSADO — trilha incorreta, nao corrupcao financeira. Correcao: reivindicar com `updateMany where status in (RECEIVED, FAILED)`, o mesmo claim que o notification-service faz no Redis. Levantado no review do PR do Bloco 4.
 
 
 ### Bloco 8 — Bateria de testes
@@ -102,6 +106,7 @@ e que nao estavam na lista original do bloco:
 - **Rodar a suíte de contrato (`payment-provider.contract.ts`) contra a Stripe.** É o que valida a abstração da porta.
 - **Sanitização de log**, rate limit no webhook, escopo PCI documentado.
 - **Webhook confia no payload assinado em vez de re-buscar via `getCharge`.** O handler do Bloco 4 usa `state` e `capturedAmountCents` do corpo verificado por HMAC. A assinatura prova autenticidade dos bytes, entao o valor e autentico enquanto o segredo estiver integro, e a obsolescencia ja e coberta pela maquina de estados. Com provedor real, re-buscar o snapshot antes de aplicar efeito financeiro e o hardening esperado. A coerencia de valor contra `Payment.amountCents` ja e verificada hoje.
+- **Nenhum log em 401/400 na rota de webhook.** Assinatura forjada e evento invalido sao recusados em silencio: zero observabilidade de tentativa de forja. Entra junto do rate limit ja registrado nesta secao, com log sanitizado (nunca o corpo, nunca o cabecalho de assinatura). Levantado no review do PR do Bloco 4.
 
 
 ### Bloco 10 — Fechamento
