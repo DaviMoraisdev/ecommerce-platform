@@ -813,3 +813,38 @@ describe('webhook — retomada apos providerRef aparecer', () => {
     expect(final.status).toBe(PaymentStatus.CAPTURED);
   });
 });
+
+// ==========================================================
+// 26. Caminho que a sabotagem S31 revelou sem cobertura
+// ==========================================================
+describe('webhook — `data` como array', () => {
+  it('CASO 26: array no lugar de `data` nao reativa a allowlist do contrato', async () => {
+    const { app, provider } = montarApp();
+
+    // Evento NAO suportado: o fake.wire so valida a estrutura de cobranca em
+    // tipos suportados, entao este `data` chega cru ao sanitizador. Sem o modo
+    // estrutura no ramo de array, os itens seriam sanitizados COM o no do
+    // contrato e `charge_ref`/`state` preservariam valor num caminho invalido.
+    const res = await postar(
+      app,
+      provider.assinarCorpo({
+        id: `evt_${randomUUID()}`,
+        type: 'customer.updated',
+        created_at: new Date().toISOString(),
+        data: [{ charge_ref: 'segredo_no_array', state: 'segredo_estado_array' }],
+      }),
+    );
+
+    expect(res.status).toBe(200);
+
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
+
+    const serializado = JSON.stringify(inbox[0].payload);
+    expect(serializado).not.toContain('segredo_no_array');
+    expect(serializado).not.toContain('segredo_estado_array');
+
+    // A FORMA sobrevive: o operador ve que `data` veio como array.
+    expect(Array.isArray((inbox[0].payload as Record<string, unknown>).data)).toBe(true);
+  });
+});
