@@ -425,3 +425,27 @@ describe('webhook — refund.succeeded', () => {
     expect(inbox[0].status).toBe(WebhookStatus.PROCESSED);
   });
 });
+
+// ==========================================================
+// 15. A guarda que a sabotagem S9 revelou sem cobertura
+// ==========================================================
+describe('webhook — corpo que o parser raw nao aceita', () => {
+  it('CASO 15: Content-Type diferente e recusado com 400 e nao grava nada', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+    const req = provider.assinarCorpo(corpo({}, { charge_ref: chargeRef }));
+
+    // express.raw({ type: "application/json" }) NAO lanca quando o tipo nao
+    // casa: deixa req.body como {} e a verificacao rodaria sobre nada.
+    const res = await request(app)
+      .post('/webhooks/fake')
+      .set('content-type', 'text/plain')
+      .set('x-fake-signature', req.headers['x-fake-signature'] as string)
+      .send(req.rawBody.toString('utf8'));
+
+    expect(res.status).toBe(400);
+    expect(await prisma.webhookEvent.count()).toBe(0);
+    const intacto = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(intacto.status).toBe(PaymentStatus.PROCESSING);
+  });
+});
