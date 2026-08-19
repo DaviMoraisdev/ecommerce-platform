@@ -96,7 +96,7 @@ interface Criada {
  * primeira e a leitura inicial, as seguintes sao as RELEITURAS apos CAS perdido.
  * `contagens` alimenta cada `updateMany` — e assim que se force a corrida.
  */
-function montar(leituras: Payment[], contagens: number[]) {
+function montar(leituras: Payment[], contagens: number[], erroNaTransacao?: Error) {
   const criadas: Criada[] = [];
   const inbox: Record<string, unknown>[] = [];
   let iLeitura = 0;
@@ -125,7 +125,10 @@ function montar(leituras: Payment[], contagens: number[]) {
         leituras[Math.min(iLeitura++, leituras.length - 1)],
       ),
     },
-    $transaction: jest.fn(async (cb: (t: unknown) => Promise<unknown>) => cb(tx)),
+    $transaction: jest.fn(async (cb: (t: unknown) => Promise<unknown>) => {
+      if (erroNaTransacao) throw erroNaTransacao;
+      return cb(tx);
+    }),
   } as unknown as PrismaClient;
 
   return { service: new WebhookService({ prisma }), criadas, inbox, tx };
@@ -176,5 +179,28 @@ describe('WebhookService — CAS perdido na transicao de status (achado 4.2)', (
 
     expect(resultado.retentavel).toBe(true);
     expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+  });
+});
+
+describe('WebhookService — falha durante a aplicacao (achado 6.4)', () => {
+  it('marca FAILED com mensagem sanitizada, incrementa attempts e propaga o erro', async () => {
+    // A rota traduz a excecao em 500, e o provedor retenta. O caminho de falha
+    // nao tinha NENHUM teste: nada provava que a linha nao fica presa em
+    // RECEIVED nem que a mensagem original do banco fica fora do inbox.
+    const falha = new Error('relation "payments" does not exist at character 42');
+    const { service, inbox } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
+      [],
+      falha,
+    );
+
+    await expect(service.processar('fake', eventoDeCaptura())).rejects.toThrow(falha);
+
+    const marcacao = inbox.find((d) => d.status === WebhookStatus.FAILED);
+    expect(marcacao).toBeDefined();
+    expect(marcacao?.attempts).toEqual({ increment: 1 });
+    // Erro de Prisma carrega nome de tabela e coluna, e o inbox e lido em
+    // triagem operacional. A mensagem original nunca pode chegar la.
+    expect(JSON.stringify(marcacao)).not.toContain('relation');
   });
 });
