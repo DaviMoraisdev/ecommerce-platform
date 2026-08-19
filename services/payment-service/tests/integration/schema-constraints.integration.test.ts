@@ -261,7 +261,10 @@ describe('webhook_events (inbox)', () => {
   // Obrigacao registrada na propria suite, nao so em comentario: quando o
   // handler do Bloco 4 existir, evento sem providerCreatedAt deve virar
   // IGNORED e NAO pode alterar o estado do pagamento.
-  it.todo('handler do Bloco 4: evento sem providerCreatedAt vira IGNORED e nao altera o pagamento');
+  // Obrigacao CUMPRIDA no Bloco 4: coberta pelo CASO 9 de
+  // tests/integration/webhook.integration.test.ts (evento sem providerCreatedAt
+  // vira IGNORED e nao altera o pagamento). A sabotagem S3 confirma que aquele
+  // caso pega o defeito: remover a guarda derruba somente ele.
 
   it('recusa attempts negativo', async () => {
     const erro = await capturarViolacao(() =>

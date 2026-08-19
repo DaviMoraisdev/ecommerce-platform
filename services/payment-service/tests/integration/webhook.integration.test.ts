@@ -500,3 +500,70 @@ describe('webhook — sanitizacao do payload gravado', () => {
     expect(JSON.stringify(inbox[0].payload)).not.toContain('tok_supersecreto');
   });
 });
+
+// ==========================================================
+// 18 e 19. Assinatura valida NAO torna o valor coerente
+// ==========================================================
+describe('webhook — coerencia de valor', () => {
+  it('CASO 18: captura com valor divergente do cobrado vira IGNORED', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo({}, { charge_ref: chargeRef, captured_amount_cents: 999 }),
+      ),
+    );
+
+    expect(res.status).toBe(200);
+    const intacto = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(intacto.status).toBe(PaymentStatus.PROCESSING);
+    expect(intacto.capturedAmountCents).toBe(0);
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(0);
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
+  });
+
+  it('CASO 19: reembolso acima do capturado NO NOSSO ESTADO vira IGNORED', async () => {
+    const { app, provider } = montarApp();
+
+    // Fixture deliberadamente divergente: pagamento CAPTURED com
+    // capturedAmountCents ainda zerado. Modela desacordo entre o NOSSO estado
+    // e o do provedor — exatamente o que a reconciliacao do Bloco 6 trata.
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+
+    // Payload INTERNAMENTE COERENTE (refunded <= captured). Com refunded maior
+    // que captured no proprio payload, quem recusa e o fake.wire com 400, e o
+    // teste provaria o WIRE, nao esta guarda. Sao invariantes diferentes: o
+    // wire compara campos do payload entre si; a guarda compara o payload com
+    // o NOSSO banco, coisa que nenhum adapter tem como fazer.
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo(
+          { type: 'refund.succeeded' },
+          {
+            charge_ref: chargeRef,
+            captured_amount_cents: VALOR,
+            refunded_amount_cents: VALOR,
+          },
+        ),
+      ),
+    );
+
+    expect(res.status).toBe(200);
+
+    // A linha de inbox prova que o evento PASSOU pelo verifyWebhook e chegou
+    // ao servico. Recusa do wire devolveria 400 e zero linha.
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
+
+    const intacto = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(intacto.refundedAmountCents).toBe(0);
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.REFUND)).toHaveLength(0);
+  });
+});

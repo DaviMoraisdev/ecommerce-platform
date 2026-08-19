@@ -212,6 +212,19 @@ export class WebhookService {
       );
     }
 
+    // Mesma guarda que assertValoresCoerentes aplica no POST /payments: a
+    // assinatura prova a ORIGEM dos bytes, nao a COERENCIA do valor.
+    if (
+      evento.eventType === 'payment.succeeded' &&
+      evento.capturedAmountCents !== payment.amountCents
+    ) {
+      return this.encerrar(
+        registroId,
+        WebhookStatus.IGNORED,
+        'valor capturado diverge do cobrado',
+      );
+    }
+
     const aplicado = await this.deps.prisma.$transaction(async (tx) => {
       // COMPARE-AND-SWAP: o status lido entra no WHERE. Se outro processo mudou
       // o pagamento entre a leitura e a escrita, count = 0 e nada e aplicado.
@@ -322,6 +335,16 @@ export class WebhookService {
         registroId,
         WebhookStatus.IGNORED,
         `reembolso exige CAPTURED, status atual ${payment.status}`,
+      );
+    }
+
+    // Fail-closed sobre dinheiro: o wire so valida nao-negativo e teto
+    // absoluto. Reembolsar mais do que se capturou e incoerencia financeira.
+    if (evento.refundedAmountCents > payment.capturedAmountCents) {
+      return this.encerrar(
+        registroId,
+        WebhookStatus.IGNORED,
+        'reembolso acima do valor capturado',
       );
     }
 

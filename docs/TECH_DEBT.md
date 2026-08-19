@@ -64,7 +64,7 @@ mecanismo derruba aquele caso, e somente ele. A REMOCAO destas linhas e escopo
 do PR de manutencao do Bloco 10, junto com as demais dividas pagas da fase.
 
 - [PAGO] **Politica fail-closed do `providerCreatedAt` nulo.** Evento sem timestamp de origem vai ao inbox como `IGNORED` e nao altera estado do pagamento.
-  Prova: CASO 9 em `tests/integration/webhook.integration.test.ts`; sabotagem S3 (remover a guarda) derruba somente o CASO 9. O `it.todo` de `schema-constraints.integration.test.ts:264` foi convertido em teste real.
+  Prova: CASO 9 em `tests/integration/webhook.integration.test.ts`; sabotagem S3 (remover a guarda) derruba somente o CASO 9. A obrigacao registrada como `it.todo` em `schema-constraints.integration.test.ts` foi cumprida pelo CASO 9, em `webhook.integration.test.ts`; o `it.todo` foi substituido por um ponteiro para ele.
 - [PAGO] **`express.json()` NAO alcanca a rota de webhook.** O `express.raw({ type, limit })` vive dentro do `webhookRouter`, e o router e montado antes do parser global em `src/app.ts`, para que o corpo cru nunca vaze para outra rota.
   Prova: CASO 5; sabotagem S11 (re-serializar o corpo antes de verificar a assinatura) derruba somente o CASO 5. S10 (remover a montagem) derruba os 16, o que confirma que a rota e sustentada por toda a suite.
 - [PAGO] **Cap de tamanho do `rawBody`.** `LIMITE_CORPO_WEBHOOK = 64kb`, acima dos 10kb do JSON global porque payload de provedor carrega a cobranca inteira, e abaixo do que serviria como vetor de exaustao de memoria.
