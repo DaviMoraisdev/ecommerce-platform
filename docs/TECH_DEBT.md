@@ -56,13 +56,30 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ### Procedimento — verificacao de ciclo de vida
 - **Verificacao de ciclo de vida exige binario compilado, porta livre e liveness.** Teste unitario com dependencia injetada nao cobre a FIACAO no ponto de entrada. Duas tentativas no Bloco 3a foram invalidadas: `npx`/`npm run dev` sao wrappers e o `kill` atinge o wrapper, nao o processo; e um orfao de execucao anterior na mesma porta faz o `curl` responder por outro processo. Procedimento: `npm run build` + `node dist/server.js`, conferir que a porta estava livre, checar liveness antes do `curl`, e so entao enviar o sinal.
 
-### Bloco 4 — Webhook e inbox
-- **Política fail-closed do `providerCreatedAt` nulo:** evento sem timestamp de origem não altera estado de pagamento; vai para o inbox como `IGNORED`. Já registrado como `it.todo` na suíte de integração do payment.
-- **`express.json()` NÃO pode alcançar a rota de webhook** — a assinatura HMAC é sobre os bytes exatos. Montar a rota com `express.raw()` antes do parser global.
-- **Cap de tamanho do `rawBody`** na rota (`express.raw({ limit })`).
-- **Sanitização em escrita** do payload do inbox e das mensagens de erro.
-- **`CANCELED` precisa de trilha de transação coerente.** Levantado no review do PR #52 (achado 4.6). Não se aplica ao `POST /payments`, e o compilador prova: `resultado.state === 'CANCELED'` **não compila** em `registrarDesfecho`, porque `ChargeResult` (retorno de `createCharge`) só admite `SUCCEEDED`, `PROCESSING` e `DECLINED`. Mas `CANCELED` existe em `ChargeState`, o conjunto largo que **webhook e `getCharge` usam** — e lá o risco é real: o pagamento vira `CANCELED` (terminal) enquanto a `PaymentTransaction` fica `PENDING`, dizendo que a autorização segue em aberto. `TransactionStatus` só tem `PENDING`, `SUCCEEDED` e `FAILED`, então a saída é `FAILED` + `failureCode` explícito, ou uma variante nova no enum.
+### Bloco 4 - Webhook e inbox
 
+As cinco entradas abaixo foram PAGAS no PR do Bloco 4. Cada uma registra o
+caso que a cobre e a sabotagem que prova que o caso pega o defeito: remover o
+mecanismo derruba aquele caso, e somente ele. A REMOCAO destas linhas e escopo
+do PR de manutencao do Bloco 10, junto com as demais dividas pagas da fase.
+
+- [PAGO] **Politica fail-closed do `providerCreatedAt` nulo.** Evento sem timestamp de origem vai ao inbox como `IGNORED` e nao altera estado do pagamento.
+  Prova: CASO 9 em `tests/integration/webhook.integration.test.ts`; sabotagem S3 (remover a guarda) derruba somente o CASO 9. O `it.todo` de `schema-constraints.integration.test.ts:264` foi convertido em teste real.
+- [PAGO] **`express.json()` NAO alcanca a rota de webhook.** O `express.raw({ type, limit })` vive dentro do `webhookRouter`, e o router e montado antes do parser global em `src/app.ts`, para que o corpo cru nunca vaze para outra rota.
+  Prova: CASO 5; sabotagem S11 (re-serializar o corpo antes de verificar a assinatura) derruba somente o CASO 5. S10 (remover a montagem) derruba os 16, o que confirma que a rota e sustentada por toda a suite.
+- [PAGO] **Cap de tamanho do `rawBody`.** `LIMITE_CORPO_WEBHOOK = 64kb`, acima dos 10kb do JSON global porque payload de provedor carrega a cobranca inteira, e abaixo do que serviria como vetor de exaustao de memoria.
+  Prova: CASO 16 (413 e zero linha de inbox); sabotagem S12 (subir o teto para 10mb) derruba somente o CASO 16.
+- [PAGO] **Sanitizacao em escrita** do payload do inbox e das mensagens de erro.
+  Implementada por DENYLIST e nao por allowlist: o inbox existe para preservar evidencia de campos que o provedor mande e nos nao conhecamos (`fake.wire` guarda `bruto` por esse motivo), e allowlist apagaria exatamente isso. Teto de profundidade 8 e de 100 itens por array. `lastError` nunca recebe a mensagem original do erro, que carrega nome de tabela e coluna.
+  Prova: CASO 17; sabotagem S13 (gravar `evento.raw` sem sanitizar) derruba somente o CASO 17.
+- [PAGO] **`CANCELED` com trilha de transacao coerente** (achado 4.6 do review do PR #52). A `AUTHORIZE` que estiver em `PENDING` e fechada como `FAILED` + `failureCode = PROVIDER_CANCELED`. Sem migracao de enum: `failureCode` ja carrega a distincao, e `TransactionStatus` continua com tres valores.
+  Prova: CASO 13; sabotagem S6 (nao fechar a autorizacao) derruba somente o CASO 13.
+
+Dois defeitos que a suite adversarial encontrou ANTES de existirem em producao,
+e que nao estavam na lista original do bloco:
+
+- `podeTransicionar(X, X)` devolve `true` de proposito, porque replay nao e transicao. Sem curto-circuito quando o estado alvo ja e o atual, dois eventos DISTINTOS reportando o mesmo estado criariam uma segunda linha `CAPTURE`, e a trilha diria que o dinheiro foi capturado duas vezes. Coberto pelo CASO 7, sabotagem S1.
+- Colisao no `@@unique` do inbox nao pode ser tratada como duplicata incondicional: uma linha `RECEIVED` ou `FAILED` significa que o efeito NUNCA aconteceu, e responder 200 prenderia o pagamento para sempre por uma falha transitoria. Coberto pelo CASO 8, sabotagem S2.
 
 ### Bloco 5 — Integração payment ↔ order
 - **Primeiro consumer do order-service:** idempotência por `eventId` + DLQ, no padrão do notification-service. Hoje o order só produz eventos.
@@ -72,6 +89,8 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 - **Recuperar chave de idempotencia presa em PROCESSING.** Quando `createCharge` falha de forma TRANSIENTE (timeout, 5xx), o dinheiro pode ter se movido — a resposta se perdeu, nao necessariamente o efeito. O servico deliberadamente NAO marca a chave como FAILED, porque isso liberaria nova tentativa com `attemptCount + 1` e chave de provedor nova, causando SEGUNDA COBRANCA. O custo: a chave fica presa em PROCESSING e o cliente nao consegue pagar aquele pedido ate a reconciliacao rodar. **O job deste bloco e obrigatorio para fechar o ciclo:** repetir `createCharge` com a chave DERIVADA (`paymentId:attemptCount`) devolve a cobranca original, e o desfecho pode ser gravado.
 - **Definir TTL e limite de tentativas da janela de retentativa.**
 - **DECISÃO EM ABERTO: congelar a resposta do replay.** Levantado no review do PR #52 (achado 4.4, segunda metade). O vínculo requisição↔chave foi pago no Bloco 3 (coluna `requestFingerprint`), mas o replay ainda **lê o `Payment` vivo** em vez de devolver uma resposta congelada. Consequência: uma chave cuja tentativa foi recusada passa a devolver `CAPTURED` depois que **outra** chave efetuar tentativa bem-sucedida no mesmo pedido. Há contra-argumento real — refletir o estado atual é mais útil ao cliente em vários casos — então é decisão de produto, não defeito óbvio. Custo se adotado: coluna de resposta serializada e política de retenção. O estoque fica reservado durante toda a janela; é decisão de negócio com efeito em disponibilidade. Referência inicial: 15 min e 3 tentativas.
+- **`attempts` do inbox sem teto.** Um evento que falha de forma DETERMINISTICA (bug no handler, ou dado que nunca vai validar) e reprocessado a cada reentrega do provedor. Hoje `WebhookEvent.attempts` apenas conta; nao ha quarentena nem parada. Definir teto e destino (parking/DLQ) junto com o job deste bloco, que ja vai varrer `RECEIVED` orfao e `IGNORED`. Levantado ao desenhar o handler do Bloco 4.
+- **Ordenacao fina entre eventos de MESMO tipo.** A defesa contra evento fora de ordem no Bloco 4 e a maquina de estados: evento que nao encontra transicao permitida vira `IGNORED`. Isso basta enquanto cada estado e alcancado uma vez, mas nao distingue dois eventos do mesmo tipo com `providerCreatedAt` diferentes. Custo: coluna `lastProviderEventAt` no `Payment` e comparacao antes do compare-and-swap. Fica neste bloco porque e o que ja mexe em reconciliacao.
 
 
 ### Bloco 8 — Bateria de testes
@@ -82,13 +101,19 @@ Mesmo ciclo das dívidas: removidos daqui quando entregues.
 ### Bloco 9 — Stripe e hardening
 - **Rodar a suíte de contrato (`payment-provider.contract.ts`) contra a Stripe.** É o que valida a abstração da porta.
 - **Sanitização de log**, rate limit no webhook, escopo PCI documentado.
+- **Webhook confia no payload assinado em vez de re-buscar via `getCharge`.** O handler do Bloco 4 usa `state` e `capturedAmountCents` do corpo verificado por HMAC. A assinatura prova autenticidade dos bytes, entao o valor e autentico enquanto o segredo estiver integro, e a obsolescencia ja e coberta pela maquina de estados. Com provedor real, re-buscar o snapshot antes de aplicar efeito financeiro e o hardening esperado. A coerencia de valor contra `Payment.amountCents` ja e verificada hoje.
 
 
 ### Bloco 10 — Fechamento
 - **Finalizar o README do payment-service e revisar o README da raiz.** Ambos foram *criados/marcados* no PR de manutenção pré-Bloco 3, com o estado daquele momento. O que falta e a revisão final: descrever os endpoints, o fluxo completo e trocar o marcador 🟡 por ✅ quando a fase fechar.
 - **PDF de revisão da fase** em `docs/phase-reviews/phase-05.pdf`.
 - **Avaliar subir `lib` para `es2022` no tsconfig do payment-service.** Hoje `Array.prototype.at` não compila, e o teste teve de usar aritmética de índice. O Node 22 suporta. Mudança de configuração que afeta todo o serviço e pode revelar outros erros — não entra em PR de feature para não misturar escopo.
+- **`WebhookEvent.lastError` guarda tambem o MOTIVO de `IGNORED`,** que nao e erro. O nome da coluna e mais estreito que o uso real. Renomear para `lastReason` custa migracao; entra junto da limpeza das dividas pagas, para nao gastar migracao isolada no meio da fase.
 
+
+
+### Gatilho - captura em duas fases (fora da Fase 5)
+- **Linha `VOID` quando `CANCELED` chega sobre autorizacao ja SUCEDIDA.** O handler do webhook fecha a `AUTHORIZE` em `PENDING` como `FAILED` + `PROVIDER_CANCELED`. O ramo em que a autorizacao ja sucedeu exigiria uma linha `VOID`, e ele nao existe hoje porque `AUTHORIZED` nao tem produtor: `mapearEstadoDoProvedor` nao mapeia nenhum `ChargeState` para ele, por decisao de captura automatica (decisao 10 da fase). Implementar agora seria codigo morto. Gatilho: quando a captura em duas fases entrar, no fluxo de expedicao.
 
 
 ## FASE 7 — Gateway, Segurança e Infra
