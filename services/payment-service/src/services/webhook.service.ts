@@ -57,8 +57,29 @@ function segmentos(chave: string): string[] {
  * substring geraria falso positivo: `company` e `expansion` contem "pan",
  * e redigir tudo que contem "pan" destruiria dado util de triagem.
  */
+/**
+ * Campos do CONTRATO DE FIO. So estes preservam VALOR no inbox.
+ *
+ * Mudanca de abordagem apos a 3a rodada de review: denylist sozinha exigia
+ * enumerar todo alias PCI/SAD existente, e tres rodadas seguidas encontraram
+ * nomes novos (`card_cvv`, depois `security_code`, `pin_block`, `track2`,
+ * `cryptogram`). Campo desconhecido NAO e campo seguro: o default passa a ser
+ * fail-closed. A CHAVE e preservada para o operador saber que o campo veio; o
+ * VALOR, nao.
+ */
+const CAMPOS_CONHECIDOS = new Set([
+  'id', 'type', 'createdat', 'data',
+  'chargeref', 'state', 'capturedamountcents', 'refundedamountcents',
+  'declinecode',
+]);
+
+function normalizar(chave: string): string {
+  return chave.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 const SEGMENTOS_SENSIVEIS = new Set([
   'pan', 'card', 'number', 'cvv', 'cvc', 'iban', 'token', 'secret',
+  'pin', 'track',
   'password', 'senha',
 ]);
 
@@ -70,11 +91,13 @@ const SEGMENTOS_SENSIVEIS = new Set([
 const RAIZES_SENSIVEIS = [
   'token', 'secret', 'password', 'senha', 'authorization', 'apikey',
   'privatekey', 'cardnumber', 'creditcard', 'accountnumber', 'cvv', 'cvc',
+  'securitycode', 'verificationvalue', 'verificationcode', 'pinblock',
+  'trackdata', 'magstripe', 'cryptogram', 'emvdata', 'servicecode',
   'iban',
 ];
 
 function ehSensivel(chave: string): boolean {
-  const normalizada = chave.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normalizada = normalizar(chave);
   if (RAIZES_SENSIVEIS.some((raiz) => normalizada.includes(raiz))) return true;
   return segmentos(chave).some((parte) => SEGMENTOS_SENSIVEIS.has(parte));
 }
@@ -89,7 +112,18 @@ function sanitizar(valor: unknown, profundidade = 0): unknown {
   if (valor !== null && typeof valor === 'object') {
     const saida: Record<string, unknown> = {};
     for (const [chave, v] of Object.entries(valor)) {
-      saida[chave] = ehSensivel(chave) ? '[redigido]' : sanitizar(v, profundidade + 1);
+      if (ehSensivel(chave)) {
+        saida[chave] = '[redigido]';
+        continue;
+      }
+      // Estrutura sempre recursa, para o formato do evento continuar visivel.
+      // Escalar fora do contrato perde o VALOR, nunca a chave.
+      const ehEstrutura = v !== null && typeof v === 'object';
+      if (!ehEstrutura && !CAMPOS_CONHECIDOS.has(normalizar(chave))) {
+        saida[chave] = '[nao-reconhecido]';
+        continue;
+      }
+      saida[chave] = sanitizar(v, profundidade + 1);
     }
     return saida;
   }
@@ -129,8 +163,10 @@ export class WebhookService {
    * EFEITO, e NAO claim exclusivo. O `create` do inbox acontece FORA da
    * transacao que altera pagamento, trilha e status final — duas entregas
    * concorrentes do mesmo evento podem ambas prosseguir. O dinheiro fica
-   * protegido pelo compare-and-swap; a TRILHA pode ficar incorreta, porque a
-   * perdedora do CAS sobrescreve o status da linha. Claim exclusivo exige valor
+   * protegido pelo compare-and-swap, e toda escrita de desfecho e condicionada a
+   * RECEIVED/FAILED, entao FAILED nao sobrescreve terminal. O que RESTA e a
+   * disputa entre conclusoes concorrentes sobre a MESMA linha: trilha imprecisa,
+   * nunca duplicacao de dinheiro. Claim exclusivo exige valor
    * novo no enum ou coluna de lease, ou seja migracao: registrado para o Bloco 6.
    */
   async processar(
@@ -243,8 +279,13 @@ export class WebhookService {
       // A linha fica em RECEIVED (nao IGNORED, nao `processedAt`) e a rota
       // responde 5xx para o provedor retentar. O teto de tentativas e a
       // quarentena sao do Bloco 6.
-      await this.deps.prisma.webhookEvent.update({
-        where: { id: registroId },
+      // Mesma guarda do catch e do encerrar: nao escreve sobre linha ja
+      // concluida por execucao concorrente (achado 4.1 da 3a rodada).
+      await this.deps.prisma.webhookEvent.updateMany({
+        where: {
+          id: registroId,
+          status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+        },
         data: { lastError: 'providerRef ainda desconhecido' },
       });
       return {

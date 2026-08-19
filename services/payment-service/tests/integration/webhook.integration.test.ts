@@ -577,41 +577,59 @@ describe('webhook — coerencia de valor', () => {
 // 20 a 24. Achados do review do PR #53
 // ==========================================================
 describe('webhook — achados do review', () => {
-  it('CASO 20: redige variantes reais de nome sensivel, incluindo aninhadas', async () => {
+  it('CASO 20: valor de campo nao reconhecido nao e persistido; segredo e redigido', async () => {
     const { app, provider } = montarApp();
     const { chargeRef } = await cenario();
 
     const evento = corpo({}, { charge_ref: chargeRef });
+    // Aliases reais de dado de autenticacao de cartao (PCI/SAD).
     evento.access_token = 'at_segredo';
     evento.cardNumber = '4111111111111111';
     evento.apiKey = 'ak_segredo';
     evento['x-api-key'] = 'xak_segredo';
-    // Achado 3.1 da segunda rodada: variantes COMPOSTAS de campo PCI. Todas
-    // passavam inteiras quando o casamento era exato sobre a chave inteira.
     evento.card_cvv = 'cvv_segredo';
     evento.cvv2 = 'cvv2_segredo';
-    evento.card_cvc = 'cvc_segredo';
     evento.primary_pan = 'pan_segredo';
     evento.customer_iban = 'iban_segredo';
-    // CONTROLE NEGATIVO: `company` contem "pan". Se este campo for redigido, a
-    // correcao virou redacao cega e destruiu dado util de triagem.
-    evento.company = 'ACME expansion LTDA';
+    evento.security_code = 'sc_segredo';
+    evento.verification_value = 'vv_segredo';
+    evento.pin_block = 'pin_segredo';
+    evento.track2 = 'track_segredo';
+    evento.magstripe_data = 'mag_segredo';
+    evento.cryptogram = 'crypto_segredo';
     (evento.data as Record<string, unknown>).private_key = 'pk_segredo';
+    // Campo desconhecido e INOFENSIVO: nem por isso o valor pode ser persistido.
+    evento.company = 'ACME expansion LTDA';
 
     expect((await postar(app, provider.assinarCorpo(evento))).status).toBe(200);
 
     const inbox = await prisma.webhookEvent.findMany();
-    const serializado = JSON.stringify(inbox[0].payload);
+    const payload = inbox[0].payload as Record<string, unknown>;
+    const serializado = JSON.stringify(payload);
+
     const segredos = [
-      'at_segredo', '4111111111111111', 'ak_segredo', 'xak_segredo', 'pk_segredo',
-      'cvv_segredo', 'cvv2_segredo', 'cvc_segredo', 'pan_segredo', 'iban_segredo',
+      'at_segredo', '4111111111111111', 'ak_segredo', 'xak_segredo',
+      'cvv_segredo', 'cvv2_segredo', 'pan_segredo', 'iban_segredo',
+      'sc_segredo', 'vv_segredo', 'pin_segredo', 'track_segredo',
+      'mag_segredo', 'crypto_segredo', 'pk_segredo', 'ACME expansion LTDA',
     ];
     for (const segredo of segredos) {
       expect(serializado).not.toContain(segredo);
     }
-    // O que nao e sensivel continua preservado.
-    expect((inbox[0].payload as Record<string, unknown>).id).toBe(evento.id);
-    expect((inbox[0].payload as Record<string, unknown>).company).toBe('ACME expansion LTDA');
+
+    // Campo do CONTRATO preserva valor.
+    expect(payload.id).toBe(evento.id);
+    expect(payload.type).toBe('payment.succeeded');
+
+    // Campo fora do contrato preserva a CHAVE, para o operador saber que veio,
+    // e perde o VALOR. Campo que sabemos ser segredo recebe marca distinta.
+    expect(payload.company).toBe('[nao-reconhecido]');
+    expect(payload.magstripe_data).toBe('[redigido]');
+    // `primary_pan` so e pego pela camada de SEGMENTOS (nenhuma raiz casa com
+    // ele). Sem esta assercao, desligar a segmentacao nao derrubaria nada, e a
+    // camada viraria decorativa depois da allowlist.
+    expect(payload.primary_pan).toBe('[redigido]');
+    expect(payload.access_token).toBe('[redigido]');
   });
 
   it('CASO 21: valor divergente em estado JA aplicado nao vira PROCESSED silencioso', async () => {

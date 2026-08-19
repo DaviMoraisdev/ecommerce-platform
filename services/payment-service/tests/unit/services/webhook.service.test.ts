@@ -96,7 +96,12 @@ interface Criada {
  * primeira e a leitura inicial, as seguintes sao as RELEITURAS apos CAS perdido.
  * `contagens` alimenta cada `updateMany` — e assim que se force a corrida.
  */
-function montar(leituras: Payment[], contagens: number[], erroNaTransacao?: Error) {
+function montar(
+  leituras: Payment[],
+  contagens: number[],
+  erroNaTransacao?: Error,
+  transacao: PaymentTransaction | null = autorizacao(),
+) {
   const criadas: Criada[] = [];
   const inbox: Record<string, unknown>[] = [];
   const filtros: Record<string, unknown>[] = [];
@@ -127,7 +132,7 @@ function montar(leituras: Payment[], contagens: number[], erroNaTransacao?: Erro
       ),
       findUniqueOrThrow: jest.fn(),
     },
-    paymentTransaction: { findFirst: jest.fn(async () => autorizacao()) },
+    paymentTransaction: { findFirst: jest.fn(async () => transacao) },
     payment: {
       findUniqueOrThrow: jest.fn(async () =>
         leituras[Math.min(iLeitura++, leituras.length - 1)],
@@ -216,7 +221,10 @@ describe('WebhookService — falha durante a aplicacao (achado 6.4)', () => {
     // simular a execucao concorrente, o que so faz sentido com o claim
     // exclusivo do Bloco 6.
     const filtro = filtros.find((f) => f.status !== undefined);
-    expect(filtro).toBeDefined();
+    expect(filtro).toMatchObject({
+      id: 'inbox_1',
+      status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+    });
   });
 });
 
@@ -236,5 +244,22 @@ describe('WebhookService — exaustao do laco de reavaliacao (achado 6.2)', () =
     expect(criadas.filter((c) => c.type === TransactionType.REFUND)).toHaveLength(0);
     expect(inbox.some((d) => d.status === WebhookStatus.PROCESSED)).toBe(false);
     expect(inbox.some((d) => d.status === WebhookStatus.IGNORED)).toBe(false);
+  });
+});
+
+describe('WebhookService — guarda de concorrencia no caminho retentavel (achado 4.1)', () => {
+  it('so grava lastError de providerRef desconhecido em linha nao concluida', async () => {
+    // Sem a guarda, uma execucao atrasada escreve "providerRef ainda
+    // desconhecido" numa linha que a concorrente ja concluiu como PROCESSED.
+    const { service, filtros } = montar([pagamento()], [], undefined, null);
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.retentavel).toBe(true);
+    const filtro = filtros[filtros.length - 1];
+    expect(filtro).toMatchObject({
+      id: 'inbox_1',
+      status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+    });
   });
 });
