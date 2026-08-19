@@ -75,25 +75,42 @@ function segmentos(chave: string): string[] {
  * VALOR, nao.
  */
 interface NoDoContrato {
-  /** Chaves cujo valor ESCALAR e preservado neste nivel. */
+  /** Chaves cujo valor ESCALAR e preservado neste nivel. NOME EXATO do wire. */
   escalares: ReadonlySet<string>;
-  /** Chaves cujo valor e objeto e continua sob contrato. */
-  objetos: Readonly<Record<string, NoDoContrato>>;
+  /**
+   * Chaves cujo valor e objeto e continua sob contrato.
+   *
+   * Map, e nao objeto literal (achado 4.1 da 5a rodada): num literal, a busca
+   * pela chave constructor devolve a propriedade HERDADA de Object.prototype,
+   * que nao e undefined e era tratada como no do contrato. A recursao seguinte
+   * estourava TypeError, virava 500, e o provedor retentava para sempre.
+   */
+  objetos: ReadonlyMap<string, NoDoContrato>;
 }
 
+/**
+ * NOMES EXATOS do formato de fio, SEM normalizacao (achado 3.1 da 5a rodada).
+ *
+ * normalizar() continua existindo, mas so na DENYLIST. As duas listas tem
+ * exigencias opostas: a denylist precisa ser TOLERANTE a variacao de escrita
+ * para pegar x-api-key e cardNumber; a allowlist precisa ser ESTRITA, porque
+ * tolerancia ali vira ampliacao do contrato — i-d normalizava para id e
+ * passava a preservar valor na raiz.
+ */
 const CONTRATO_DA_COBRANCA: NoDoContrato = {
-  escalares: new Set(['chargeref', 'state', 'capturedamountcents', 'refundedamountcents', 'declinecode']),
-  objetos: {},
+  escalares: new Set([
+    'charge_ref',
+    'state',
+    'captured_amount_cents',
+    'refunded_amount_cents',
+    'decline_code',
+  ]),
+  objetos: new Map(),
 };
 
-/**
- * O contrato e uma ARVORE, nao uma lista de nomes (achado 3.1 da 4a rodada).
- * Allowlist por nome era contornavel: `{ extra: { id: "segredo" } }` reativava a
- * permissao de `id` num caminho que ninguem autorizou.
- */
 const CONTRATO_RAIZ: NoDoContrato = {
-  escalares: new Set(['id', 'type', 'createdat']),
-  objetos: { data: CONTRATO_DA_COBRANCA },
+  escalares: new Set(['id', 'type', 'created_at']),
+  objetos: new Map([['data', CONTRATO_DA_COBRANCA]]),
 };
 
 function normalizar(chave: string): string {
@@ -143,21 +160,24 @@ function sanitizar(valor: unknown, no: NoDoContrato | null, profundidade = 0): u
   }
 
   if (valor !== null && typeof valor === 'object') {
-    const saida: Record<string, unknown> = {};
+    // Object.create(null): sem prototipo, __proto__ vindo do JSON e chave comum
+    // em vez de reescrever o prototipo e sumir da evidencia.
+    const saida = Object.create(null) as Record<string, unknown>;
+
     for (const [chave, v] of Object.entries(valor)) {
       if (ehSensivel(chave)) {
         saida[chave] = '[redigido]';
         continue;
       }
-      const nome = normalizar(chave);
       const ehEstrutura = Array.isArray(v) || (v !== null && typeof v === 'object');
-      const filho = no === null ? undefined : no.objetos[nome];
+      // Comparacao EXATA e por Map: sem normalizacao, sem heranca de prototipo.
+      const filho = no === null ? undefined : no.objetos.get(chave);
 
       if (filho !== undefined && ehEstrutura) {
         saida[chave] = sanitizar(v, filho, profundidade + 1);
         continue;
       }
-      if (!ehEstrutura && no !== null && no.escalares.has(nome)) {
+      if (!ehEstrutura && no !== null && no.escalares.has(chave)) {
         saida[chave] = v;
         continue;
       }

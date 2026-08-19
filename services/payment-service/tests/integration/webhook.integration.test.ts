@@ -848,3 +848,62 @@ describe('webhook — `data` como array', () => {
     expect(Array.isArray((inbox[0].payload as Record<string, unknown>).data)).toBe(true);
   });
 });
+
+// ==========================================================
+// 27 e 28. Achados da 5a rodada de review
+// ==========================================================
+describe('webhook — limites da arvore de contrato', () => {
+  it('CASO 27: nome que NORMALIZA para campo do contrato nao e autorizado', async () => {
+    const { app, provider } = montarApp();
+    const { chargeRef } = await cenario();
+
+    // A denylist PRECISA ser tolerante a variacao de escrita; a allowlist NAO.
+    // Com a mesma normalizacao nas duas, i-d virava id e passava a preservar
+    // valor na raiz, e d-a-t-a abria o caminho do contrato.
+    const evento = corpo({}, { charge_ref: chargeRef });
+    evento['i-d'] = 'segredo_id';
+    evento['created@at'] = 'segredo_criado';
+    evento['t.y.p.e'] = 'segredo_tipo';
+    evento['d-a-t-a'] = { 'charge#ref': 'segredo_ref' };
+
+    expect((await postar(app, provider.assinarCorpo(evento))).status).toBe(200);
+
+    const payload = (await prisma.webhookEvent.findMany())[0].payload as Record<string, unknown>;
+    const serializado = JSON.stringify(payload);
+    for (const segredo of ['segredo_id', 'segredo_criado', 'segredo_tipo', 'segredo_ref']) {
+      expect(serializado).not.toContain(segredo);
+    }
+    expect(payload['i-d']).toBe('[nao-reconhecido]');
+    expect(payload['created@at']).toBe('[nao-reconhecido]');
+
+    // O campo REAL do contrato continua preservado.
+    expect(payload.id).toBe(evento.id);
+    expect((payload.data as Record<string, unknown>).charge_ref).toBe(chargeRef);
+  });
+
+  it('CASO 28: chave herdada do prototipo nao derruba o processamento', async () => {
+    const { app, provider } = montarApp();
+
+    // Num objeto literal usado como mapa, a busca pela chave constructor devolve
+    // a propriedade HERDADA de Object.prototype, que nao e undefined e era
+    // tratada como no do contrato. Resultado: TypeError, 500, e retentativa
+    // infinita do provedor sobre um evento autentico.
+    const res = await postar(
+      app,
+      provider.assinarCorpo({
+        id: `evt_${randomUUID()}`,
+        type: 'customer.updated',
+        created_at: new Date().toISOString(),
+        constructor: { value: 'segredo_ctor' },
+        __proto__: { value: 'segredo_proto' },
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
+    const serializado = JSON.stringify(inbox[0].payload);
+    expect(serializado).not.toContain('segredo_ctor');
+    expect(serializado).not.toContain('segredo_proto');
+  });
+});
