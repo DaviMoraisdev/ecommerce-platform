@@ -17,6 +17,12 @@ export interface WebhookServiceDeps {
 
 export interface ResultadoDeWebhook {
   status: WebhookStatus;
+  /**
+   * Condicao possivelmente TRANSITORIA: o evento nao pode ser aplicado agora,
+   * mas pode vir a ser. A rota traduz em 5xx para o provedor retentar. Marcar
+   * como terminal e responder 200 perderia o efeito financeiro para sempre.
+   */
+  retentavel?: boolean;
   motivo?: string;
 }
 
@@ -30,10 +36,32 @@ export interface ResultadoDeWebhook {
  * Entao: preserva tudo, redige o que sabemos ser sensivel, e limita
  * profundidade e tamanho de array para o payload nao virar vetor de DoS.
  */
-const CHAVES_SENSIVEIS = new Set([
-  'card', 'pan', 'number', 'cvv', 'cvc', 'secret', 'client_secret',
-  'password', 'authorization', 'token', 'api_key',
+/**
+ * Correspondencia EXATA so funciona para nomes curtos e ambiguos, onde busca
+ * por substring geraria falso positivo: `company` contem "pan", `phone_number`
+ * contem "number".
+ */
+const NOMES_EXATOS = new Set([
+  'pan', 'cvv', 'cvc', 'iban', 'card', 'number', 'token', 'secret',
+  'password', 'senha',
 ]);
+
+/**
+ * Raizes buscadas por SUBSTRING na chave normalizada. Normalizar (minusculas
+ * e remover tudo que nao e alfanumerico) faz `access_token`, `accessToken`,
+ * `x-api-key` e `API_KEY` colapsarem na mesma forma. Achado 3.1 do review:
+ * antes era `has(chave.toLowerCase())`, e todas essas variantes escapavam.
+ */
+const RAIZES_SENSIVEIS = [
+  'token', 'secret', 'password', 'senha', 'authorization', 'apikey',
+  'privatekey', 'cardnumber', 'creditcard', 'accountnumber',
+];
+
+function ehSensivel(chave: string): boolean {
+  const normalizada = chave.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (NOMES_EXATOS.has(normalizada)) return true;
+  return RAIZES_SENSIVEIS.some((raiz) => normalizada.includes(raiz));
+}
 const PROFUNDIDADE_MAXIMA = 8;
 const ITENS_MAXIMOS = 100;
 
@@ -45,9 +73,7 @@ function sanitizar(valor: unknown, profundidade = 0): unknown {
   if (valor !== null && typeof valor === 'object') {
     const saida: Record<string, unknown> = {};
     for (const [chave, v] of Object.entries(valor)) {
-      saida[chave] = CHAVES_SENSIVEIS.has(chave.toLowerCase())
-        ? '[redigido]'
-        : sanitizar(v, profundidade + 1);
+      saida[chave] = ehSensivel(chave) ? '[redigido]' : sanitizar(v, profundidade + 1);
     }
     return saida;
   }
@@ -81,9 +107,15 @@ export class WebhookService {
    *
    * Aplicar antes de registrar significa que uma queda entre os dois faz a
    * proxima entrega reaplicar. Registrar primeiro deixa o evento visivel como
-   * pendente e recuperavel — mesmo claim-before-effects da Fase 4, com a trava
-   * sendo constraint do Postgres em vez de SET NX no Redis. A vantagem aqui e
-   * que trava e efeito cabem na MESMA transacao.
+   * pendente e recuperavel.
+   *
+   * LIMITE CONHECIDO (achado 5.1 do review): isto e REGISTRO DURAVEL ANTES DO
+   * EFEITO, e NAO claim exclusivo. O `create` do inbox acontece FORA da
+   * transacao que altera pagamento, trilha e status final — duas entregas
+   * concorrentes do mesmo evento podem ambas prosseguir. O dinheiro fica
+   * protegido pelo compare-and-swap; a TRILHA pode ficar incorreta, porque a
+   * perdedora do CAS sobrescreve o status da linha. Claim exclusivo exige valor
+   * novo no enum ou coluna de lease, ou seja migracao: registrado para o Bloco 6.
    */
   async processar(
     providerName: string,
@@ -149,10 +181,11 @@ export class WebhookService {
       // RECEIVED/FAILED significa que o efeito NUNCA aconteceu — queda entre
       // gravar e aplicar. Tratar isso como duplicata prenderia o pagamento
       // para sempre por uma falha transitoria.
-      await this.deps.prisma.webhookEvent.update({
-        where: { id: existente.id },
-        data: { attempts: { increment: 1 } },
-      });
+      //
+      // NAO incrementa `attempts` aqui (achado 4.5): a semantica e TENTATIVAS
+      // QUE FALHARAM, e quem incrementa e o `catch` de `processar`. Incrementar
+      // nos dois lugares contava duas vezes a mesma tentativa e anteciparia o
+      // teto/quarentena planejado para o Bloco 6.
       return { id: existente.id };
     }
   }
@@ -180,7 +213,21 @@ export class WebhookService {
       orderBy: { createdAt: 'asc' },
     });
     if (transacao === null) {
-      return this.encerrar(registroId, WebhookStatus.IGNORED, 'providerRef desconhecido');
+      // Achado 4.2 do review. O `providerRef` so e persistido no
+      // `registrarDesfecho`, DEPOIS da resposta do provedor: a linha write-ahead
+      // nasce com `providerRef` nulo. Um webhook pode chegar antes desse commit.
+      // A linha fica em RECEIVED (nao IGNORED, nao `processedAt`) e a rota
+      // responde 5xx para o provedor retentar. O teto de tentativas e a
+      // quarentena sao do Bloco 6.
+      await this.deps.prisma.webhookEvent.update({
+        where: { id: registroId },
+        data: { lastError: 'providerRef ainda desconhecido' },
+      });
+      return {
+        status: WebhookStatus.RECEIVED,
+        motivo: 'providerRef ainda desconhecido',
+        retentavel: true,
+      };
     }
 
     const payment = await this.deps.prisma.payment.findUniqueOrThrow({
@@ -196,6 +243,22 @@ export class WebhookService {
 
     const novoStatus = mapearEstadoDoProvedor(evento.state);
 
+    // Invariante monetaria ANTES do curto-circuito de idempotencia (achado 4.4).
+    // A assinatura prova a ORIGEM dos bytes, nao a COERENCIA do valor. Se esta
+    // checagem viesse depois, um segundo evento com valor divergente sobre um
+    // pagamento JA capturado seria aceito como PROCESSED e a divergencia nunca
+    // chegaria a triagem.
+    if (
+      evento.eventType === 'payment.succeeded' &&
+      evento.capturedAmountCents !== payment.amountCents
+    ) {
+      return this.encerrar(
+        registroId,
+        WebhookStatus.IGNORED,
+        'valor capturado diverge do cobrado',
+      );
+    }
+
     // podeTransicionar(X, X) devolve true DE PROPOSITO (replay nao e transicao).
     // Sem este curto-circuito, um SEGUNDO evento distinto reportando o mesmo
     // estado criaria uma segunda linha CAPTURE — a trilha diria que o dinheiro
@@ -209,19 +272,6 @@ export class WebhookService {
         registroId,
         WebhookStatus.IGNORED,
         `transicao ${payment.status} -> ${novoStatus} nao permitida`,
-      );
-    }
-
-    // Mesma guarda que assertValoresCoerentes aplica no POST /payments: a
-    // assinatura prova a ORIGEM dos bytes, nao a COERENCIA do valor.
-    if (
-      evento.eventType === 'payment.succeeded' &&
-      evento.capturedAmountCents !== payment.amountCents
-    ) {
-      return this.encerrar(
-        registroId,
-        WebhookStatus.IGNORED,
-        'valor capturado diverge do cobrado',
       );
     }
 

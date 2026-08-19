@@ -323,17 +323,22 @@ describe('webhook — eventos que NAO podem alterar estado', () => {
     expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
   });
 
-  it('CASO 11: charge_ref desconhecido vira IGNORED sem quebrar', async () => {
+  it('CASO 11: charge_ref desconhecido e RETENTAVEL, nao terminal', async () => {
     const { app, provider } = montarApp();
     const { payment } = await cenario();
 
+    // O providerRef so e persistido no registrarDesfecho, DEPOIS da resposta
+    // do provedor: a linha write-ahead nasce com providerRef null. Logo o
+    // webhook pode chegar antes desse commit. Marcar IGNORED aqui perderia o
+    // efeito financeiro para sempre, porque 200 impede a retentativa.
     const res = await postar(app, provider.assinarCorpo(corpo()));
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0].status).toBe(WebhookStatus.RECEIVED);
     const intacto = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(intacto.status).toBe(PaymentStatus.PROCESSING);
-    const inbox = await prisma.webhookEvent.findMany();
-    expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
   });
 
   it('CASO 12: evento de tipo nao suportado vira IGNORED preservando o tipo BRUTO', async () => {
@@ -565,5 +570,134 @@ describe('webhook — coerencia de valor', () => {
     expect(intacto.refundedAmountCents).toBe(0);
     const trilha = await transacoesDe(payment.id);
     expect(trilha.filter((t) => t.type === TransactionType.REFUND)).toHaveLength(0);
+  });
+});
+
+// ==========================================================
+// 20 a 24. Achados do review do PR #53
+// ==========================================================
+describe('webhook — achados do review', () => {
+  it('CASO 20: redige variantes reais de nome sensivel, incluindo aninhadas', async () => {
+    const { app, provider } = montarApp();
+    const { chargeRef } = await cenario();
+
+    const evento = corpo({}, { charge_ref: chargeRef });
+    evento.access_token = 'at_segredo';
+    evento.cardNumber = '4111111111111111';
+    evento.apiKey = 'ak_segredo';
+    evento['x-api-key'] = 'xak_segredo';
+    (evento.data as Record<string, unknown>).private_key = 'pk_segredo';
+
+    expect((await postar(app, provider.assinarCorpo(evento))).status).toBe(200);
+
+    const inbox = await prisma.webhookEvent.findMany();
+    const serializado = JSON.stringify(inbox[0].payload);
+    for (const segredo of ['at_segredo', '4111111111111111', 'ak_segredo', 'xak_segredo', 'pk_segredo']) {
+      expect(serializado).not.toContain(segredo);
+    }
+    // O que nao e sensivel continua preservado.
+    expect((inbox[0].payload as Record<string, unknown>).id).toBe(evento.id);
+  });
+
+  it('CASO 21: valor divergente em estado JA aplicado nao vira PROCESSED silencioso', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { capturedAmountCents: VALOR },
+    });
+
+    // Invariante monetaria tem de ser checada ANTES do curto-circuito de
+    // idempotencia, senao a divergencia deixa de ser sinalizada para triagem.
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({}, { charge_ref: chargeRef, captured_amount_cents: 999 })),
+    );
+
+    expect(res.status).toBe(200);
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
+    const intacto = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(intacto.capturedAmountCents).toBe(VALOR);
+  });
+
+  it('CASO 22: reembolsos CONCORRENTES nao perdem o maior total', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { capturedAmountCents: VALOR },
+    });
+
+    const evento = (total: number) =>
+      provider.assinarCorpo(
+        corpo(
+          { type: 'refund.succeeded' },
+          {
+            charge_ref: chargeRef,
+            captured_amount_cents: VALOR,
+            refunded_amount_cents: total,
+          },
+        ),
+      );
+
+    // Se o de 5000 vencer o CAS, o de 7000 NAO pode virar IGNORED com 200: o
+    // provedor nao retenta e o banco ficaria abaixo do reembolso real.
+    await Promise.all([postar(app, evento(5000)), postar(app, evento(7000))]);
+
+    const final = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(final.refundedAmountCents).toBe(7000);
+
+    const trilha = await transacoesDe(payment.id);
+    const somaReembolsos = trilha
+      .filter((t) => t.type === TransactionType.REFUND)
+      .reduce((acc, t) => acc + t.amountCents, 0);
+    expect(somaReembolsos).toBe(7000);
+  });
+
+  it('CASO 23: entregas CONCORRENTES do mesmo evento aplicam efeito UMA vez', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+    const req = provider.assinarCorpo(corpo({}, { charge_ref: chargeRef }));
+
+    await Promise.all([postar(app, req), postar(app, req)]);
+
+    const final = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(final.status).toBe(PaymentStatus.CAPTURED);
+    expect(await prisma.webhookEvent.count()).toBe(1);
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(1);
+    // O STATUS final da linha de inbox nao e afirmado aqui: sem claim de posse
+    // a perdedora do CAS pode sobrescrever PROCESSED com IGNORED. Divida
+    // registrada para o Bloco 6; o dinheiro e o que este caso protege.
+  });
+
+  it('CASO 24: retomada de linha FAILED nao infla attempts', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+    const evento = corpo({}, { charge_ref: chargeRef });
+
+    await prisma.webhookEvent.create({
+      data: {
+        provider: 'fake',
+        providerEventId: evento.id as string,
+        eventType: evento.type as string,
+        payload: evento as Prisma.InputJsonObject,
+        providerCreatedAt: new Date(evento.created_at as string),
+        status: WebhookStatus.FAILED,
+        attempts: 1,
+        lastError: 'falha inesperada no processamento do webhook',
+      },
+    });
+
+    expect((await postar(app, provider.assinarCorpo(evento))).status).toBe(200);
+
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox[0].status).toBe(WebhookStatus.PROCESSED);
+    // attempts conta TENTATIVAS QUE FALHARAM. Uma retomada bem-sucedida nao
+    // e uma falha nova; incrementar no registro E no catch conta duas vezes.
+    expect(inbox[0].attempts).toBe(1);
+    const final = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(final.status).toBe(PaymentStatus.CAPTURED);
   });
 });

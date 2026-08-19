@@ -73,9 +73,19 @@ export function criarWebhookRouter(deps: WebhookRouterDeps): Router {
           throw erro;
         }
 
-        await deps.service.processar(deps.provider.name, evento);
+        const resultado = await deps.service.processar(deps.provider.name, evento);
 
-        // 200 para tudo que foi REGISTRADO — aplicado, ignorado ou duplicata.
+        // Condicao possivelmente transitoria: 5xx para o provedor RETENTAR.
+        // Responder 200 aqui encerraria o evento para sempre.
+        if (resultado.retentavel === true) {
+          res.status(503).json({
+            code: 'EVENTO_AINDA_NAO_APLICAVEL',
+            error: 'Evento recebido, ainda nao aplicavel. Retente.',
+          });
+          return;
+        }
+
+        // 200 para desfecho DEFINITIVO — aplicado, ignorado ou duplicata.
         // O corpo nao revela o desfecho interno: o provedor so precisa saber
         // que nao deve retentar.
         res.status(200).json({ received: true });
