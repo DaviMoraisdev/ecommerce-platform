@@ -600,6 +600,12 @@ describe('webhook — achados do review', () => {
     (evento.data as Record<string, unknown>).private_key = 'pk_segredo';
     // Campo desconhecido e INOFENSIVO: nem por isso o valor pode ser persistido.
     evento.company = 'ACME expansion LTDA';
+    // Estruturas desconhecidas: o bypass da allowlist por NOME. Array recursa e
+    // o escalar dentro dele escapava; objeto desconhecido reativava a allowlist
+    // global, entao `id` e `state` sobreviviam num caminho proibido.
+    evento.extra_array = ['segredo_array'];
+    evento.extra_object = { id: 'segredo_objeto', state: 'segredo_estado' };
+    evento.extra_nested = [{ type: 'segredo_aninhado' }];
 
     expect((await postar(app, provider.assinarCorpo(evento))).status).toBe(200);
 
@@ -612,6 +618,7 @@ describe('webhook — achados do review', () => {
       'cvv_segredo', 'cvv2_segredo', 'pan_segredo', 'iban_segredo',
       'sc_segredo', 'vv_segredo', 'pin_segredo', 'track_segredo',
       'mag_segredo', 'crypto_segredo', 'pk_segredo', 'ACME expansion LTDA',
+      'segredo_array', 'segredo_objeto', 'segredo_estado', 'segredo_aninhado',
     ];
     for (const segredo of segredos) {
       expect(serializado).not.toContain(segredo);
@@ -629,6 +636,20 @@ describe('webhook — achados do review', () => {
     // ele). Sem esta assercao, desligar a segmentacao nao derrubaria nada, e a
     // camada viraria decorativa depois da allowlist.
     expect(payload.primary_pan).toBe('[redigido]');
+
+    // ALLOWLIST POR CAMINHO: `id` e do contrato NA RAIZ. O mesmo nome dentro de
+    // um objeto desconhecido nao pode reativar a allowlist.
+    const extraObjeto = payload.extra_object as Record<string, unknown>;
+    expect(extraObjeto.id).toBe('[nao-reconhecido]');
+    expect(extraObjeto.state).toBe('[nao-reconhecido]');
+    expect(payload.extra_array).toEqual(['[nao-reconhecido]']);
+
+    // A FORMA sobrevive: o operador ve que veio um array de objeto, sem o valor.
+    expect(Array.isArray(payload.extra_nested)).toBe(true);
+    expect((payload.extra_nested as Record<string, unknown>[])[0].type).toBe('[nao-reconhecido]');
+
+    // Campo do contrato DENTRO de `data` continua preservado.
+    expect((payload.data as Record<string, unknown>).charge_ref).toBe(chargeRef);
     expect(payload.access_token).toBe('[redigido]');
   });
 

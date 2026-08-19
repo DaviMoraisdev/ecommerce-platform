@@ -27,14 +27,21 @@ export interface ResultadoDeWebhook {
 }
 
 /**
- * Sanitizacao em ESCRITA, por DENYLIST — e nao por allowlist.
+ * Sanitizacao em ESCRITA: ALLOWLIST POR CAMINHO, com denylist por cima.
  *
- * Reversao consciente do que eu defendi antes: allowlist e a regra quando se
- * conhece a forma do dado. Aqui o inbox existe justamente para preservar campos
- * que o provedor mande e nos nao conhecamos (fake.wire guarda `bruto` por esse
- * motivo). Allowlist apagaria exatamente a evidencia que da valor a tabela.
- * Entao: preserva tudo, redige o que sabemos ser sensivel, e limita
- * profundidade e tamanho de array para o payload nao virar vetor de DoS.
+ * Historico da decisao, porque ela mudou duas vezes sob review. Comecou como
+ * denylist pura, com o argumento de que o inbox existe para preservar evidencia
+ * de campos desconhecidos. Tres rodadas de review encontraram aliases PCI/SAD
+ * novos escapando — campo desconhecido NAO e campo seguro, e enumerar nomes e
+ * corrida infinita. Virou allowlist por NOME, e a quarta rodada mostrou que
+ * allowlist por nome e contornavel com estrutura aninhada.
+ *
+ * Modelo final:
+ *   1. o contrato de fio e uma ARVORE (CONTRATO_RAIZ); so ele preserva valor;
+ *   2. fora dele, a FORMA e preservada e toda folha vira [nao-reconhecido];
+ *   3. a denylist marca [redigido] no que sabemos ser segredo — informacao
+ *      diferente de [nao-reconhecido] para quem tria;
+ *   4. teto de profundidade e de itens por array, contra payload-bomba.
  */
 /**
  * Quebra a chave em SEGMENTOS: `card_cvv`, `cardCvv` e `card-cvv` viram todos
@@ -67,11 +74,27 @@ function segmentos(chave: string): string[] {
  * fail-closed. A CHAVE e preservada para o operador saber que o campo veio; o
  * VALOR, nao.
  */
-const CAMPOS_CONHECIDOS = new Set([
-  'id', 'type', 'createdat', 'data',
-  'chargeref', 'state', 'capturedamountcents', 'refundedamountcents',
-  'declinecode',
-]);
+interface NoDoContrato {
+  /** Chaves cujo valor ESCALAR e preservado neste nivel. */
+  escalares: ReadonlySet<string>;
+  /** Chaves cujo valor e objeto e continua sob contrato. */
+  objetos: Readonly<Record<string, NoDoContrato>>;
+}
+
+const CONTRATO_DA_COBRANCA: NoDoContrato = {
+  escalares: new Set(['chargeref', 'state', 'capturedamountcents', 'refundedamountcents', 'declinecode']),
+  objetos: {},
+};
+
+/**
+ * O contrato e uma ARVORE, nao uma lista de nomes (achado 3.1 da 4a rodada).
+ * Allowlist por nome era contornavel: `{ extra: { id: "segredo" } }` reativava a
+ * permissao de `id` num caminho que ninguem autorizou.
+ */
+const CONTRATO_RAIZ: NoDoContrato = {
+  escalares: new Set(['id', 'type', 'createdat']),
+  objetos: { data: CONTRATO_DA_COBRANCA },
+};
 
 function normalizar(chave: string): string {
   return chave.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -104,11 +127,21 @@ function ehSensivel(chave: string): boolean {
 const PROFUNDIDADE_MAXIMA = 8;
 const ITENS_MAXIMOS = 100;
 
-function sanitizar(valor: unknown, profundidade = 0): unknown {
+/**
+ * `no === null` significa MODO ESTRUTURA: estamos fora do contrato, a forma e
+ * preservada para triagem e toda folha perde o valor. A allowlist NUNCA e
+ * reativada dentro desse modo.
+ */
+function sanitizar(valor: unknown, no: NoDoContrato | null, profundidade = 0): unknown {
   if (profundidade > PROFUNDIDADE_MAXIMA) return '[profundidade excedida]';
+
+  // Nenhum campo do contrato e array: todo array e territorio desconhecido.
   if (Array.isArray(valor)) {
-    return valor.slice(0, ITENS_MAXIMOS).map((item) => sanitizar(item, profundidade + 1));
+    return valor
+      .slice(0, ITENS_MAXIMOS)
+      .map((item) => sanitizar(item, null, profundidade + 1));
   }
+
   if (valor !== null && typeof valor === 'object') {
     const saida: Record<string, unknown> = {};
     for (const [chave, v] of Object.entries(valor)) {
@@ -116,18 +149,29 @@ function sanitizar(valor: unknown, profundidade = 0): unknown {
         saida[chave] = '[redigido]';
         continue;
       }
-      // Estrutura sempre recursa, para o formato do evento continuar visivel.
-      // Escalar fora do contrato perde o VALOR, nunca a chave.
-      const ehEstrutura = v !== null && typeof v === 'object';
-      if (!ehEstrutura && !CAMPOS_CONHECIDOS.has(normalizar(chave))) {
-        saida[chave] = '[nao-reconhecido]';
+      const nome = normalizar(chave);
+      const ehEstrutura = Array.isArray(v) || (v !== null && typeof v === 'object');
+      const filho = no === null ? undefined : no.objetos[nome];
+
+      if (filho !== undefined && ehEstrutura) {
+        saida[chave] = sanitizar(v, filho, profundidade + 1);
         continue;
       }
-      saida[chave] = sanitizar(v, profundidade + 1);
+      if (!ehEstrutura && no !== null && no.escalares.has(nome)) {
+        saida[chave] = v;
+        continue;
+      }
+      // Fora do contrato: estrutura recursa em MODO ESTRUTURA, escalar perde o valor.
+      saida[chave] = ehEstrutura
+        ? sanitizar(v, null, profundidade + 1)
+        : '[nao-reconhecido]';
     }
     return saida;
   }
-  return valor;
+
+  // Folha: so chega aqui em modo estrutura; no caminho do contrato o valor ja
+  // foi devolvido pelo ramo de escalares acima.
+  return no === null ? '[nao-reconhecido]' : valor;
 }
 
 /**
@@ -210,7 +254,7 @@ export class WebhookService {
           providerEventId: evento.providerEventId,
           // Tipo BRUTO: gravar 'unsupported' perderia o que o operador precisa para triar.
           eventType: evento.providerEventTypeBruto,
-          payload: sanitizar(evento.raw) as Prisma.InputJsonValue,
+          payload: sanitizar(evento.raw, CONTRATO_RAIZ) as Prisma.InputJsonValue,
           providerCreatedAt: evento.providerCreatedAt,
           status: WebhookStatus.RECEIVED,
         },
