@@ -881,29 +881,42 @@ describe('webhook — limites da arvore de contrato', () => {
     expect((payload.data as Record<string, unknown>).charge_ref).toBe(chargeRef);
   });
 
-  it('CASO 28: chave herdada do prototipo nao derruba o processamento', async () => {
+  it('CASO 28: chave herdada do prototipo nao derruba nem some da evidencia', async () => {
     const { app, provider } = montarApp();
 
-    // Num objeto literal usado como mapa, a busca pela chave constructor devolve
-    // a propriedade HERDADA de Object.prototype, que nao e undefined e era
-    // tratada como no do contrato. Resultado: TypeError, 500, e retentativa
-    // infinita do provedor sobre um evento autentico.
-    const res = await postar(
-      app,
-      provider.assinarCorpo({
-        id: `evt_${randomUUID()}`,
-        type: 'customer.updated',
-        created_at: new Date().toISOString(),
-        constructor: { value: 'segredo_ctor' },
-        __proto__: { value: 'segredo_proto' },
-      }),
-    );
+    // STRING CRUA de proposito. Num literal TypeScript, `__proto__` DEFINE o
+    // prototipo do objeto e nunca vira chave — o cenario passava sem testar
+    // nada. So JSON.parse cria propriedade PROPRIA com esse nome.
+    const id = `evt_${randomUUID()}`;
+    const criadoEm = new Date().toISOString();
+    const corpoCru =
+      '{"id":"' + id + '","type":"customer.updated","created_at":"' + criadoEm + '",' +
+      '"constructor":{"value":"segredo_ctor"},' +
+      '"__proto__":{"value":"segredo_proto"}}';
+
+    // `constructor` numa busca por objeto literal devolveria a propriedade
+    // HERDADA de Object.prototype, seria tratada como no do contrato, e a
+    // recursao estouraria TypeError: 500 e retentativa infinita.
+    const res = await postar(app, provider.assinarCorpo(corpoCru));
 
     expect(res.status).toBe(200);
     const inbox = await prisma.webhookEvent.findMany();
     expect(inbox[0].status).toBe(WebhookStatus.IGNORED);
-    const serializado = JSON.stringify(inbox[0].payload);
+
+    const payload = inbox[0].payload as Record<string, unknown>;
+    const serializado = JSON.stringify(payload);
     expect(serializado).not.toContain('segredo_ctor');
     expect(serializado).not.toContain('segredo_proto');
+
+    // As duas chaves sobrevivem como EVIDENCIA. Com `saida = {}` em vez de
+    // Object.create(null), atribuir `__proto__` reescreveria o prototipo e a
+    // chave sumiria em silencio do inbox.
+    expect(Object.keys(payload)).toContain('constructor');
+
+    // `__proto__` NAO sobrevive ao round-trip do Prisma/Postgres: comprovado por
+    // diagnostico isolado, a chave existe ao gravar e some ao ler. Por isso ela e
+    // renomeada na escrita — a evidencia de que o campo veio nao pode sumir em
+    // silencio de uma tabela de auditoria.
+    expect(Object.keys(payload)).toContain('__proto__ [renomeado]');
   });
 });

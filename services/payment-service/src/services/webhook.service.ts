@@ -160,13 +160,20 @@ function sanitizar(valor: unknown, no: NoDoContrato | null, profundidade = 0): u
   }
 
   if (valor !== null && typeof valor === 'object') {
-    // Object.create(null): sem prototipo, __proto__ vindo do JSON e chave comum
-    // em vez de reescrever o prototipo e sumir da evidencia.
+    // Object.create(null) protege a construcao deste objeto contra poluicao de
+    // prototipo. NAO basta para o `__proto__`: comprovado por diagnostico
+    // isolado, a chave existe ao gravar e some ao ler — o round-trip do
+    // Prisma/Postgres reconstroi o objeto com atribuicao comum e ela reescreve
+    // o prototipo. Por isso ela e RENOMEADA abaixo: evidencia marcada e
+    // aceitavel, evidencia que some em silencio nao e.
     const saida = Object.create(null) as Record<string, unknown>;
 
     for (const [chave, v] of Object.entries(valor)) {
+      // Chave que nao sobrevive a persistencia e gravada com marca explicita.
+      const nomeDeSaida = chave === '__proto__' ? '__proto__ [renomeado]' : chave;
+
       if (ehSensivel(chave)) {
-        saida[chave] = '[redigido]';
+        saida[nomeDeSaida] = '[redigido]';
         continue;
       }
       const ehEstrutura = Array.isArray(v) || (v !== null && typeof v === 'object');
@@ -174,15 +181,15 @@ function sanitizar(valor: unknown, no: NoDoContrato | null, profundidade = 0): u
       const filho = no === null ? undefined : no.objetos.get(chave);
 
       if (filho !== undefined && ehEstrutura) {
-        saida[chave] = sanitizar(v, filho, profundidade + 1);
+        saida[nomeDeSaida] = sanitizar(v, filho, profundidade + 1);
         continue;
       }
       if (!ehEstrutura && no !== null && no.escalares.has(chave)) {
-        saida[chave] = v;
+        saida[nomeDeSaida] = v;
         continue;
       }
       // Fora do contrato: estrutura recursa em MODO ESTRUTURA, escalar perde o valor.
-      saida[chave] = ehEstrutura
+      saida[nomeDeSaida] = ehEstrutura
         ? sanitizar(v, null, profundidade + 1)
         : '[nao-reconhecido]';
     }
