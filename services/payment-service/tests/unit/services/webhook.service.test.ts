@@ -99,6 +99,7 @@ interface Criada {
 function montar(leituras: Payment[], contagens: number[], erroNaTransacao?: Error) {
   const criadas: Criada[] = [];
   const inbox: Record<string, unknown>[] = [];
+  const filtros: Record<string, unknown>[] = [];
   let iLeitura = 0;
   let iCas = 0;
 
@@ -117,6 +118,13 @@ function montar(leituras: Payment[], contagens: number[], erroNaTransacao?: Erro
     webhookEvent: {
       create: jest.fn(async () => ({ id: 'inbox_1' })),
       update: jest.fn(async ({ data }: { data: Record<string, unknown> }) => { inbox.push(data); return data; }),
+      updateMany: jest.fn(
+        async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+          filtros.push(where);
+          inbox.push(data);
+          return { count: 1 };
+        },
+      ),
       findUniqueOrThrow: jest.fn(),
     },
     paymentTransaction: { findFirst: jest.fn(async () => autorizacao()) },
@@ -131,7 +139,7 @@ function montar(leituras: Payment[], contagens: number[], erroNaTransacao?: Erro
     }),
   } as unknown as PrismaClient;
 
-  return { service: new WebhookService({ prisma }), criadas, inbox, tx };
+  return { service: new WebhookService({ prisma }), criadas, inbox, filtros, tx };
 }
 
 describe('WebhookService — CAS perdido no reembolso (achado 4.1)', () => {
@@ -188,7 +196,7 @@ describe('WebhookService — falha durante a aplicacao (achado 6.4)', () => {
     // nao tinha NENHUM teste: nada provava que a linha nao fica presa em
     // RECEIVED nem que a mensagem original do banco fica fora do inbox.
     const falha = new Error('relation "payments" does not exist at character 42');
-    const { service, inbox } = montar(
+    const { service, inbox, filtros } = montar(
       [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
       [],
       falha,
@@ -202,5 +210,31 @@ describe('WebhookService — falha durante a aplicacao (achado 6.4)', () => {
     // Erro de Prisma carrega nome de tabela e coluna, e o inbox e lido em
     // triagem operacional. A mensagem original nunca pode chegar la.
     expect(JSON.stringify(marcacao)).not.toContain('relation');
+
+    // Assercao ESTRUTURAL (nao comportamental): a marcacao de FAILED so pode
+    // atingir linha ainda nao concluida. Provar isso por comportamento exigiria
+    // simular a execucao concorrente, o que so faz sentido com o claim
+    // exclusivo do Bloco 6.
+    const filtro = filtros.find((f) => f.status !== undefined);
+    expect(filtro).toBeDefined();
+  });
+});
+
+describe('WebhookService — exaustao do laco de reavaliacao (achado 6.2)', () => {
+  it('esgota o limite e devolve RETENTAVEL sem criar trilha nem encerrar o inbox', async () => {
+    // Contencao continua: todo CAS falha. O evento NAO pode virar terminal —
+    // sem efeito aplicado, encerrar aqui perderia o reembolso de vez.
+    const { service, criadas, inbox } = montar(
+      [pagamento({ refundedAmountCents: 0 })],
+      [0, 0, 0, 0],
+    );
+
+    const resultado = await service.processar('fake', eventoDeReembolso(7000));
+
+    expect(resultado.retentavel).toBe(true);
+    expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+    expect(criadas.filter((c) => c.type === TransactionType.REFUND)).toHaveLength(0);
+    expect(inbox.some((d) => d.status === WebhookStatus.PROCESSED)).toBe(false);
+    expect(inbox.some((d) => d.status === WebhookStatus.IGNORED)).toBe(false);
   });
 });

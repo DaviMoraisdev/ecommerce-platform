@@ -37,30 +37,46 @@ export interface ResultadoDeWebhook {
  * profundidade e tamanho de array para o payload nao virar vetor de DoS.
  */
 /**
- * Correspondencia EXATA so funciona para nomes curtos e ambiguos, onde busca
- * por substring geraria falso positivo: `company` contem "pan", `phone_number`
- * contem "number".
+ * Quebra a chave em SEGMENTOS: `card_cvv`, `cardCvv` e `card-cvv` viram todos
+ * ['card', 'cvv']. O sufixo numerico e removido para `cvv2` casar com `cvv`.
+ *
+ * Existe por causa do achado 3.1 da segunda rodada de review: correspondencia
+ * exata sobre a chave INTEIRA deixava passar toda variante composta.
  */
-const NOMES_EXATOS = new Set([
-  'pan', 'cvv', 'cvc', 'iban', 'card', 'number', 'token', 'secret',
+function segmentos(chave: string): string[] {
+  return chave
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((parte) => parte !== '')
+    .map((parte) => parte.replace(/[0-9]+$/, ''));
+}
+
+/**
+ * Casados por SEGMENTO exato, nunca por substring. Sao nomes curtos onde
+ * substring geraria falso positivo: `company` e `expansion` contem "pan",
+ * e redigir tudo que contem "pan" destruiria dado util de triagem.
+ */
+const SEGMENTOS_SENSIVEIS = new Set([
+  'pan', 'card', 'number', 'cvv', 'cvc', 'iban', 'token', 'secret',
   'password', 'senha',
 ]);
 
 /**
- * Raizes buscadas por SUBSTRING na chave normalizada. Normalizar (minusculas
- * e remover tudo que nao e alfanumerico) faz `access_token`, `accessToken`,
- * `x-api-key` e `API_KEY` colapsarem na mesma forma. Achado 3.1 do review:
- * antes era `has(chave.toLowerCase())`, e todas essas variantes escapavam.
+ * Casadas por SUBSTRING na chave normalizada. Sao longas o bastante para nao
+ * colidir com palavra comum, e pegam variantes que a segmentacao sozinha nao
+ * pega: `x-api-key` normaliza para `xapikey`, que contem `apikey`.
  */
 const RAIZES_SENSIVEIS = [
   'token', 'secret', 'password', 'senha', 'authorization', 'apikey',
-  'privatekey', 'cardnumber', 'creditcard', 'accountnumber',
+  'privatekey', 'cardnumber', 'creditcard', 'accountnumber', 'cvv', 'cvc',
+  'iban',
 ];
 
 function ehSensivel(chave: string): boolean {
   const normalizada = chave.toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (NOMES_EXATOS.has(normalizada)) return true;
-  return RAIZES_SENSIVEIS.some((raiz) => normalizada.includes(raiz));
+  if (RAIZES_SENSIVEIS.some((raiz) => normalizada.includes(raiz))) return true;
+  return segmentos(chave).some((parte) => SEGMENTOS_SENSIVEIS.has(parte));
 }
 const PROFUNDIDADE_MAXIMA = 8;
 const ITENS_MAXIMOS = 100;
@@ -127,8 +143,16 @@ export class WebhookService {
     try {
       return await this.decidirEAplicar(registro.id, evento);
     } catch (erro) {
-      await this.deps.prisma.webhookEvent.update({
-        where: { id: registro.id },
+      // GUARDA DE CONCORRENCIA (achado 4.1 da 2a rodada): so marca FAILED se a
+      // linha ainda NAO foi concluida. Sem isto, uma execucao que falha
+      // sobrescreve como FAILED o PROCESSED que a execucao concorrente acabou de
+      // gravar, e a reconciliacao passa a ver como pendente um evento aplicado.
+      // Nao substitui o claim exclusivo (Bloco 6); remove o pior sintoma dele.
+      await this.deps.prisma.webhookEvent.updateMany({
+        where: {
+          id: registro.id,
+          status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+        },
         data: {
           status: WebhookStatus.FAILED,
           attempts: { increment: 1 },
@@ -487,8 +511,12 @@ export class WebhookService {
     status: WebhookStatus,
     motivo?: string,
   ): Promise<ResultadoDeWebhook> {
-    await this.deps.prisma.webhookEvent.update({
-      where: { id: registroId },
+    // Mesma guarda do catch: desfecho so e gravado sobre linha nao concluida.
+    await this.deps.prisma.webhookEvent.updateMany({
+      where: {
+        id: registroId,
+        status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+      },
       data: {
         status,
         processedAt: new Date(),

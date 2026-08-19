@@ -586,17 +586,32 @@ describe('webhook — achados do review', () => {
     evento.cardNumber = '4111111111111111';
     evento.apiKey = 'ak_segredo';
     evento['x-api-key'] = 'xak_segredo';
+    // Achado 3.1 da segunda rodada: variantes COMPOSTAS de campo PCI. Todas
+    // passavam inteiras quando o casamento era exato sobre a chave inteira.
+    evento.card_cvv = 'cvv_segredo';
+    evento.cvv2 = 'cvv2_segredo';
+    evento.card_cvc = 'cvc_segredo';
+    evento.primary_pan = 'pan_segredo';
+    evento.customer_iban = 'iban_segredo';
+    // CONTROLE NEGATIVO: `company` contem "pan". Se este campo for redigido, a
+    // correcao virou redacao cega e destruiu dado util de triagem.
+    evento.company = 'ACME expansion LTDA';
     (evento.data as Record<string, unknown>).private_key = 'pk_segredo';
 
     expect((await postar(app, provider.assinarCorpo(evento))).status).toBe(200);
 
     const inbox = await prisma.webhookEvent.findMany();
     const serializado = JSON.stringify(inbox[0].payload);
-    for (const segredo of ['at_segredo', '4111111111111111', 'ak_segredo', 'xak_segredo', 'pk_segredo']) {
+    const segredos = [
+      'at_segredo', '4111111111111111', 'ak_segredo', 'xak_segredo', 'pk_segredo',
+      'cvv_segredo', 'cvv2_segredo', 'cvc_segredo', 'pan_segredo', 'iban_segredo',
+    ];
+    for (const segredo of segredos) {
       expect(serializado).not.toContain(segredo);
     }
     // O que nao e sensivel continua preservado.
     expect((inbox[0].payload as Record<string, unknown>).id).toBe(evento.id);
+    expect((inbox[0].payload as Record<string, unknown>).company).toBe('ACME expansion LTDA');
   });
 
   it('CASO 21: valor divergente em estado JA aplicado nao vira PROCESSED silencioso', async () => {
@@ -702,6 +717,59 @@ describe('webhook — achados do review', () => {
     // attempts conta TENTATIVAS QUE FALHARAM. Uma retomada bem-sucedida nao
     // e uma falha nova; incrementar no registro E no catch conta duas vezes.
     expect(inbox[0].attempts).toBe(1);
+    const final = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(final.status).toBe(PaymentStatus.CAPTURED);
+  });
+});
+
+// ==========================================================
+// 25. Ciclo completo do providerRef transitorio
+// ==========================================================
+describe('webhook — retomada apos providerRef aparecer', () => {
+  it('CASO 25: 503 primeiro, aplicado depois que a transacao e persistida', async () => {
+    const { app, provider } = montarApp();
+    const chargeRef = `ch_${randomUUID()}`;
+
+    // Pagamento SEM transacao ainda: o estado real entre o createCharge e o
+    // commit do registrarDesfecho.
+    const payment = await prisma.payment.create({
+      data: {
+        orderId: randomUUID(),
+        userId: randomUUID(),
+        amountCents: VALOR,
+        currency: 'BRL',
+        provider: 'fake',
+        status: PaymentStatus.PROCESSING,
+        expiresAt: new Date(Date.now() + 15 * 60_000),
+      },
+    });
+
+    const req = provider.assinarCorpo(corpo({}, { charge_ref: chargeRef }));
+
+    expect((await postar(app, req)).status).toBe(503);
+    const primeiro = await prisma.webhookEvent.findMany();
+    expect(primeiro).toHaveLength(1);
+    expect(primeiro[0].status).toBe(WebhookStatus.RECEIVED);
+
+    // O registrarDesfecho commita o providerRef.
+    await prisma.paymentTransaction.create({
+      data: {
+        paymentId: payment.id,
+        type: TransactionType.AUTHORIZE,
+        status: TransactionStatus.PENDING,
+        amountCents: VALOR,
+        providerRef: chargeRef,
+      },
+    });
+
+    // MESMO evento reentregue: colide no unique, e retomado, e aplica.
+    expect((await postar(app, req)).status).toBe(200);
+
+    const inbox = await prisma.webhookEvent.findMany();
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0].status).toBe(WebhookStatus.PROCESSED);
+    expect(inbox[0].lastError).toBeNull();
+
     const final = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(final.status).toBe(PaymentStatus.CAPTURED);
   });
