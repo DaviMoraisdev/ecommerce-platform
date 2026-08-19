@@ -449,3 +449,54 @@ describe('webhook — corpo que o parser raw nao aceita', () => {
     expect(intacto.status).toBe(PaymentStatus.PROCESSING);
   });
 });
+
+// ==========================================================
+// 16. Cap de tamanho do corpo cru
+// ==========================================================
+describe('webhook — teto de tamanho do corpo', () => {
+  it('CASO 16: corpo acima do teto e recusado com 413 e nao grava nada', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    // Corpo sem teto e vetor de exaustao de memoria. 80kb passa dos 64kb
+    // do LIMITE_CORPO_WEBHOOK; o 413 do express.raw e traduzido pelo
+    // handler de erro do app, que ja converte status de cliente em 4xx.
+    const gordo = corpo({}, { charge_ref: chargeRef });
+    gordo.recheio = 'x'.repeat(80000);
+
+    const res = await postar(app, provider.assinarCorpo(gordo));
+
+    expect(res.status).toBe(413);
+    expect(await prisma.webhookEvent.count()).toBe(0);
+    const intacto = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(intacto.status).toBe(PaymentStatus.PROCESSING);
+  });
+});
+
+// ==========================================================
+// 17. Sanitizacao em ESCRITA do payload do inbox
+// ==========================================================
+describe('webhook — sanitizacao do payload gravado', () => {
+  it('CASO 17: campo sensivel e redigido, o resto do payload e preservado', async () => {
+    const { app, provider } = montarApp();
+    const { chargeRef } = await cenario();
+
+    const evento = corpo({}, { charge_ref: chargeRef });
+    evento.token = 'tok_supersecreto';
+    (evento.data as Record<string, unknown>).cvv = '123';
+
+    const res = await postar(app, provider.assinarCorpo(evento));
+    expect(res.status).toBe(200);
+
+    const inbox = await prisma.webhookEvent.findMany();
+    const payload = inbox[0].payload as Record<string, unknown>;
+
+    expect(payload.token).toBe('[redigido]');
+    expect((payload.data as Record<string, unknown>).cvv).toBe('[redigido]');
+
+    // Denylist, e nao allowlist: o inbox existe para preservar a evidencia
+    // integra, inclusive campos que nao conhecemos.
+    expect(payload.id).toBe(evento.id);
+    expect(JSON.stringify(inbox[0].payload)).not.toContain('tok_supersecreto');
+  });
+});
