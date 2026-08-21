@@ -973,6 +973,10 @@ describe('webhook — gravacao na outbox', () => {
     expect(await prisma.outboxEvent.count()).toBe(1);
   });
 
+  // NAO prova o eventId deterministico: a reentrega e barrada pelo dedupe do
+  // inbox ANTES de chegar ao enqueue, entao so um evento seria gravado com id
+  // derivado ou aleatorio. Confirmado pela sabotagem R2, que nao o derrubou.
+  // Quem cobre o id sao os CASOs 29 e 30. Este e redundante com o CASO 6.
   it('CASO 31: webhook reentregue nao duplica o evento', async () => {
     const { app, provider } = montarApp();
     const { chargeRef } = await cenario();

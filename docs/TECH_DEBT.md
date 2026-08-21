@@ -84,9 +84,17 @@ e que nao estavam na lista original do bloco:
 - `payment.succeeded` nao validava o valor capturado contra o cobrado, embora o `POST /payments` faca isso em `assertValoresCoerentes`. Assinatura valida prova ORIGEM, nao COERENCIA. Coberto pelo CASO 18, sabotagem S14.
 - `refund.succeeded` nao validava o reembolso contra o `capturedAmountCents` do NOSSO banco. Invariante distinta da do `fake.wire`, que so compara campos do payload entre si e nao conhece o nosso estado. Coberto pelo CASO 19, sabotagem S15.
 
-### Bloco 5 — Integração payment ↔ order
-- **Primeiro consumer do order-service:** idempotência por `eventId` + DLQ, no padrão do notification-service. Hoje o order só produz eventos.
+### Bloco 5 - Integracao payment <-> order
 
+DIVIDIDO em 5a (payment publica) e 5b (order consome), pelo mesmo motivo que a
+Fase 3 dividiu o Bloco 8: um PR atravessando dois servicos com broker no meio
+tem superficie demais para uma rodada de review so.
+
+- [5a PAGO] **Payment publica `payment.captured` de forma confiavel.** Exchange proprio `payments` (topic), outbox gravada na MESMA transacao do efeito do webhook, relay com polling, publisher amqp com confirm channel, e `RABBITMQ_URL` fail-closed em producao.
+  `eventId` DETERMINISTICO (`payment.captured:<paymentId>`): o `@unique` vira trava de duplicata por construcao, e o consumidor do 5b ganha chave estavel.
+  Prova: 5 unitarios de evento/relay, 1 unitario de transacao, 3 de integracao, 3 de bootstrap/encerrar; 15 sabotagens, 14 no alvo exato e 1 que revelou cobertura ausente.
+- [5b] **Primeiro consumer do order-service:** fila propria com binding `payment.*` no exchange `payments`, idempotencia por `eventId` e DLQ. Hoje o order so produz eventos.
+  DECISAO EM ABERTO: o TECH_DEBT dizia "no padrao do notification-service", que reivindica no Redis. Mas o order NAO tem Redis (deps: prisma, amqplib, dotenv, express, helmet, jsonwebtoken) e o efeito dele e escrita no Postgres. Inbox com `@@unique` na MESMA transacao do efeito da exatamente-uma-vez de verdade; claim no Redis + escrita no Postgres deixa janela. Decidir no inicio do 5b.
 
 ### Bloco 6 — Reconciliação e expiração
 - **Recuperar chave de idempotencia presa em PROCESSING.** Quando `createCharge` falha de forma TRANSIENTE (timeout, 5xx), o dinheiro pode ter se movido — a resposta se perdeu, nao necessariamente o efeito. O servico deliberadamente NAO marca a chave como FAILED, porque isso liberaria nova tentativa com `attemptCount + 1` e chave de provedor nova, causando SEGUNDA COBRANCA. O custo: a chave fica presa em PROCESSING e o cliente nao consegue pagar aquele pedido ate a reconciliacao rodar. **O job deste bloco e obrigatorio para fechar o ciclo:** repetir `createCharge` com a chave DERIVADA (`paymentId:attemptCount`) devolve a cobranca original, e o desfecho pode ser gravado.
@@ -101,6 +109,8 @@ e que nao estavam na lista original do bloco:
 ### Bloco 8 — Bateria de testes
 - **Provar ROLLBACK de escrita parcial no `$transaction` de `persistirTentativa`.** O que já está provado: o duble de Prisma cobre ordem das operações e decisões, e a integração cobre os `CHECK`, o `@unique` de `orderId` e concorrência real. O que **não** está provado: que uma falha *depois* de uma escrita bem-sucedida dentro da mesma transação desfaz a anterior. No teste de concorrência a falha acontece no primeiro `create`, então não há escrita prévia para desfazer. Exige injetar falha no meio da transação — por exemplo forçar violação de `CHECK` no `paymentTransaction.create` após o `payment.update` de `attemptCount`, e conferir que o contador volta ao valor anterior.
 - **Cobrir o `getPrisma` sem `connectDatabase` prévio.** O caminho de erro existe e tem mensagem explícita, mas nenhum teste o exercita.
+- **A publicacao NUNCA foi exercitada contra um RabbitMQ real.** No Bloco 5a o `publish` e sempre duble: os testes provam a DECISAO do relay (marcar SENT so apos confirm, nao tocar nos eventos com broker fora, nao reentrar) e a gravacao na outbox, mas nenhum byte chegou a um broker. Conexao, `assertExchange`, confirm channel e reconexao sao codigo copiado do order-service e nao verificado aqui.
+- **`startOutboxRelay`/`stopOutboxRelay` sem teste proprio.** O que esta provado e que o ciclo de vida os CHAMA na ordem certa (sabotagens W1-W4). O laco de timer, o teto do `stopOutboxRelay` e a idempotencia do start nao tem teste — sao copia do relay do order-service.
 
 
 ### Bloco 9 — Stripe e hardening
@@ -180,6 +190,8 @@ e que nao estavam na lista original do bloco:
 ### Contratos / arquitetura
 - **Contrato de topologia compartilhado:** EXCHANGE e routing keys duplicados em order (`events/topology.ts`) e notification (`config/topology.ts`). Pacote comum ou aceitar a duplicação.
 - **Ciclo de vida acoplado a efeitos globais:** `start()`/estado do publisher rodam no import, com `process.exit` embutido e estado de módulo global. Separar construção/start/stop + injetar conexão/logger/exit.
+- **Publisher e relay duplicados entre order-service e payment-service.** Era decisao consciente registrada quando so o order tinha; com o Bloco 5a virou fato consumado, e agora sao dois arquivos quase identicos que precisam evoluir juntos. Divergencia ja existe e e deliberada: o payment recebe a URL do broker por parametro (vinda do `loadConfig`) em vez de ler `process.env`. Avaliar pacote compartilhado quando um terceiro servico precisar publicar.
+- **Knobs de tuning do publisher e do relay lidos direto de `process.env`** (`RABBITMQ_*_MS`, `OUTBOX_*`), fora do `loadConfig`. Inconsistencia interna consciente: sao valores sem relevancia de seguranca e com default seguro em faixa fechada, e trazer os oito para o `AppConfig` incharia a config sem ganho. Reavaliar se algum deles passar a ter efeito operacional relevante.
 
 ### Qualidade de testes / CI
 - **Não existe CI neste repositório.** Levantado indiretamente no review do PR #52: o `statusCheckRollup` do PR vem **vazio**, e o revisor registrou por três vezes que "não é possível confirmar apenas com base no diff se os testes foram executados". Hoje a única evidência de que a bateria passou é o output colado na descrição do PR — que é palavra do autor, não verificação independente. Mínimo necessário: workflow rodando `npm run verify` e `npm run verify:integration` com Postgres de serviço, por serviço alterado.
