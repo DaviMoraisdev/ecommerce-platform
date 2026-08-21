@@ -59,6 +59,7 @@ export interface PrismaFalso {
     updateMany: jest.Mock;
   };
   paymentTransaction: { create: jest.Mock; update: jest.Mock };
+  outboxEvent: { create: jest.Mock };
   $transaction: jest.Mock;
 }
 
@@ -115,6 +116,10 @@ export function prismaFalso(): PrismaFalso {
       create: jest.fn(async () => ({ id: 'tx_1' })),
       update: jest.fn(async () => ({ id: 'tx_1' })),
     },
+    // Sob captura automatica, registrarDesfecho tambem enfileira o evento na
+    // MESMA transacao. Como o $transaction daqui entrega o proprio duble como
+    // tx, este create serve aos dois lados.
+    outboxEvent: { create: jest.fn(async () => ({ id: 'out_1' })) },
     $transaction: jest.fn(),
   };
 

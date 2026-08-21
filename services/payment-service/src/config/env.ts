@@ -284,6 +284,13 @@ function parseAmqpUrl(
   if (parsed.protocol !== 'amqp:' && parsed.protocol !== 'amqps:') {
     throw new ConfigError(`RABBITMQ_URL usa protocolo nao suportado: ${parsed.protocol}`);
   }
+  // `new URL('amqp:broker')` NAO lanca: amqp nao e um esquema "special" na spec
+  // WHATWG, entao sem `//` o resto vira path opaco e hostname fica vazio. URL
+  // valida, endereco inexistente. Sem esta checagem o erro so apareceria no
+  // connect, em runtime, em vez de no boot.
+  if (parsed.hostname === '') {
+    throw new ConfigError('RABBITMQ_URL sem host: nao ha endereco de broker para conectar');
+  }
 
   if (nodeEnv === 'production' && parsed.protocol === 'amqp:' && !permitirInseguro) {
     throw new ConfigError(

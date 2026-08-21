@@ -780,3 +780,21 @@ describe('criarPagamento — traducao de erro do order', () => {
     },
   );
 });
+
+describe('criarPagamento — evento de captura na outbox', () => {
+  it('enfileira payment.captured na MESMA transacao do desfecho', async () => {
+    // Sem esta assercao, os seis casos acima voltariam ao verde so por o duble
+    // ter ganhado a propriedade — nenhum deles afirma que o evento foi
+    // enfileirado. Verde por preenchimento de duble nao e cobertura.
+    const { service, falso } = montar({});
+
+    await service.criarPagamento(entrada());
+
+    expect(falso.outboxEvent.create).toHaveBeenCalledTimes(1);
+    const args = falso.outboxEvent.create.mock.calls[0][0] as {
+      data: { eventId: string; routingKey: string; payload: Record<string, unknown> };
+    };
+    expect(args.data.routingKey).toBe('payment.captured');
+    expect(args.data.eventId).toBe('payment.captured:' + String(args.data.payload.paymentId));
+  });
+});

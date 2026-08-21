@@ -1,5 +1,10 @@
 import type { OutboxEvent } from '@prisma/client';
-import { tick, type RelayDeps } from '../../../src/events/outbox.relay';
+import {
+  startOutboxRelay,
+  stopOutboxRelay,
+  tick,
+  type RelayDeps,
+} from '../../../src/events/outbox.relay';
 
 function evento(id: string): OutboxEvent {
   return {
@@ -61,14 +66,13 @@ describe('outbox relay — um ciclo', () => {
     );
     const d = deps({ fetchPending });
 
-    // .catch aqui NAO e complacencia com falha: e para o teste FALHAR em vez de
-    // matar o runner. Sem ele, uma rejeicao nao tratada derruba o processo do
-    // Node e leva junto os outros casos do arquivo.
-    const primeiro = tick(d).catch(() => undefined);
-    const segundo = tick(d).catch(() => undefined); // entra com o primeiro em voo
-    if (liberar !== null) {
-      (liberar as (v: OutboxEvent[]) => void)([evento('ev_1')]);
-    }
+    // Sem .catch: o tick nao pode rejeitar (ele trata internamente), e engolir a
+    // rejeicao esconderia justamente a regressao que faria isso mudar.
+    // `fetchPending` e chamado sincronamente ate o primeiro await, entao
+    // `liberar` ja esta preenchido aqui.
+    const primeiro = tick(d);
+    const segundo = tick(d); // entra com o primeiro ainda em voo
+    (liberar as unknown as (v: OutboxEvent[]) => void)([evento('ev_1')]);
     await Promise.all([primeiro, segundo]);
 
     expect(fetchPending).toHaveBeenCalledTimes(1);
@@ -98,5 +102,48 @@ describe('outbox relay — tamanho do lote', () => {
       else process.env.OUTBOX_BATCH = anterior;
       jest.resetModules();
     }
+  });
+});
+
+describe('outbox relay — caminho de SUCESSO', () => {
+  it('CASO A8: publish confirmado marca SENT e nao registra retry', async () => {
+    // Sem este caso, remover o markSent nao derrubaria nada: os outros so
+    // cobrem falha, broker fora e reentrada.
+    const d = deps();
+    await tick(d);
+    expect(d.markSent).toHaveBeenCalledWith('ev_1');
+    expect(d.markRetry).not.toHaveBeenCalled();
+  });
+});
+
+describe('outbox relay — ciclo de vida', () => {
+  afterEach(async () => {
+    await stopOutboxRelay();
+    jest.useRealTimers();
+  });
+
+  it('CASO A9: start roda um ciclo e AGENDA o proximo', async () => {
+    jest.useFakeTimers();
+    const d = deps({ fetchPending: jest.fn(async () => []) });
+
+    startOutboxRelay(d);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(d.fetchPending).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(d.fetchPending).toHaveBeenCalledTimes(2);
+  });
+
+  it('CASO A10: stop impede que novos ciclos sejam agendados', async () => {
+    jest.useFakeTimers();
+    const d = deps({ fetchPending: jest.fn(async () => []) });
+
+    startOutboxRelay(d);
+    await jest.advanceTimersByTimeAsync(0);
+    await stopOutboxRelay();
+
+    const antes = (d.fetchPending as jest.Mock).mock.calls.length;
+    await jest.advanceTimersByTimeAsync(5000);
+    expect((d.fetchPending as jest.Mock).mock.calls.length).toBe(antes);
   });
 });

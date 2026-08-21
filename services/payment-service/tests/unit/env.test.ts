@@ -422,6 +422,14 @@ describe('loadConfig — RABBITMQ_URL', () => {
     expect(config.rabbitmqUrl).toBe('amqp://usuario:senha@broker:5672');
   });
 
+  it('recusa URL com protocolo valido mas SEM host', () => {
+    // Passaria o fail-closed da config e falharia so no relay assincrono,
+    // depois de o servico ja ter anunciado disponibilidade.
+    expect(() =>
+      loadConfig(envDeTeste({ RABBITMQ_URL: 'amqp:broker' })),
+    ).toThrow(/sem host/);
+  });
+
   it('recusa protocolo que nao e amqp nem amqps', () => {
     expect(() =>
       loadConfig(envDeTeste({ RABBITMQ_URL: 'http://broker:5672' })),
