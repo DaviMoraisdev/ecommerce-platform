@@ -9,6 +9,8 @@ import {
   type PrismaClient,
 } from '@prisma/client';
 import { mapearEstadoDoProvedor, podeTransicionar } from '../domain/payment-status';
+import { enqueue } from '../events/outbox.repository';
+import { montarEventoDeCaptura } from '../events/payment.events';
 import type { WebhookEventPayload } from '../providers/payment-provider.port';
 
 export interface WebhookServiceDeps {
@@ -426,6 +428,25 @@ export class WebhookService {
       if (count === 0) return false;
 
       await this.escreverTrilha(tx, payment, transacao, evento);
+
+      // MESMA TRANSACAO do efeito. Publicar depois do commit abriria janela para
+      // pagamento capturado sem evento; gravar antes, para efeito que falha,
+      // avisaria o order de um pagamento que nao aconteceu.
+      if (evento.eventType === 'payment.succeeded') {
+        await enqueue(
+          tx,
+          montarEventoDeCaptura(
+            {
+              paymentId: payment.id,
+              orderId: payment.orderId,
+              amountCents: payment.amountCents,
+              capturedAmountCents: evento.capturedAmountCents,
+              currency: payment.currency,
+            },
+            new Date(),
+          ),
+        );
+      }
 
       await tx.webhookEvent.update({
         where: { id: registroId },
