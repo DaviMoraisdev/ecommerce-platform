@@ -30,6 +30,8 @@ import {
   ProviderInvalidRequestError,
   type PaymentProvider,
 } from '../providers/payment-provider.port';
+import { enqueue } from '../events/outbox.repository';
+import { montarEventoDeCaptura } from '../events/payment.events';
 
 export interface PaymentServiceDeps {
   prisma: PrismaClient;
@@ -496,6 +498,26 @@ export class PaymentService {
             providerRef: resultado.providerRef,
           },
         });
+
+        // CAMINHO PRINCIPAL do projeto: sob captura automatica (decisao 10 da
+        // fase) o pagamento chega a CAPTURED AQUI, nao pelo webhook. Sem este
+        // enqueue nenhum evento e emitido, e um webhook posterior nao conserta
+        // porque o WebhookService curto-circuita quando o estado alvo ja e o
+        // atual. O `eventId` derivado garante que os dois caminhos nunca
+        // produzam duas linhas para a mesma captura.
+        await enqueue(
+          tx,
+          montarEventoDeCaptura(
+            {
+              paymentId: payment.id,
+              orderId: payment.orderId,
+              amountCents: payment.amountCents,
+              capturedAmountCents: resultado.capturedAmountCents,
+              currency: payment.currency,
+            },
+            new Date(),
+          ),
+        );
       }
 
       const p = await tx.payment.update({

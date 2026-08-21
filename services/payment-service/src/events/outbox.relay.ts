@@ -15,7 +15,19 @@ export interface RelayDeps {
   lote?: number;
 }
 
-const LOTE_PADRAO = 20;
+/**
+ * Faixa fechada, mesmo criterio do relay do order-service. Lido no import: e
+ * knob de operacao, sem relevancia de seguranca e com default seguro.
+ *
+ * Estava DOCUMENTADO no .env.example e nunca lido — operador configurava e nada
+ * mudava (apontado no review do PR #54).
+ */
+function inteiroNaFaixa(raw: string | undefined, padrao: number, min: number, max: number): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= min && n <= max ? n : padrao;
+}
+
+const LOTE_PADRAO = inteiroNaFaixa(process.env.OUTBOX_BATCH, 20, 1, 500);
 
 /** Guarda de reentrada: dois ciclos simultaneos publicariam o mesmo lote. */
 let executando = false;
@@ -55,13 +67,8 @@ export async function tick(deps: RelayDeps): Promise<void> {
   }
 }
 
-function intervalo(raw: string | undefined, padrao: number, min: number, max: number): number {
-  const n = Number(raw);
-  return Number.isInteger(n) && n >= min && n <= max ? n : padrao;
-}
-
-const POLL_INTERVAL_MS = intervalo(process.env.OUTBOX_POLL_INTERVAL_MS, 1000, 50, 60000);
-const STOP_TIMEOUT_MS = intervalo(process.env.OUTBOX_STOP_TIMEOUT_MS, 5000, 1, 60000);
+const POLL_INTERVAL_MS = inteiroNaFaixa(process.env.OUTBOX_POLL_INTERVAL_MS, 1000, 50, 60000);
+const STOP_TIMEOUT_MS = inteiroNaFaixa(process.env.OUTBOX_STOP_TIMEOUT_MS, 5000, 1, 60000);
 
 let timer: NodeJS.Timeout | null = null;
 let parado = false;

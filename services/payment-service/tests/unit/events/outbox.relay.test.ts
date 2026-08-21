@@ -74,3 +74,29 @@ describe('outbox relay — um ciclo', () => {
     expect(fetchPending).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('outbox relay — tamanho do lote', () => {
+  it('CASO A6: usa o lote injetado', async () => {
+    const d = deps({ lote: 7 });
+    await tick(d);
+    expect(d.fetchPending).toHaveBeenCalledWith(7);
+  });
+
+  it('CASO A7: OUTBOX_BATCH da env realmente afeta o lote padrao', async () => {
+    // O knob estava documentado no .env.example e nunca era lido: o operador
+    // configurava e o lote continuava 20 (apontado no review do PR #54).
+    const anterior = process.env.OUTBOX_BATCH;
+    process.env.OUTBOX_BATCH = '3';
+    try {
+      jest.resetModules();
+      const modulo = await import('../../../src/events/outbox.relay');
+      const d = deps();
+      await modulo.tick(d as unknown as Parameters<typeof modulo.tick>[0]);
+      expect(d.fetchPending).toHaveBeenCalledWith(3);
+    } finally {
+      if (anterior === undefined) delete process.env.OUTBOX_BATCH;
+      else process.env.OUTBOX_BATCH = anterior;
+      jest.resetModules();
+    }
+  });
+});
