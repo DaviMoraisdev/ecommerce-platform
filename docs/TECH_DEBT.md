@@ -134,6 +134,7 @@ e que nao estavam na lista original do bloco:
 - **Separar `/health` (liveness) de `/ready` (readiness com check de DB):** quando houver health probes de orquestração.
 - **Paginação no `/admin/users` (auth-service):** [herdada da Fase 2].
 - **Portas de dev em 0.0.0.0:** postgres/mongo/redis publicam em todas as interfaces (rabbitmq já restrito a 127.0.0.1). Restringir + credenciais fortes por ambiente. Dev-only, baixa.
+- **`deepmerge-ts` com stack exhaustion (GHSA-ggr8-5vv4-36mx), 3 avisos high no `npm audit`.** Cadeia unica confirmada por `npm ls deepmerge-ts`: `prisma@6.19.3` (devDependency, CLI) -> `@prisma/config` -> `deepmerge-ts@7.1.5`. O `@prisma/client`, que e dependencia de PRODUCAO, nao aparece na cadeia — nao ha exposicao em runtime, so em build/CLI. O `npm audit fix --force` faz downgrade para `prisma@6.12.0`, que e breaking. A mesma cadeia existe em TODOS os servicos da plataforma, entao a correcao e transversal e nao cabe num PR de feature. Reavaliar quando o Prisma publicar versao com `@prisma/config` corrigido.
 
 ### Infra / containerização
 - **payment-service no docker-compose:** nasceu fora do compose (só `npm run dev`), mesmo estado do notification-service. Dockerfile, entrada no compose e healthcheck. Tratar junto com o item do notification-service, abaixo.
