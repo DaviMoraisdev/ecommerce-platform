@@ -105,6 +105,10 @@ function montar(
   const criadas: Criada[] = [];
   const inbox: Record<string, unknown>[] = [];
   const filtros: Record<string, unknown>[] = [];
+  // Dois espioes com o MESMO nome de operacao, em clientes diferentes: e a
+  // unica forma de distinguir "gravou dentro da transacao" de "gravou fora".
+  const outboxNoTx = jest.fn(async () => ({}));
+  const outboxForaDaTx = jest.fn(async () => ({}));
   let iLeitura = 0;
   let iCas = 0;
 
@@ -117,6 +121,7 @@ function montar(
     webhookEvent: {
       update: jest.fn(async ({ data }: { data: Record<string, unknown> }) => { inbox.push(data); return data; }),
     },
+    outboxEvent: { create: outboxNoTx },
   };
 
   const prisma = {
@@ -133,6 +138,7 @@ function montar(
       findUniqueOrThrow: jest.fn(),
     },
     paymentTransaction: { findFirst: jest.fn(async () => transacao) },
+    outboxEvent: { create: outboxForaDaTx },
     payment: {
       findUniqueOrThrow: jest.fn(async () =>
         leituras[Math.min(iLeitura++, leituras.length - 1)],
@@ -144,7 +150,7 @@ function montar(
     }),
   } as unknown as PrismaClient;
 
-  return { service: new WebhookService({ prisma }), criadas, inbox, filtros, tx };
+  return { service: new WebhookService({ prisma }), criadas, inbox, filtros, tx, outboxNoTx, outboxForaDaTx };
 }
 
 describe('WebhookService — CAS perdido no reembolso (achado 4.1)', () => {
@@ -261,5 +267,22 @@ describe('WebhookService — guarda de concorrencia no caminho retentavel (achad
       id: 'inbox_1',
       status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
     });
+  });
+});
+
+describe('WebhookService — outbox na MESMA transacao (achado R6)', () => {
+  it('grava o evento pelo cliente da TRANSACAO, nunca pelo cliente solto', async () => {
+    const emVoo = pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 });
+    const { service, outboxNoTx, outboxForaDaTx } = montar([emVoo], [1]);
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.status).toBe(WebhookStatus.PROCESSED);
+    expect(outboxNoTx).toHaveBeenCalledTimes(1);
+    // Pelo cliente solto, o evento COMMITA sozinho: um efeito que reverte
+    // deixaria o order-service sabendo de um pagamento que nao aconteceu.
+    // O CASO 30 prova a direcao oposta (evento falha -> efeito nao fica);
+    // esta e a simetrica, e ate a sabotagem R6 ela nao tinha prova nenhuma.
+    expect(outboxForaDaTx).not.toHaveBeenCalled();
   });
 });
