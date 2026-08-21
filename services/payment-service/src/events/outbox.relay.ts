@@ -54,3 +54,64 @@ export async function tick(deps: RelayDeps): Promise<void> {
     executando = false;
   }
 }
+
+function intervalo(raw: string | undefined, padrao: number, min: number, max: number): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= min && n <= max ? n : padrao;
+}
+
+const POLL_INTERVAL_MS = intervalo(process.env.OUTBOX_POLL_INTERVAL_MS, 1000, 50, 60000);
+const STOP_TIMEOUT_MS = intervalo(process.env.OUTBOX_STOP_TIMEOUT_MS, 5000, 1, 60000);
+
+let timer: NodeJS.Timeout | null = null;
+let parado = false;
+let iniciado = false;
+let cicloAtual: Promise<void> | null = null;
+
+/** Idempotente: chamar duas vezes nao cria dois loops de timer. */
+export function startOutboxRelay(deps: RelayDeps): void {
+  if (iniciado) return;
+  iniciado = true;
+  parado = false;
+
+  const loop = async (): Promise<void> => {
+    if (parado) return;
+    cicloAtual = tick(deps);
+    await cicloAtual;
+    cicloAtual = null;
+    if (!parado) timer = setTimeout(() => void loop(), POLL_INTERVAL_MS);
+  };
+
+  console.log('[relay] outbox relay iniciado (intervalo ' + POLL_INTERVAL_MS + 'ms)');
+  void loop();
+}
+
+/**
+ * Para e AGUARDA o ciclo em voo, para nao encerrar no meio de uma publicacao.
+ * Com teto: um tick travado nao pode pendurar o shutdown — o evento fica
+ * PENDING e sai no proximo boot, que e o at-least-once funcionando.
+ */
+export async function stopOutboxRelay(): Promise<void> {
+  parado = true;
+  if (timer) {
+    clearTimeout(timer);
+    timer = null;
+  }
+  if (cicloAtual) {
+    let idDoTeto: NodeJS.Timeout | undefined;
+    const teto = new Promise<void>((resolve) => {
+      idDoTeto = setTimeout(() => {
+        console.warn(
+          '[relay] ciclo nao terminou em ' + STOP_TIMEOUT_MS + 'ms; seguindo o shutdown (evento fica PENDING)',
+        );
+        resolve();
+      }, STOP_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([cicloAtual.catch(() => undefined), teto]);
+    } finally {
+      if (idDoTeto) clearTimeout(idDoTeto);
+    }
+  }
+  iniciado = false;
+}
