@@ -236,3 +236,58 @@ describe('publisher — canal fechado sem erro', () => {
     expect(conexao.close).toHaveBeenCalled();
   }, 5_000);
 });
+
+describe('publisher — abertura condenada', () => {
+  it('CASO P10: apos o deadline, a abertura PARA em vez de seguir criando canal', async () => {
+    // A sabotagem S13 mostrou que o P8 sozinho nao cobre isto: com canal mock
+    // que resolve na hora, o descarte acontece no ponto de checagem seguinte e
+    // o teste passa. No mundo real o deadline vence PORQUE o broker esta
+    // doente, entao o createConfirmChannel pendura — e agora fora do
+    // withTimeout, sem deadline nenhum. A conexao deixa de vazar por um
+    // instante e passa a vazar para sempre.
+    const canal = montarCanal();
+    const conexao = montarConexao(canal, {
+      createConfirmChannel: jest.fn(() => new Promise(() => undefined)),
+    });
+
+    jest.resetModules();
+    process.env.RABBITMQ_MAX_RETRIES = '1';
+    process.env.RABBITMQ_CONNECT_TIMEOUT_MS = '50';
+    const amqp = (await import('amqplib')).default as unknown as { connect: jest.Mock };
+    amqp.connect.mockReset();
+    let liberarConexao = (_v: unknown): void => undefined;
+    amqp.connect.mockImplementation(
+      () => new Promise((r) => {
+        liberarConexao = r as (v: unknown) => void;
+      }),
+    );
+    const mod = await import('../../../src/events/publisher');
+
+    const emVoo = mod.initEventPublisher(URL_BROKER).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 80));
+    liberarConexao(conexao);
+    await emVoo;
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(conexao.createConfirmChannel).not.toHaveBeenCalled();
+    expect(conexao.close).toHaveBeenCalled();
+  }, 5_000);
+
+  it('CASO P11: conexao que morre durante a abertura nao vira publisher pronto', async () => {
+    // Os observadores entram no instante da aquisicao, entao a conexao pode
+    // fechar ANTES de ela virar a conexao atual. Nesse instante o guard
+    // `connection !== conn` e verdadeiro e o handler nao limpa nada: sem a
+    // marca `morta`, o estado global adotaria um cadaver.
+    const canal = montarCanal();
+    const conexao = montarConexao(canal);
+    conexao.createConfirmChannel = jest.fn(async () => {
+      conexao.handlers['close']?.();
+      return canal;
+    }) as unknown as typeof conexao.createConfirmChannel;
+
+    const { mod } = await carregar(conexao, { RABBITMQ_MAX_RETRIES: '1' });
+
+    await expect(mod.initEventPublisher(URL_BROKER)).rejects.toThrow();
+    expect(mod.isPublisherReady()).toBe(false);
+  }, 5_000);
+});
