@@ -124,3 +124,19 @@ model OutboxEvent {
   @@index([status, createdAt])
   @@map("outbox_events")
 }
+
+model InboxEvent {
+  id String @id @default(uuid())
+  // eventId que veio DENTRO do evento (determinstico do lado do payment:
+  // "payment.captured:<paymentId>"). UNIQUE e a trava de duplicata: a garantia
+  // vem da constraint, nao de um SELECT previo — checar-e-depois-inserir tem
+  // corrida entre a checagem e o insert.
+  eventId String @unique
+  routingKey String
+  // Quando o efeito commitou. Como o insert vive na MESMA transacao do efeito,
+  // esta linha existir prova que o efeito aconteceu — e o contrario tambem.
+  processedAt DateTime @default(now())
+
+  @@index([processedAt])
+  @@map("inbox_events")
+}
