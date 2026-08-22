@@ -21,6 +21,9 @@ function montarDeps(ordem: string[], overrides: Partial<BootstrapDeps> = {}) {
       ordem.push('connect');
     }),
     createApp: jest.fn(() => ({ listen })),
+    iniciarRelay: jest.fn(() => {
+      ordem.push('relay');
+    }),
     ...overrides,
   };
 
@@ -32,13 +35,16 @@ beforeEach(() => {
 });
 
 describe('bootstrap', () => {
-  it('executa na ordem: configuracao, conexao, porta', async () => {
+  it('executa na ordem: configuracao, conexao, relay, porta', async () => {
     const ordem: string[] = [];
     const { deps } = montarDeps(ordem);
 
     await bootstrap(deps);
 
-    expect(ordem).toEqual(['config', 'connect', 'listen']);
+    // O relay entra DEPOIS do banco porque o ciclo dele le a outbox, e ANTES
+    // da porta porque nao depende de HTTP — atrasar a saida de eventos ate o
+    // servidor subir nao traz beneficio nenhum.
+    expect(ordem).toEqual(['config', 'connect', 'relay', 'listen']);
   });
 
   it('passa ao banco a URL vinda da configuracao validada', async () => {
@@ -88,5 +94,25 @@ describe('bootstrap', () => {
 
     expect(deps.createApp).not.toHaveBeenCalled();
     expect(listen).not.toHaveBeenCalled();
+  });
+});
+
+describe('bootstrap — relay da outbox', () => {
+  it('NAO inicia o relay quando a conexao com o banco falha', async () => {
+    const ordem: string[] = [];
+    const { deps } = montarDeps(ordem, {
+      connectDatabase: jest.fn(async () => {
+        throw new Error('Falha ao conectar ao banco de dados');
+      }),
+    });
+    await expect(bootstrap(deps)).rejects.toThrow('Falha ao conectar');
+    expect(deps.iniciarRelay).not.toHaveBeenCalled();
+  });
+
+  it('passa ao relay a configuracao validada', async () => {
+    const ordem: string[] = [];
+    const { deps } = montarDeps(ordem);
+    await bootstrap(deps);
+    expect(deps.iniciarRelay).toHaveBeenCalledWith(CONFIG);
   });
 });

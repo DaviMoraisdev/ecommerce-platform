@@ -17,6 +17,8 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
+      pararRelay: async () => undefined,
+      fecharPublisher: async () => undefined,
       fecharServidor: async () => void ordem.push('servidor'),
       desconectarBanco: async () => void ordem.push('banco'),
       ...c,
@@ -33,6 +35,8 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
+      pararRelay: async () => undefined,
+      fecharPublisher: async () => undefined,
       fecharServidor: async () => {
         throw new Error('servidor travado');
       },
@@ -50,6 +54,8 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
+      pararRelay: async () => undefined,
+      fecharPublisher: async () => undefined,
       fecharServidor: async () => undefined,
       desconectarBanco: async () => {
         throw new Error('banco fora');
@@ -65,6 +71,8 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
+      pararRelay: async () => undefined,
+      fecharPublisher: async () => undefined,
       // Nunca resolve: simula requisicao em voo que nao termina.
       fecharServidor: () => new Promise<void>(() => undefined),
       desconectarBanco: async () => undefined,
@@ -81,6 +89,8 @@ describe('encerrar', () => {
 
     await expect(
       encerrar({
+        pararRelay: async () => undefined,
+        fecharPublisher: async () => undefined,
         fecharServidor: async () => {
           throw new Error('a');
         },
@@ -108,6 +118,8 @@ describe('registrarEncerramento', () => {
     const espiao = espionarSinais();
 
     registrarEncerramento({
+      pararRelay: async () => undefined,
+      fecharPublisher: async () => undefined,
       fecharServidor: async () => undefined,
       desconectarBanco: async () => undefined,
       sinais: ['SIGTERM', 'SIGINT'],
@@ -124,6 +136,8 @@ describe('registrarEncerramento', () => {
     const codigos: number[] = [];
 
     registrarEncerramento({
+      pararRelay: async () => undefined,
+      fecharPublisher: async () => undefined,
       fecharServidor: async () => void (fechamentos += 1),
       desconectarBanco: async () => undefined,
       sinais: ['SIGINT'],
@@ -149,6 +163,8 @@ describe('registrarEncerramento', () => {
     const codigos: number[] = [];
 
     registrarEncerramento({
+      pararRelay: async () => undefined,
+      fecharPublisher: async () => undefined,
       fecharServidor: async () => {
         throw new Error('falhou');
       },
@@ -164,5 +180,24 @@ describe('registrarEncerramento', () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(codigos).toEqual([1]);
+  });
+});
+
+describe('encerrar — relay e publisher', () => {
+  it('para o relay ANTES de fechar o publisher, e o banco por ULTIMO', async () => {
+    const ordem: string[] = [];
+    const c = coletores();
+    const codigo = await encerrar({
+      fecharServidor: async () => void ordem.push('servidor'),
+      pararRelay: async () => void ordem.push('relay'),
+      fecharPublisher: async () => void ordem.push('publisher'),
+      desconectarBanco: async () => void ordem.push('banco'),
+      ...c,
+    });
+    // O tick usa o BANCO, entao o banco sai por ultimo. E o publisher sai
+    // depois do relay parado: na ordem inversa, a conexao cairia no meio de
+    // uma publicacao ja iniciada.
+    expect(ordem).toEqual(['servidor', 'relay', 'publisher', 'banco']);
+    expect(codigo).toBe(0);
   });
 });

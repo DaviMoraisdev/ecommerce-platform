@@ -10,6 +10,13 @@ export const SEGREDO_DE_TESTE = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071
  * dentro do loadConfig passaria por todos os testes. Valores distintos tornam a
  * troca visivel.
  */
+/**
+ * Uma constante para os DOIS builders. `configDeTeste` monta o AppConfig e
+ * `envDeTeste` monta as variaveis: eles sao espelhos, e um valor literal
+ * repetido nos dois deixaria os espelhos divergirem em silencio.
+ */
+export const URL_BROKER_DE_TESTE = 'amqps://usuario:senha@127.0.0.1:5671';
+
 export const SEGREDO_WEBHOOK = 'webhook0000111122223333444455556666777788889999aa';
 export const SEGREDO_JWT = 'jwt0000aaaabbbbccccddddeeeeffff11112222333344445555';
 
@@ -32,6 +39,7 @@ export function configDeTeste(overrides: Partial<AppConfig> = {}): AppConfig {
     orderServiceUrl: 'http://localhost:3006',
     orderServiceTimeoutMs: 5000,
     paymentWindowMinutes: 15,
+    rabbitmqUrl: URL_BROKER_DE_TESTE,
     ...overrides,
   };
 }
@@ -54,6 +62,24 @@ export function envDeTeste(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv
     PAYMENT_WEBHOOK_SECRET: SEGREDO_WEBHOOK,
     JWT_SECRET: SEGREDO_JWT,
     ORDER_SERVICE_URL: 'http://localhost:3006',
+    RABBITMQ_URL: URL_BROKER_DE_TESTE,
     ...overrides,
   };
+}
+
+/**
+ * Cenario de PRODUCAO coerente.
+ *
+ * `NODE_ENV=production` liga tres regras fail-closed de uma vez: provedor real,
+ * https no order-service e amqps no broker. Um teste que troca so o NODE_ENV
+ * falha pela regra ERRADA e esconde o que queria provar — aconteceu duas vezes
+ * ao escrever os testes do RABBITMQ_URL.
+ */
+export function envDeProducao(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return envDeTeste({
+    NODE_ENV: 'production',
+    PAYMENT_PROVIDER: 'stripe',
+    ORDER_SERVICE_URL: 'https://order.interno:3006',
+    ...overrides,
+  });
 }

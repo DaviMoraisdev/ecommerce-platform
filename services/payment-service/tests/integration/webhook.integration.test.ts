@@ -43,6 +43,7 @@ beforeAll(async () => {
 
 afterEach(async () => {
   await prisma.webhookEvent.deleteMany();
+  await prisma.outboxEvent.deleteMany();
   await prisma.idempotencyRecord.deleteMany();
   await prisma.paymentTransaction.deleteMany();
   await prisma.payment.deleteMany();
@@ -918,5 +919,72 @@ describe('webhook — limites da arvore de contrato', () => {
     // renomeada na escrita — a evidencia de que o campo veio nao pode sumir em
     // silencio de uma tabela de auditoria.
     expect(Object.keys(payload)).toContain('__proto__ [renomeado]');
+  });
+});
+
+// ==========================================================
+// 29 a 31. Outbox: o evento sai junto com o efeito, ou nao sai
+// ==========================================================
+describe('webhook — gravacao na outbox', () => {
+  it('CASO 29: efeito aplicado grava UM evento, com payload minimo', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const res = await postar(app, provider.assinarCorpo(corpo({}, { charge_ref: chargeRef })));
+    expect(res.status).toBe(200);
+
+    const eventos = await prisma.outboxEvent.findMany();
+    expect(eventos).toHaveLength(1);
+    expect(eventos[0].routingKey).toBe('payment.captured');
+    // eventId DERIVADO: o @unique vira trava de duplicata por construcao.
+    expect(eventos[0].eventId).toBe(`payment.captured:${payment.id}`);
+    expect(eventos[0].status).toBe('PENDING');
+
+    const payload = eventos[0].payload as Record<string, unknown>;
+    expect(payload.paymentId).toBe(payment.id);
+    expect(payload.orderId).toBe(payment.orderId);
+    expect(payload.capturedAmountCents).toBe(VALOR);
+    // Nada do provedor atravessa a fila.
+    expect(JSON.stringify(payload)).not.toContain('charge_ref');
+    expect(JSON.stringify(payload)).not.toContain(chargeRef);
+  });
+
+  it('CASO 30: colisao do eventId reverte a transacao INTEIRA', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    // Ocupa o eventId de proposito: a gravacao do evento passa a falhar DENTRO
+    // da transacao do efeito. Ou os dois commitam, ou nenhum.
+    await prisma.outboxEvent.create({
+      data: {
+        eventId: `payment.captured:${payment.id}`,
+        routingKey: 'payment.captured',
+        payload: { preexistente: true },
+      },
+    });
+
+    const res = await postar(app, provider.assinarCorpo(corpo({}, { charge_ref: chargeRef })));
+    expect(res.status).toBe(500);
+
+    const intacto = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(intacto.status).toBe(PaymentStatus.PROCESSING);
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(0);
+    expect(await prisma.outboxEvent.count()).toBe(1);
+  });
+
+  // NAO prova o eventId deterministico: a reentrega e barrada pelo dedupe do
+  // inbox ANTES de chegar ao enqueue, entao so um evento seria gravado com id
+  // derivado ou aleatorio. Confirmado pela sabotagem R2, que nao o derrubou.
+  // Quem cobre o id sao os CASOs 29 e 30. Este e redundante com o CASO 6.
+  it('CASO 31: webhook reentregue nao duplica o evento', async () => {
+    const { app, provider } = montarApp();
+    const { chargeRef } = await cenario();
+    const req = provider.assinarCorpo(corpo({}, { charge_ref: chargeRef }));
+
+    expect((await postar(app, req)).status).toBe(200);
+    expect((await postar(app, req)).status).toBe(200);
+
+    expect(await prisma.outboxEvent.count()).toBe(1);
   });
 });

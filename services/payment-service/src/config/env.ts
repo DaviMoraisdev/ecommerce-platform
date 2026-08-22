@@ -26,6 +26,11 @@ export interface AppConfig {
    * cliente com cartao recusado tem menos tempo para tentar outro.
    */
   paymentWindowMinutes: number;
+  /**
+   * URL do broker. `null` significa relay DESLIGADO — permitido apenas fora de
+   * producao, para desenvolver sem RabbitMQ de pe.
+   */
+  rabbitmqUrl: string | null;
 }
 
 export class ConfigError extends Error {
@@ -242,6 +247,61 @@ function parseProvider(raw: string, nodeEnv: NodeEnv): ProviderName {
   throw new ConfigError(`PAYMENT_PROVIDER invalido: "${raw}". Use "fake" ou "stripe".`);
 }
 
+/**
+ * Espelha deliberadamente o tratamento de ORDER_SERVICE_URL: a credencial viaja
+ * DENTRO da URL do broker, entao transporte em texto claro em producao expoe
+ * usuario e senha a quem estiver na rede.
+ *
+ * Ausencia e FAIL-CLOSED em producao pelo mesmo motivo do PAYMENT_PROVIDER=fake:
+ * sem broker, o pagamento e capturado e o pedido nunca fica sabendo —
+ * inconsistencia silenciosa entre servicos. Em development/test a ausencia apenas
+ * desliga o relay, com log explicito.
+ */
+function parseAmqpUrl(
+  raw: string | undefined,
+  nodeEnv: NodeEnv,
+  permitirInseguro: boolean,
+): string | null {
+  const valor = (raw ?? '').trim();
+
+  if (valor === '') {
+    if (nodeEnv === 'production') {
+      throw new ConfigError(
+        'RABBITMQ_URL e obrigatoria em production: sem broker, a captura nunca chega ao order-service.',
+      );
+    }
+    return null;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(valor);
+  } catch {
+    // Nunca interpolamos a URL na mensagem: ela contem a senha.
+    throw new ConfigError('RABBITMQ_URL nao e uma URL valida');
+  }
+
+  if (parsed.protocol !== 'amqp:' && parsed.protocol !== 'amqps:') {
+    throw new ConfigError(`RABBITMQ_URL usa protocolo nao suportado: ${parsed.protocol}`);
+  }
+  // `new URL('amqp:broker')` NAO lanca: amqp nao e um esquema "special" na spec
+  // WHATWG, entao sem `//` o resto vira path opaco e hostname fica vazio. URL
+  // valida, endereco inexistente. Sem esta checagem o erro so apareceria no
+  // connect, em runtime, em vez de no boot.
+  if (parsed.hostname === '') {
+    throw new ConfigError('RABBITMQ_URL sem host: nao ha endereco de broker para conectar');
+  }
+
+  if (nodeEnv === 'production' && parsed.protocol === 'amqp:' && !permitirInseguro) {
+    throw new ConfigError(
+      'RABBITMQ_URL em texto claro (amqp://) em production. A credencial viaja na URL. ' +
+        'Use amqps:// ou declare RABBITMQ_ALLOW_INSECURE=true se o transporte ja for protegido.',
+    );
+  }
+
+  return valor;
+}
+
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   const nodeEnv = parseNodeEnv(source.NODE_ENV);
 
@@ -279,6 +339,11 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       source.PAYMENT_WINDOW_MINUTES,
       'PAYMENT_WINDOW_MINUTES',
       15,
+    ),
+    rabbitmqUrl: parseAmqpUrl(
+      source.RABBITMQ_URL,
+      nodeEnv,
+      parseBooleano(source.RABBITMQ_ALLOW_INSECURE, 'RABBITMQ_ALLOW_INSECURE'),
     ),
   };
 }

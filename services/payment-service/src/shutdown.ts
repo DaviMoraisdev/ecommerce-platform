@@ -14,6 +14,10 @@
 export interface EncerramentoDeps {
   /** Para de aceitar conexoes e espera as em voo terminarem. */
   fecharServidor: () => Promise<void>;
+  /** Aguarda o ciclo em voo do relay: cortar no meio deixaria evento a caminho. */
+  pararRelay: () => Promise<void>;
+  /** So depois do relay parado, senao a conexao cai no meio de uma publicacao. */
+  fecharPublisher: () => Promise<void>;
   desconectarBanco: () => Promise<void>;
   /** Teto para o encerramento inteiro. */
   timeoutMs?: number;
@@ -50,6 +54,28 @@ export async function encerrar(deps: EncerramentoDeps): Promise<number> {
     } catch (erro) {
       reportarErro(
         '[payment-service] falha ao fechar o servidor: ' + (erro as Error).message,
+      );
+      codigo = 1;
+    }
+
+    // Relay ANTES do publisher: na ordem inversa, a conexao cairia no meio de
+    // uma publicacao ja iniciada.
+    try {
+      await deps.pararRelay();
+      log('[payment-service] relay da outbox parado');
+    } catch (erro) {
+      reportarErro(
+        '[payment-service] falha ao parar o relay: ' + (erro as Error).message,
+      );
+      codigo = 1;
+    }
+
+    try {
+      await deps.fecharPublisher();
+      log('[payment-service] publisher fechado');
+    } catch (erro) {
+      reportarErro(
+        '[payment-service] falha ao fechar o publisher: ' + (erro as Error).message,
       );
       codigo = 1;
     }

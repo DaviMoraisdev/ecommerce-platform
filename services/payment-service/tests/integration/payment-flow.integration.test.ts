@@ -8,6 +8,7 @@ import { PaymentService } from '../../src/services/payment.service';
 import { assertTestDatabase } from '../helpers/testDbGuard';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { orderClientFalso, pedidoDeTeste } from '../helpers/prisma-fake';
+import * as outboxRepo from '../../src/events/outbox.repository';
 
 /**
  * O que ESTE arquivo prova e os testes unitarios NAO podem provar.
@@ -37,6 +38,7 @@ beforeAll(async () => {
 
 afterEach(async () => {
   // Ordem ditada pelas FKs com Restrict: dependentes antes de payments.
+  await prisma.outboxEvent.deleteMany();
   await prisma.idempotencyRecord.deleteMany();
   await prisma.paymentTransaction.deleteMany();
   await prisma.payment.deleteMany();
@@ -420,5 +422,59 @@ describe('review 4.4 — a chave fica vinculada a requisicao que a criou', () =>
 
     expect(espiaoCharge).toHaveBeenCalledTimes(1);
     expect(await prisma.payment.count({ where: { orderId: outroPedido } })).toBe(0);
+  });
+});
+
+describe('captura SINCRONA tambem emite o evento', () => {
+  it('CASO F1: createCharge SUCCEEDED grava a outbox na mesma transacao', async () => {
+    // Caminho PADRAO do projeto (captura automatica, decisao 10 da fase): o
+    // registrarDesfecho leva o pagamento a CAPTURED na hora. Sem enqueue aqui,
+    // nenhum evento e emitido — e um webhook posterior NAO conserta, porque o
+    // WebhookService curto-circuita quando o estado alvo ja e o atual.
+    const { service, input, orderId } = cenario();
+
+    const resultado = await service.criarPagamento(input);
+
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId } });
+    expect(payment.status).toBe(PaymentStatus.CAPTURED);
+
+    const eventos = await prisma.outboxEvent.findMany();
+    expect(eventos).toHaveLength(1);
+    expect(eventos[0].routingKey).toBe('payment.captured');
+    expect(eventos[0].eventId).toBe(`payment.captured:${resultado.paymentId}`);
+
+    const payload = eventos[0].payload as Record<string, unknown>;
+    expect(payload.paymentId).toBe(resultado.paymentId);
+    expect(payload.orderId).toBe(orderId);
+    expect(payload.capturedAmountCents).toBe(payment.capturedAmountCents);
+  });
+
+  it('CASO F2: falha ao gravar o evento desfaz o desfecho INTEIRO', async () => {
+    // O CASO 30 ocupa o eventId de proposito, mas ali o payment ja existe. Aqui
+    // o id nasce dentro do create, entao a colisao real e inalcancavel: a falha
+    // e injetada no enqueue. O gatilho e simulado, o rollback NAO — quem desfaz
+    // e o Postgres. Se o enqueue estivesse FORA da transacao do desfecho, a
+    // captura commitaria e este teste pegaria.
+    // Criacao e desfecho sao transacoes separadas: o pagamento ja commitou como
+    // PROCESSING antes, entao o esperado e ele continuar PROCESSING.
+    const { service, input, orderId } = cenario();
+    const espiao = jest
+      .spyOn(outboxRepo, 'enqueue')
+      .mockRejectedValue(new Error('falha simulada na gravacao do evento'));
+
+    // Sem assertiva sobre propagacao: o que esta sob teste e a atomicidade, nao
+    // como o servico embrulha o erro.
+    await service.criarPagamento(input).catch(() => undefined);
+    espiao.mockRestore();
+
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId } });
+    expect(payment.status).toBe(PaymentStatus.PROCESSING);
+    expect(payment.capturedAmountCents).toBe(0);
+
+    const capturas = await prisma.paymentTransaction.findMany({
+      where: { paymentId: payment.id, type: TransactionType.CAPTURE },
+    });
+    expect(capturas).toHaveLength(0);
+    expect(await prisma.outboxEvent.count()).toBe(0);
   });
 });

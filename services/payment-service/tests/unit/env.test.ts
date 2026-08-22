@@ -1,5 +1,5 @@
 import { loadConfig, ConfigError } from '../../src/config/env';
-import { configDeTeste, envDeTeste } from '../helpers/config';
+import { configDeTeste, envDeProducao, envDeTeste } from '../helpers/config';
 
 /**
  * Segredo de 48 caracteres: passa o minimo de 32 e nao esta na lista de
@@ -387,5 +387,69 @@ describe('loadConfig — PAYMENT_WINDOW_MINUTES', () => {
     expect(() => loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: '10080' })).toThrow(
       /entre 1 e 1440/,
     );
+  });
+});
+
+describe('loadConfig — RABBITMQ_URL', () => {
+  it('FAIL-CLOSED: ausente em producao lanca', () => {
+    const env = envDeProducao({ RABBITMQ_URL: undefined });
+    // Sem broker, a captura e gravada e o pedido nunca fica sabendo:
+    // inconsistencia silenciosa entre servicos.
+    expect(() => loadConfig(env)).toThrow(ConfigError);
+    expect(() => loadConfig(env)).toThrow(/RABBITMQ_URL e obrigatoria/);
+  });
+
+  it.each(['development', 'test'])('ausente em %s apenas desliga o relay', (ambiente) => {
+    const config = loadConfig(
+      envDeTeste({ NODE_ENV: ambiente, RABBITMQ_URL: undefined }),
+    );
+    expect(config.rabbitmqUrl).toBeNull();
+  });
+
+  it('recusa amqp:// em producao sem declaracao de transporte protegido', () => {
+    const env = envDeProducao({ RABBITMQ_URL: 'amqp://usuario:senha@broker:5672' });
+    // A credencial viaja DENTRO da URL: quem estiver na rede captura.
+    expect(() => loadConfig(env)).toThrow(/texto claro/);
+  });
+
+  it('aceita amqp:// em producao quando o transporte protegido e DECLARADO', () => {
+    const config = loadConfig(
+      envDeProducao({
+        RABBITMQ_URL: 'amqp://usuario:senha@broker:5672',
+        RABBITMQ_ALLOW_INSECURE: 'true',
+      }),
+    );
+    expect(config.rabbitmqUrl).toBe('amqp://usuario:senha@broker:5672');
+  });
+
+  it('recusa URL com protocolo valido mas SEM host', () => {
+    // Passaria o fail-closed da config e falharia so no relay assincrono,
+    // depois de o servico ja ter anunciado disponibilidade.
+    expect(() =>
+      loadConfig(envDeTeste({ RABBITMQ_URL: 'amqp:broker' })),
+    ).toThrow(/sem host/);
+  });
+
+  it('recusa protocolo que nao e amqp nem amqps', () => {
+    expect(() =>
+      loadConfig(envDeTeste({ RABBITMQ_URL: 'http://broker:5672' })),
+    ).toThrow(/protocolo nao suportado/);
+  });
+
+  it('URL invalida: recusa SEM vazar a credencial na mensagem', () => {
+    // `amqp:` e esquema NAO-ESPECIAL, e o URL do WHATWG e permissivo com esses:
+    // 'amqp:// usuario:...' parseia sem erro e o espaco vira percent-encoding.
+    // Caractere invalido no ESQUEMA e o que derruba o parser de verdade.
+    const env = envDeTeste({ RABBITMQ_URL: 'ht!tp://usuario:senha_supersecreta@broker' });
+    let capturado: unknown;
+    try {
+      loadConfig(env);
+    } catch (erro) {
+      capturado = erro;
+    }
+    expect(capturado).toBeInstanceOf(ConfigError);
+    // Mesma regra do testDbGuard: a URL contem a senha, entao nunca vai para
+    // a mensagem de erro, que acaba em log.
+    expect((capturado as Error).message).not.toContain('senha_supersecreta');
   });
 });
