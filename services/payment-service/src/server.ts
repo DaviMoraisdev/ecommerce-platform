@@ -8,8 +8,11 @@ import { closeEventPublisher, initEventPublisher, isPublisherReady, publish } fr
 import { fetchPending, markRetry, markSent } from './events/outbox.repository';
 
 // Ponto de entrada: o UNICO lugar com process.exit e o unico que liga as pecas.
-// Nenhum modulo importado aqui le o ambiente em tempo de import, entao qualquer
-// falha de configuracao ou conexao chega ao catch abaixo.
+// Toda VALIDACAO de ambiente mora no loadConfig, entao falha de configuracao
+// ou de conexao chega ao catch abaixo em vez de explodir durante o import.
+// Ressalva: publisher.ts e outbox.relay.ts leem process.env em tempo de import
+// para os knobs de tuning (faixa fechada, default seguro, nada que afete
+// seguranca). E por isso que os testes deles precisam de jest.resetModules().
 bootstrap({
   loadConfig,
   connectDatabase,

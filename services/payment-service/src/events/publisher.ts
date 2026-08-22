@@ -102,16 +102,37 @@ interface RecursosEmAbertura {
   conn: AmqpConnection | null;
   ch: AmqpConfirmChannel | null;
   abortado: boolean;
+  morta: boolean;
+}
+
+// Fecha o que ja foi adquirido e SO ENTAO lanca. A ordem importa: lancar
+// antes de fechar deixa conexao viva, sem referencia e sem listener — o pior
+// dos dois mundos, porque um error nela vira excecao nao tratada.
+async function abortarSePreciso(ref: RecursosEmAbertura): Promise<void> {
+  if (!ref.abortado && !fechado) return;
+  const porFechamento = fechado;
+  await descartar(ref);
+  throw porFechamento
+    ? new PublisherFechado('publisher fechado durante a inicializacao')
+    : new Error('abertura abortada: deadline da inicializacao vencido');
 }
 
 async function abrirCanal(url: string, ref: RecursosEmAbertura): Promise<AmqpConfirmChannel> {
+  // Cada recurso e observado e conferido no instante em que existe, nao no
+  // fim da abertura: entre createConfirmChannel e assertExchange ja da tempo
+  // de o broker emitir error, e ate agora esse trecho corria sem listener.
   const conn = await amqp.connect(url);
   ref.conn = conn;
-  if (ref.abortado) throw new Error('abertura abortada');
+  observarConexao(conn, ref);
+  await abortarSePreciso(ref);
+
   const ch = await conn.createConfirmChannel();
   ref.ch = ch;
-  if (ref.abortado) throw new Error('abertura abortada');
+  observarCanal(ch, ref);
+  await abortarSePreciso(ref);
+
   await ch.assertExchange(EXCHANGE, EXCHANGE_TYPE, { durable: true });
+  await abortarSePreciso(ref);
   return ch;
 }
 
@@ -123,17 +144,20 @@ async function descartar(ref: RecursosEmAbertura): Promise<void> {
   ref.conn = null;
 }
 
-function ligarObservadores(conn: AmqpConnection, ch: AmqpConfirmChannel): void {
+function observarConexao(conn: AmqpConnection, ref: RecursosEmAbertura): void {
   conn.on('error', (err) => {
     console.warn('[events] conexao com erro: ' + motivoSeguro(err));
   });
   conn.on('close', () => {
+    ref.morta = true; // pode fechar ANTES de virarmos a conexao atual
     if (connection !== conn) return; // conexao antiga: nao mexe no estado atual
     console.warn('[events] conexao fechada; publisher desativado');
     connection = null;
     channel = null;
   });
+}
 
+function observarCanal(ch: AmqpConfirmChannel, ref: RecursosEmAbertura): void {
   // Canal e EventEmitter: sem listener de error, o evento vira uncaught
   // exception e mata o processo inteiro por causa de um canal quebrado.
   ch.on('error', (err) => {
@@ -141,9 +165,13 @@ function ligarObservadores(conn: AmqpConnection, ch: AmqpConfirmChannel): void {
     desativarCanal(ch);
   });
   ch.on('close', () => {
+    ref.morta = true;
     if (channel !== ch) return;
+    // Invalida o PAR. Zerar so o canal deixava a conexao viva e sem dono: o
+    // proximo init abria outra por cima e a anterior virava orfa. O custo e
+    // uma reconexao inteira por fechamento de canal, que o relay absorve.
     console.warn('[events] canal fechado; publisher desativado');
-    channel = null;
+    desativarCanal(ch);
   });
 
   // basic.return: o broker aceitou no exchange mas nenhuma fila casou com a
@@ -180,7 +208,7 @@ export function initEventPublisher(url: string): Promise<void> {
 async function doInitEventPublisher(url: string): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const ref: RecursosEmAbertura = { conn: null, ch: null, abortado: false };
+    const ref: RecursosEmAbertura = { conn: null, ch: null, abortado: false, morta: false };
     try {
       if (fechado) throw new PublisherFechado('publisher fechado antes da inicializacao');
 
@@ -191,12 +219,16 @@ async function doInitEventPublisher(url: string): Promise<void> {
 
       // O shutdown pode ter corrido enquanto a abertura estava em voo.
       // Publicar estado agora ressuscitaria um publisher ja encerrado.
-      if (fechado) {
+      await abortarSePreciso(ref);
+
+      // O recurso pode ter morrido entre a instalacao do listener e este
+      // ponto: ali o guard `connection !== conn` ainda era verdadeiro, entao
+      // ninguem limpou nada. Publicar agora seria adotar um cadaver.
+      if (ref.morta) {
         await descartar(ref);
-        throw new PublisherFechado('publisher fechado durante a inicializacao');
+        throw new Error('conexao ou canal fechou durante a inicializacao');
       }
 
-      ligarObservadores(ref.conn as AmqpConnection, ch);
       connection = ref.conn;
       channel = ch;
       console.log('[events] publisher conectado; exchange "' + EXCHANGE + '" pronto');

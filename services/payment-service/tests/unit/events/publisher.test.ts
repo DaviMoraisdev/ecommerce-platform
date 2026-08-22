@@ -185,3 +185,54 @@ describe('publisher — log', () => {
     expect(erros.join(' ')).not.toContain('senha_supersecreta');
   }, 5_000);
 });
+describe('publisher — recurso que chega depois do deadline', () => {
+  it('CASO P8: conexao concluida APOS o timeout e fechada, nao vira orfa', async () => {
+    // withTimeout descarta a resolucao tardia. Se a conexao terminar de abrir
+    // depois disso, ela fica viva, sem referencia global e SEM listener: o
+    // proximo error que ela emitir e uncaught exception.
+    const canal = montarCanal();
+    const conexao = montarConexao(canal);
+
+    jest.resetModules();
+    process.env.RABBITMQ_MAX_RETRIES = '1';
+    process.env.RABBITMQ_CONNECT_TIMEOUT_MS = '50';
+    const amqp = (await import('amqplib')).default as unknown as { connect: jest.Mock };
+    amqp.connect.mockReset();
+    let liberarConexao = (_v: unknown): void => undefined;
+    amqp.connect.mockImplementation(
+      () => new Promise((r) => {
+        liberarConexao = r as (v: unknown) => void;
+      }),
+    );
+    const mod = await import('../../../src/events/publisher');
+
+    const emVoo = mod.initEventPublisher(URL_BROKER).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 80)); // deixa o deadline vencer
+    liberarConexao(conexao);
+    await emVoo;
+    await new Promise((r) => setTimeout(r, 20)); // deixa o descarte tardio rodar
+
+    expect(conexao.close).toHaveBeenCalled();
+    expect(mod.isPublisherReady()).toBe(false);
+  }, 5_000);
+});
+
+describe('publisher — canal fechado sem erro', () => {
+  it('CASO P9: close isolado do canal invalida tambem a conexao', async () => {
+    // desativarCanal derruba o par canal+conexao, mas o handler de close so
+    // zerava o canal: a conexao anterior ficava viva e o proximo init abria
+    // outra por cima dela.
+    const canal = montarCanal();
+    const conexao = montarConexao(canal);
+    const { mod } = await carregar(conexao);
+    await mod.initEventPublisher(URL_BROKER);
+    expect(mod.isPublisherReady()).toBe(true);
+
+    expect(canal.handlers['close']).toBeDefined();
+    canal.handlers['close']?.();
+
+    expect(mod.isPublisherReady()).toBe(false);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(conexao.close).toHaveBeenCalled();
+  }, 5_000);
+});
