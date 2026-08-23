@@ -199,8 +199,15 @@ describe('decidirEntrega — traducao de resultado em acao no broker', () => {
     );
 
     // Contagem zerada: as proximas falhas voltam a ter as 5 chances.
-    const acao = await decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, falhando);
-    expect(acao.type).toBe('nack-requeue');
+    // TRES falhas, nao uma: com o teto em 5 e a contagem NAO zerada, a sequencia
+    // seguiria 4, 5, 6 e a terceira cruzaria o teto. Com uma falha so, o teste
+    // passava dos dois jeitos — a sabotagem U10 provou isso.
+    const tipos: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const acao = await decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, falhando);
+      tipos.push(acao.type);
+    }
+    expect(tipos).toEqual(['nack-requeue', 'nack-requeue', 'nack-requeue']);
   });
 
   it('CASO C31: P2002 da compensacao concorrente e REQUEUE, nao DLQ', async () => {
