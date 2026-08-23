@@ -82,6 +82,11 @@ type Conexao = Awaited<ReturnType<typeof amqp.connect>>;
 type Canal = Awaited<ReturnType<Conexao['createChannel']>>;
 
 const CLOSE_TIMEOUT_MS = toIntInRange(process.env.PAYMENTS_CLOSE_TIMEOUT_MS, 3000, 50, 60000);
+// Deadline sobre a abertura INTEIRA. Sem ele, um createChannel ou um consume
+// pendurado deixa `iniciando` preenchido para sempre: o single-flight faz toda
+// tentativa futura esperar por uma promise que nunca resolve, e o consumidor
+// morre em silencio com o HTTP saudavel.
+const OPEN_TIMEOUT_MS = toIntInRange(process.env.PAYMENTS_OPEN_TIMEOUT_MS, 10000, 100, 300000);
 
 let conexao: Conexao | null = null;
 let canal: Canal | null = null;
@@ -168,6 +173,16 @@ interface EmAbertura {
   ch: Canal | null;
 }
 
+/**
+ * Aquisicao em voo, VISIVEL de fora.
+ *
+ * Antes, `ref` era local a abrirSessao: se o connect resolvesse e o
+ * createChannel pendurasse, o encerramento nao tinha como alcancar a conexao ja
+ * aberta — ela ficava sem dono, e o abortarSePreciso seguinte nunca chegava a
+ * rodar para fecha-la.
+ */
+let emAbertura: EmAbertura | null = null;
+
 // Fecha o que ja foi adquirido e SO ENTAO lanca. Lancar antes de fechar deixa
 // conexao viva, sem referencia e sem dono — cada ciclo de retry vazaria uma.
 async function abortarSePreciso(ref: EmAbertura, minhaGeracao: number): Promise<void> {
@@ -221,37 +236,19 @@ async function abrirSessao(): Promise<void> {
 
   const minhaGeracao = geracao;
   const ref: EmAbertura = { conn: null, ch: null };
+  emAbertura = ref;
 
   try {
     // Cada recurso e observado e conferido no instante em que existe, nao no
     // fim da abertura: entre createChannel e a topologia ja da tempo de o
     // broker emitir error, e sem listener isso vira excecao nao tratada.
-    const conn = await amqp.connect(url);
-    ref.conn = conn;
-    observarConexao(conn, minhaGeracao);
-    await abortarSePreciso(ref, minhaGeracao);
+    // Deadline sobre a abertura INTEIRA, nao por etapa. Qualquer passo que
+    // pendure — connect, createChannel, topologia ou consume — encerra aqui em
+    // vez de deixar `iniciando` preenchido para sempre.
+    const ch = await comDeadline(adquirir(url, ref, minhaGeracao), OPEN_TIMEOUT_MS);
 
-    const ch = await conn.createChannel();
-    ref.ch = ch;
-    observarCanal(ch, minhaGeracao);
-    await abortarSePreciso(ref, minhaGeracao);
-
-    await montarTopologia(ch);
-    await abortarSePreciso(ref, minhaGeracao);
-
-    await ch.consume(QUEUE_PAGAMENTOS, (msg) => {
-      if (!msg) {
-        // Broker cancelou a assinatura: a sessao acabou, ainda que a conexao
-        // continue de pe. Apenas retornar deixaria o consumidor "ativo" sem
-        // ninguem consumindo.
-        if (geracao === minhaGeracao) invalidarSessao('consumer cancelado pelo broker');
-        return;
-      }
-      void tratarMensagem(ch, msg);
-    });
-    await abortarSePreciso(ref, minhaGeracao);
-
-    conexao = conn;
+    if (ref.conn === null) throw new Error('conexao ausente apos a abertura');
+    conexao = ref.conn;
     canal = ch;
     console.log('[payments] consumindo ' + QUEUE_PAGAMENTOS + ' (binding ' + BINDING_PAYMENT_CAPTURED + '); DLQ: ' + DLQ_PAGAMENTOS);
   } catch (err) {
@@ -259,18 +256,61 @@ async function abrirSessao(): Promise<void> {
     await fecharSilencioso(ref.ch);
     await fecharSilencioso(ref.conn);
     if (!encerrando) agendarReconexao();
+  } finally {
+    if (emAbertura === ref) emAbertura = null;
   }
 }
 
-async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: { routingKey: string } }): Promise<void> {
+async function adquirir(url: string, ref: EmAbertura, minhaGeracao: number): Promise<Canal> {
+  const conn = await amqp.connect(url);
+  ref.conn = conn;
+  observarConexao(conn, minhaGeracao);
+  await abortarSePreciso(ref, minhaGeracao);
+
+  const ch = await conn.createChannel();
+  ref.ch = ch;
+  observarCanal(ch, minhaGeracao);
+  await abortarSePreciso(ref, minhaGeracao);
+
+  await montarTopologia(ch);
+  await abortarSePreciso(ref, minhaGeracao);
+
+  await ch.consume(QUEUE_PAGAMENTOS, (msg) => {
+      if (!msg) {
+        // Broker cancelou a assinatura: a sessao acabou, ainda que a conexao
+        // continue de pe. Apenas retornar deixaria o consumidor "ativo" sem
+        // ninguem consumindo.
+        if (geracao === minhaGeracao) invalidarSessao('consumer cancelado pelo broker');
+        return;
+      }
+      // .catch obrigatorio: uma rejeicao aqui nao tem observador e vira
+      // unhandledRejection, que pode derrubar o processo HTTP inteiro —
+      // exatamente o que o isolamento deste consumidor existe para evitar.
+      void tratarMensagem(ch as Canal, msg).catch((err) => {
+        console.error('[payments] falha nao tratada no handler: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
+      });
+    });
+  await abortarSePreciso(ref, minhaGeracao);
+  return ch;
+}
+
+// Exportada para teste: e o unico ponto onde uma rejeicao poderia escapar do
+// callback do broker, entao ela precisa ser exercitavel diretamente.
+export async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: { routingKey: string } }): Promise<void> {
   const routingKey = msg.fields.routingKey;
 
   // Tamanho ANTES da conversao: toString de um buffer gigante ja e o consumo
   // de memoria que se quer evitar.
   const porTamanho = decidirPorTamanho(msg.content.length);
   if (porTamanho !== null) {
-    console.warn('[payments] ' + porTamanho.reason);
-    await executarAcao(ch, msg, porTamanho, () => sleep(REQUEUE_DELAY_MS));
+    console.warn('[payments] ' + sanitizarParaLog(porTamanho.reason));
+    // MESMA protecao do caminho normal: este ramo estava fora do try/catch, e
+    // um nack falhando com o canal ja morto rejeitava sem observador.
+    try {
+      await executarAcao(ch, msg, porTamanho, () => sleep(REQUEUE_DELAY_MS));
+    } catch (err) {
+      console.error('[payments] falha ao aplicar acao no canal: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
+    }
     return;
   }
 
@@ -284,7 +324,9 @@ async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: { routi
   }
 
   if (acao.type !== 'ack') {
-    console.warn('[payments] ' + acao.type + ' (' + sanitizarParaLog(routingKey) + '): ' + acao.reason);
+    // A reason carrega campos do payload (moeda, valores, mensagem de erro).
+    // Sanitizar a linha INTEIRA no ponto de saida, nao so a routing key.
+    console.warn('[payments] ' + acao.type + ' (' + sanitizarParaLog(routingKey) + '): ' + sanitizarParaLog(acao.reason));
   }
 
   try {
@@ -309,6 +351,18 @@ export async function pararConsumidorPagamentos(): Promise<void> {
   canal = null;
   conexao = null;
   geracao++;
+
+  // Fecha tambem o que uma abertura em voo ja adquiriu. Ela pode estar parada
+  // num await que nunca resolve — nesse caso ela sozinha nunca fecharia nada.
+  const provisorio = emAbertura;
+  emAbertura = null;
+
   await fecharSilencioso(ch);
   await fecharSilencioso(conn);
+  if (provisorio) {
+    await fecharSilencioso(provisorio.ch);
+    await fecharSilencioso(provisorio.conn);
+    provisorio.ch = null;
+    provisorio.conn = null;
+  }
 }

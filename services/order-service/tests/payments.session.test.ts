@@ -6,6 +6,9 @@ jest.mock('amqplib', () => ({
 process.env.RABBITMQ_URL = 'amqp://localhost:5672';
 process.env.PAYMENTS_RECONNECT_DELAY_MS = '100';
 process.env.PAYMENTS_REQUEUE_DELAY_MS = '50';
+// Curto para o C35: a abertura pendurada precisa terminar DENTRO do teste,
+// senao o log do deadline sai depois que o jest ja fechou o caso.
+process.env.PAYMENTS_OPEN_TIMEOUT_MS = '200';
 
 type Runtime = typeof import('../src/events/payments.runtime');
 type Handler = (...a: unknown[]) => unknown;
@@ -103,6 +106,30 @@ describe('sessao do consumidor — perda e recuperacao', () => {
   });
 });
 
+describe('handler — nenhuma rejeicao sem observador', () => {
+  it('CASO C33: nack que falha no caminho de payload grande nao rejeita', async () => {
+    // Este ramo estava fora do try/catch. Com o canal ja morto, o nack rejeita,
+    // a promise do handler nao tem observador e vira unhandledRejection — que
+    // pode derrubar o processo HTTP, o oposto do isolamento que o consumidor
+    // existe para dar.
+    const ch = canalFalso({
+      nack: jest.fn(() => {
+        throw new Error('canal ja fechado');
+      }),
+    });
+    const { mod } = carregar();
+
+    const grande = {
+      content: Buffer.alloc(70 * 1024),
+      fields: { routingKey: 'payment.captured' },
+    };
+
+    await expect(
+      mod.tratarMensagem(ch as never, grande),
+    ).resolves.toBeUndefined();
+  });
+});
+
 describe('sessao do consumidor — aquisicao e encerramento', () => {
   it('CASO C27: falha no meio do setup fecha o que ja foi adquirido', async () => {
     // Canal e conexao ja existem quando a topologia falha. Sem fechar, cada
@@ -174,6 +201,30 @@ describe('sessao do consumidor — aquisicao e encerramento', () => {
     expect(cx.createChannel).not.toHaveBeenCalled();
     expect(cx.close).toHaveBeenCalled();
     expect(mod.estaConsumindo()).toBe(false);
+  }, 5_000);
+
+  it('CASO C35: shutdown fecha conexao ja adquirida com o canal pendurado', async () => {
+    // O caso que o C30 NAO cobre: ali o connect nem tinha resolvido. Aqui a
+    // conexao ja existe e o createChannel pendura — o abortarSePreciso seguinte
+    // nunca roda, entao quem tem de fechar e o encerramento. Antes, `ref` era
+    // local a abrirSessao e o shutdown nao alcancava nada.
+    const ch = canalFalso();
+    const cx = conexaoFalsa(ch, {
+      createChannel: jest.fn(() => new Promise(() => undefined)),
+    });
+    const { mod, connect } = carregar();
+    connect.mockResolvedValue(cx);
+
+    const emVoo = mod.iniciarConsumidorPagamentos().catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 10)); // deixa o connect resolver
+    await mod.pararConsumidorPagamentos();
+
+    expect(cx.close).toHaveBeenCalled();
+    expect(mod.estaConsumindo()).toBe(false);
+
+    // Espera o deadline da abertura estourar: sem isso o log da falha sai
+    // depois do fim do teste e o jest reclama de log tardio.
+    await emVoo;
   }, 5_000);
 
   it('CASO C29: dois inicios concorrentes abrem UMA conexao', async () => {

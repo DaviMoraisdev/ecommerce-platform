@@ -20,9 +20,12 @@ function idValido(v: unknown, max = MAX_ID): v is string {
   return typeof v === 'string' && v.trim() !== '' && v.trim() === v && v.length <= max;
 }
 
-// Teto explicito: 1 bilhao de reais em centavos. Valor monetario acima disso
-// neste sistema e erro, nao negocio.
-const MAX_CENTAVOS = 100_000_000_000;
+// Teto = limite da coluna. amountCents e INTEGER no Postgres (Int no Prisma),
+// que vai ate 2_147_483_647. O teto anterior era 1 bilhao de REAIS em centavos,
+// quase 47x acima disso: o valor passava na entrada e estourava no insert,
+// depois de a transacao ja estar aberta. Limite de entrada tem de ser o limite
+// do que se consegue PERSISTIR, nao um numero redondo escolhido a parte.
+const MAX_CENTAVOS = 2_147_483_647;
 
 function centavosValidos(v: unknown): v is number {
   // isSafeInteger, nao isInteger: acima de 2^53 a aritmetica de ponto flutuante
@@ -56,7 +59,11 @@ export function parseCaptura(raw: string): CapturaEvent | null {
   if (!idValido(o.orderId)) return null;
   if (!centavosValidos(o.amountCents)) return null;
   if (!centavosValidos(o.capturedAmountCents)) return null;
-  if (typeof o.currency !== 'string' || o.currency.trim() === '') return null;
+  // Codigo ISO-4217: exatamente tres letras maiusculas. Aceitar "qualquer
+  // string nao vazia" deixava passar CR/LF (forja linha de log) e dezenas de
+  // KB (amplifica log). Regex ancorada de tamanho fixo nao tem backtracking —
+  // o risco de ReDoS vem de quantificador aninhado, nao de regex em si.
+  if (typeof o.currency !== 'string' || !/^[A-Z]{3}$/.test(o.currency)) return null;
   if (o.eventId !== eventIdEsperado(o.paymentId)) return null;
   if (o.occurredAt !== undefined && typeof o.occurredAt !== 'string') return null;
 

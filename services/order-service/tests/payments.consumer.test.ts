@@ -3,6 +3,7 @@ import {
   decidirEntrega,
   decidirPorTamanho,
   MAX_PAYLOAD_BYTES,
+  resetarTentativas,
   ResultadoAplicacao,
 } from '../src/events/payments.consumer';
 import { BINDING_PAYMENT_CAPTURED } from '../src/events/payments.topology';
@@ -28,6 +29,9 @@ function deps(resultado: ResultadoAplicacao | Error) {
     }),
   };
 }
+
+// O contador de tentativas e estado de modulo compartilhado entre os casos.
+beforeEach(() => resetarTentativas());
 
 describe('decidirPorTamanho', () => {
   it('CASO C21: payload acima do limite vai para a DLQ sem ser convertido', () => {
@@ -151,6 +155,91 @@ describe('decidirEntrega — traducao de resultado em acao no broker', () => {
     );
   });
 
+  it('CASO C34: moeda fora do formato ISO e recusada no parser', async () => {
+    // CR/LF em moeda forja linha de log; moeda de 60 KB amplifica log. Codigo
+    // ISO tem exatamente tres letras maiusculas — o resto e ataque ou bug.
+    const d = deps({ tipo: 'aplicado' });
+    for (const moeda of ['BR', 'brl', 'USD\n[INFO] pagamento conciliado', 'B'.repeat(5000)]) {
+      const acao = await decidirEntrega(corpo({ currency: moeda }), BINDING_PAYMENT_CAPTURED, d);
+      expect(acao.type).toBe('nack-dlq');
+    }
+    expect(d.aplicar).not.toHaveBeenCalled();
+  });
+
+  it('CASO C36: transitorio repetido acaba na DLQ em vez de travar a fila', async () => {
+    // Sem teto, um erro permanente que a classificacao nao reconhece volta para
+    // sempre e monopoliza o unico slot do prefetch(1). Com teto, a mensagem vai
+    // para a DLQ — PRESERVADA, nao descartada.
+    resetarTentativas();
+    const d = deps(new Error('erro generico que nunca melhora'));
+
+    const tipos: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const acao = await decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, d);
+      tipos.push(acao.type);
+    }
+
+    expect(tipos.slice(0, 5)).toEqual(Array(5).fill('nack-requeue'));
+    expect(tipos[5]).toBe('nack-dlq');
+  });
+
+  it('CASO C37: desfecho terminal zera a contagem de tentativas', async () => {
+    // Sem limpar, uma mensagem que falhou algumas vezes e depois deu certo
+    // deixaria a contagem envenenada para a proxima ocorrencia da mesma chave.
+    resetarTentativas();
+
+    const falhando = deps(new Error('indisponivel'));
+    for (let i = 0; i < 3; i++) {
+      await decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, falhando);
+    }
+
+    const ok = deps({ tipo: 'aplicado' });
+    await expect(decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, ok)).resolves.toEqual(
+      expect.objectContaining({ type: 'ack' }),
+    );
+
+    // Contagem zerada: as proximas falhas voltam a ter as 5 chances.
+    const acao = await decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, falhando);
+    expect(acao.type).toBe('nack-requeue');
+  });
+
+  it('CASO C31: P2002 da compensacao concorrente e REQUEUE, nao DLQ', async () => {
+    // Regressao introduzida por mim na rodada anterior: o servico relanca o
+    // P2002 que nao e do inbox dizendo que e corrida e precisa reprocessar, e o
+    // classificador mandava para a DLQ. P2002 nao e categoria de erro, e sinal
+    // de concorrencia — alguem chegou primeiro. Isso e transitorio por
+    // definicao.
+    const erro = new Prisma.PrismaClientKnownRequestError('unique violado', {
+      code: 'P2002',
+      clientVersion: 'x',
+      meta: { target: 'pending_compensations_open_key' },
+    });
+    const d = deps(erro);
+    await expect(decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, d)).resolves.toEqual(
+      expect.objectContaining({ type: 'nack-requeue' }),
+    );
+  });
+
+  it('CASO C32: valor acima do que a coluna INTEGER aceita e recusado', async () => {
+    // MAX_CENTAVOS estava em 100_000_000_000 contra uma coluna INTEGER, que vai
+    // ate 2_147_483_647. O valor passava na entrada e estourava no insert,
+    // depois de ja ter aberto a transacao.
+    const d = deps({ tipo: 'aplicado' });
+    const acima = await decidirEntrega(
+      corpo({ amountCents: 2_147_483_648, capturedAmountCents: 2_147_483_648 }),
+      BINDING_PAYMENT_CAPTURED,
+      d,
+    );
+    expect(acima.type).toBe('nack-dlq');
+    expect(d.aplicar).not.toHaveBeenCalled();
+
+    const noLimite = await decidirEntrega(
+      corpo({ amountCents: 2_147_483_647, capturedAmountCents: 2_147_483_647 }),
+      BINDING_PAYMENT_CAPTURED,
+      d,
+    );
+    expect(noLimite.type).toBe('ack');
+  });
   it('CASO C24: erro DESCONHECIDO e tratado como transitorio', async () => {
     // Assimetria proposital: classificar transitorio como deterministico
     // descarta pagamento; o contrario so gasta ciclo.

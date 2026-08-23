@@ -24,7 +24,13 @@ export type ResultadoAplicacao =
 
 // Codigos do Prisma que NAO melhoram com o tempo: chave estrangeira violada,
 // registro ausente, valor fora do tipo. Tentar de novo repete o mesmo erro.
-const CODIGOS_DETERMINISTICOS = new Set(['P2000', 'P2002', 'P2003', 'P2011', 'P2012', 'P2025']);
+//
+// P2002 NAO entra. Violacao de unique nao e categoria de erro, e sinal de
+// CONCORRENCIA: alguem chegou primeiro. No fluxo da compensacao, a transacao
+// que perde a corrida aborta junto com o insert do inbox e PRECISA reprocessar
+// para encontrar a pendencia ja criada. Classifica-lo como deterministico
+// mandava essa corrida para a DLQ — o oposto do que o servico documenta.
+const CODIGOS_DETERMINISTICOS = new Set(['P2000', 'P2003', 'P2011', 'P2012', 'P2025']);
 
 /**
  * Classifica a falha. So volta true quando da para AFIRMAR que o erro e
@@ -47,6 +53,40 @@ export function ehDeterministico(err: unknown): boolean {
     return CODIGOS_DETERMINISTICOS.has(err.code);
   }
   return false;
+}
+
+const MAX_TENTATIVAS = (() => {
+  const n = Number(process.env.PAYMENTS_MAX_TENTATIVAS);
+  return Number.isInteger(n) && n >= 1 && n <= 100 ? n : 5;
+})();
+
+/**
+ * Tentativas por eventId, em memoria.
+ *
+ * Isto torna decidirEntrega IMPURA de proposito: contar tentativas exige
+ * memoria ENTRE entregas, e nao existe onde guardar isso sem estado. A
+ * alternativa seria uma retry queue com TTL e x-death, que e comportamento do
+ * BROKER — nao daria para provar com dublê, e entregar maquina nao testavel
+ * chamando de correcao e pior que a impureza.
+ *
+ * O que isto resolve: sem teto, um erro permanente que a classificacao nao
+ * reconhece volta para a fila indefinidamente e monopoliza o unico slot do
+ * prefetch(1), travando todas as mensagens validas atras dele. Com teto, a
+ * mensagem vai para a DLQ — PRESERVADA, nao descartada.
+ *
+ * Limitacao registrada no TECH_DEBT: o contador morre com o processo, entao um
+ * reinicio zera a contagem.
+ */
+const tentativas = new Map<string, number>();
+
+export function resetarTentativas(): void {
+  tentativas.clear();
+}
+
+function contarRequeue(chave: string): number {
+  const n = (tentativas.get(chave) ?? 0) + 1;
+  tentativas.set(chave, n);
+  return n;
 }
 
 export interface ConsumerDeps {
@@ -126,12 +166,28 @@ export async function decidirEntrega(
     if (ehDeterministico(err)) {
       // Erro que nao muda com o tempo. Requeue aqui seria loop eterno ocupando
       // o unico slot do prefetch(1) e travando mensagens validas atras.
+      tentativas.delete(evento.eventId);
       return { type: 'nack-dlq', reason: 'falha deterministica ao aplicar: ' + motivo };
     }
-    // C6 — falha de infra. NUNCA DLQ: perder evento por indisponibilidade
-    // momentanea e o pior desfecho possivel aqui.
-    return { type: 'nack-requeue', reason: 'falha transitoria ao aplicar: ' + motivo };
+    // C6 — falha de infra. Requeue, porque perder evento por indisponibilidade
+    // momentanea e o pior desfecho possivel aqui...
+    const n = contarRequeue(evento.eventId);
+    if (n > MAX_TENTATIVAS) {
+      // ...mas nao para sempre: um erro permanente que a classificacao nao
+      // reconhece travaria a fila inteira. DLQ preserva a mensagem.
+      tentativas.delete(evento.eventId);
+      return {
+        type: 'nack-dlq',
+        reason: 'excedeu ' + MAX_TENTATIVAS + ' tentativas transitorias: ' + motivo,
+      };
+    }
+    return {
+      type: 'nack-requeue',
+      reason: 'falha transitoria (' + n + '/' + MAX_TENTATIVAS + '): ' + motivo,
+    };
   }
+  // Desfecho terminal: a contagem desta chave deixa de interessar.
+  tentativas.delete(evento.eventId);
 
   switch (resultado.tipo) {
     case 'aplicado':
