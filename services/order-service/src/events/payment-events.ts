@@ -20,10 +20,23 @@ function idValido(v: unknown, max = MAX_ID): v is string {
   return typeof v === 'string' && v.trim() !== '' && v.trim() === v && v.length <= max;
 }
 
+// Teto explicito: 1 bilhao de reais em centavos. Valor monetario acima disso
+// neste sistema e erro, nao negocio.
+const MAX_CENTAVOS = 100_000_000_000;
+
 function centavosValidos(v: unknown): v is number {
-  // Integer, nao float: dinheiro em centavos. 100.5 centavos e contrato quebrado,
-  // e Number.isInteger tambem barra NaN e Infinity.
-  return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+  // isSafeInteger, nao isInteger: acima de 2^53 a aritmetica de ponto flutuante
+  // perde precisao em silencio, e 2**53 e 2**53+1 viram o mesmo numero.
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= MAX_CENTAVOS;
+}
+
+// O eventId e a chave de idempotencia. Se ele nao estiver amarrado ao
+// identificador financeiro, o MESMO pagamento reentregue com outro eventId
+// atravessa a trava, e um eventId reaproveitado faz um pagamento legitimo ser
+// descartado como duplicata. Aqui a relacao deixa de ser convencao e vira
+// verificacao.
+export function eventIdEsperado(paymentId: string): string {
+  return 'payment.captured:' + paymentId;
 }
 
 // Devolve null em vez de lancar: quem chama traduz isso em DLQ, e "invalido"
@@ -44,6 +57,7 @@ export function parseCaptura(raw: string): CapturaEvent | null {
   if (!centavosValidos(o.amountCents)) return null;
   if (!centavosValidos(o.capturedAmountCents)) return null;
   if (typeof o.currency !== 'string' || o.currency.trim() === '') return null;
+  if (o.eventId !== eventIdEsperado(o.paymentId)) return null;
   if (o.occurredAt !== undefined && typeof o.occurredAt !== 'string') return null;
 
   return {

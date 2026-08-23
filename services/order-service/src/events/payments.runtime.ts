@@ -1,5 +1,5 @@
 import amqp from 'amqplib';
-import { DeliveryAction, decidirEntrega, sanitizarParaLog } from './payments.consumer';
+import { DeliveryAction, decidirEntrega, decidirPorTamanho, sanitizarParaLog } from './payments.consumer';
 import { aplicarCaptura } from '../services/payment-capture.service';
 import {
   EXCHANGE_PAGAMENTOS,
@@ -81,13 +81,57 @@ export async function executarAcao(
 type Conexao = Awaited<ReturnType<typeof amqp.connect>>;
 type Canal = Awaited<ReturnType<Conexao['createChannel']>>;
 
+const CLOSE_TIMEOUT_MS = toIntInRange(process.env.PAYMENTS_CLOSE_TIMEOUT_MS, 3000, 50, 60000);
+
 let conexao: Conexao | null = null;
 let canal: Canal | null = null;
 let encerrando = false;
+let iniciando: Promise<void> | null = null;
 let reconexao: NodeJS.Timeout | null = null;
+
+/**
+ * Contador de sessao. Toda abertura carrega a geracao em que comecou, e todo
+ * listener so age se a geracao ainda for a dele.
+ *
+ * Sem isso, o listener de um canal antigo derrubaria a sessao nova, e uma
+ * abertura que terminasse tarde publicaria estado por cima de outra. E a mesma
+ * classe de corrida que o publisher do payment teve nas rodadas 2 e 3 do PR
+ * anterior — aqui ela vem resolvida de origem.
+ */
+let geracao = 0;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// Fechamento nunca pendura o encerramento: broker travado responderia nunca.
+function comDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout ' + ms + 'ms')), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      },
+    );
+  });
+}
+
+async function fecharSilencioso(r: { close(): Promise<unknown> } | null): Promise<void> {
+  if (!r) return;
+  try {
+    await comDeadline(Promise.resolve(r.close()), CLOSE_TIMEOUT_MS);
+  } catch {
+    /* ja fechado, ou travado: segue */
+  }
+}
+
+export function estaConsumindo(): boolean {
+  return canal !== null;
 }
 
 function agendarReconexao(): void {
@@ -96,20 +140,77 @@ function agendarReconexao(): void {
     reconexao = null;
     void iniciarConsumidorPagamentos();
   }, RECONNECT_DELAY_MS);
-  // unref: um timer pendente nao pode segurar o processo vivo no encerramento.
+  // unref: timer pendente nao pode segurar o processo vivo no encerramento.
   reconexao.unref();
 }
 
 /**
- * Sobe o consumidor. NAO derruba o processo em falha, e essa e a divergencia
- * deliberada em relacao ao notification-service.
- *
- * La, `connection.on('close') -> process.exit(1)` esta certo: e um worker puro,
- * reiniciar E a recuperacao. O order serve a API de pedidos. Matar o HTTP
- * porque o broker caiu troca degradacao parcial (eventos atrasam) por
- * indisponibilidade total (ninguem cria pedido).
+ * Ponto UNICO de perda de sessao. Canal fechado, conexao fechada e consumer
+ * cancelado pelo broker convergem aqui — antes, so a conexao tinha tratamento,
+ * e as outras duas deixavam o servico "ativo" sem ninguem consumindo, com o
+ * HTTP saudavel. Parada silenciosa e o pior modo de falha deste servico.
  */
-export async function iniciarConsumidorPagamentos(): Promise<void> {
+function invalidarSessao(motivo: string): void {
+  const ch = canal;
+  const conn = conexao;
+  canal = null;
+  conexao = null;
+  geracao++; // qualquer abertura em voo desta geracao vira obsoleta
+  if (encerrando) return;
+  console.error('[payments] sessao perdida (' + motivo + '); HTTP segue no ar, reconectando em ' + RECONNECT_DELAY_MS + 'ms');
+  void fecharSilencioso(ch);
+  void fecharSilencioso(conn);
+  agendarReconexao();
+}
+
+interface EmAbertura {
+  conn: Conexao | null;
+  ch: Canal | null;
+}
+
+// Fecha o que ja foi adquirido e SO ENTAO lanca. Lancar antes de fechar deixa
+// conexao viva, sem referencia e sem dono — cada ciclo de retry vazaria uma.
+async function abortarSePreciso(ref: EmAbertura, minhaGeracao: number): Promise<void> {
+  if (!encerrando && geracao === minhaGeracao) return;
+  const motivo = encerrando ? 'encerramento durante a abertura' : 'sessao obsoleta';
+  await fecharSilencioso(ref.ch);
+  await fecharSilencioso(ref.conn);
+  ref.ch = null;
+  ref.conn = null;
+  throw new Error(motivo);
+}
+
+function observarConexao(conn: Conexao, minhaGeracao: number): void {
+  conn.on('error', (err) => {
+    console.error('[payments] conexao com erro: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
+  });
+  conn.on('close', () => {
+    if (geracao !== minhaGeracao) return;
+    invalidarSessao('conexao fechada');
+  });
+}
+
+function observarCanal(ch: Canal, minhaGeracao: number): void {
+  ch.on('error', (err) => {
+    console.error('[payments] canal com erro: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
+  });
+  ch.on('close', () => {
+    if (geracao !== minhaGeracao) return;
+    invalidarSessao('canal fechado');
+  });
+}
+
+// Single-flight: uma reconexao agendada coincidindo com um inicio manual abriria
+// duas conexoes, e a referencia global ficaria com uma orfa.
+export function iniciarConsumidorPagamentos(): Promise<void> {
+  if (iniciando) return iniciando;
+  iniciando = abrirSessao().finally(() => {
+    iniciando = null;
+  });
+  return iniciando;
+}
+
+async function abrirSessao(): Promise<void> {
   if (encerrando || canal !== null) return;
 
   const url = process.env.RABBITMQ_URL;
@@ -118,61 +219,79 @@ export async function iniciarConsumidorPagamentos(): Promise<void> {
     return;
   }
 
-  try {
-    const conn = await amqp.connect(url);
-    const ch = await conn.createChannel();
-    await montarTopologia(ch);
+  const minhaGeracao = geracao;
+  const ref: EmAbertura = { conn: null, ch: null };
 
-    // Listeners antes de consumir: sem listener de error num EventEmitter, o
-    // evento vira excecao nao tratada e mata o processo — justamente o que
-    // este desenho quer evitar.
-    conn.on('error', (err) => {
-      console.error('[payments] conexao com erro: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
-    });
-    conn.on('close', () => {
-      if (conexao !== conn) return;
-      conexao = null;
-      canal = null;
-      if (encerrando) return;
-      console.error('[payments] conexao fechada; HTTP segue no ar, reconectando em ' + RECONNECT_DELAY_MS + 'ms');
-      agendarReconexao();
-    });
-    ch.on('error', (err) => {
-      console.error('[payments] canal com erro: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
-    });
+  try {
+    // Cada recurso e observado e conferido no instante em que existe, nao no
+    // fim da abertura: entre createChannel e a topologia ja da tempo de o
+    // broker emitir error, e sem listener isso vira excecao nao tratada.
+    const conn = await amqp.connect(url);
+    ref.conn = conn;
+    observarConexao(conn, minhaGeracao);
+    await abortarSePreciso(ref, minhaGeracao);
+
+    const ch = await conn.createChannel();
+    ref.ch = ch;
+    observarCanal(ch, minhaGeracao);
+    await abortarSePreciso(ref, minhaGeracao);
+
+    await montarTopologia(ch);
+    await abortarSePreciso(ref, minhaGeracao);
 
     await ch.consume(QUEUE_PAGAMENTOS, (msg) => {
-      if (!msg) return; // consumo cancelado pelo broker
-      void (async () => {
-        const routingKey = msg.fields.routingKey;
-        let acao: DeliveryAction;
-        try {
-          acao = await decidirEntrega(msg.content.toString(), routingKey, { aplicar: aplicarCaptura });
-        } catch (err) {
-          // decidirEntrega ja converte falha de aplicacao em requeue; cair aqui
-          // e falha do proprio decisor, e requeue continua sendo o conservador.
-          acao = { type: 'nack-requeue', reason: sanitizarParaLog(err instanceof Error ? err.message : String(err)) };
-        }
-        if (acao.type !== 'ack') {
-          console.warn('[payments] ' + acao.type + ' (' + sanitizarParaLog(routingKey) + '): ' + acao.reason);
-        }
-        try {
-          await executarAcao(ch, msg, acao, () => sleep(REQUEUE_DELAY_MS));
-        } catch (err) {
-          // Canal ja morto: a mensagem volta para a fila sozinha, sem ack.
-          console.error('[payments] falha ao aplicar acao no canal: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
-        }
-      })();
+      if (!msg) {
+        // Broker cancelou a assinatura: a sessao acabou, ainda que a conexao
+        // continue de pe. Apenas retornar deixaria o consumidor "ativo" sem
+        // ninguem consumindo.
+        if (geracao === minhaGeracao) invalidarSessao('consumer cancelado pelo broker');
+        return;
+      }
+      void tratarMensagem(ch, msg);
     });
+    await abortarSePreciso(ref, minhaGeracao);
 
     conexao = conn;
     canal = ch;
     console.log('[payments] consumindo ' + QUEUE_PAGAMENTOS + ' (binding ' + BINDING_PAYMENT_CAPTURED + '); DLQ: ' + DLQ_PAGAMENTOS);
   } catch (err) {
     console.error('[payments] falha ao iniciar consumidor: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
-    conexao = null;
-    canal = null;
-    agendarReconexao();
+    await fecharSilencioso(ref.ch);
+    await fecharSilencioso(ref.conn);
+    if (!encerrando) agendarReconexao();
+  }
+}
+
+async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: { routingKey: string } }): Promise<void> {
+  const routingKey = msg.fields.routingKey;
+
+  // Tamanho ANTES da conversao: toString de um buffer gigante ja e o consumo
+  // de memoria que se quer evitar.
+  const porTamanho = decidirPorTamanho(msg.content.length);
+  if (porTamanho !== null) {
+    console.warn('[payments] ' + porTamanho.reason);
+    await executarAcao(ch, msg, porTamanho, () => sleep(REQUEUE_DELAY_MS));
+    return;
+  }
+
+  let acao: DeliveryAction;
+  try {
+    acao = await decidirEntrega(msg.content.toString(), routingKey, { aplicar: aplicarCaptura });
+  } catch (err) {
+    // decidirEntrega ja classifica falha de aplicacao; cair aqui e falha do
+    // proprio decisor, e requeue continua sendo o conservador.
+    acao = { type: 'nack-requeue', reason: sanitizarParaLog(err instanceof Error ? err.message : String(err)) };
+  }
+
+  if (acao.type !== 'ack') {
+    console.warn('[payments] ' + acao.type + ' (' + sanitizarParaLog(routingKey) + '): ' + acao.reason);
+  }
+
+  try {
+    await executarAcao(ch, msg, acao, () => sleep(REQUEUE_DELAY_MS));
+  } catch (err) {
+    // Canal morto: a mensagem volta para a fila sozinha, sem ack.
+    console.error('[payments] falha ao aplicar acao no canal: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
   }
 }
 
@@ -182,18 +301,14 @@ export async function pararConsumidorPagamentos(): Promise<void> {
     clearTimeout(reconexao);
     reconexao = null;
   }
+  // NAO espera a abertura em voo: ela confere `encerrando` apos cada await e
+  // fecha sozinha o que adquiriu. Esperar aqui penduraria o shutdown num
+  // amqp.connect que pode nunca responder.
   const ch = canal;
   const conn = conexao;
   canal = null;
   conexao = null;
-  try {
-    if (ch) await ch.close();
-  } catch {
-    /* canal ja fechado */
-  }
-  try {
-    if (conn) await conn.close();
-  } catch {
-    /* conexao ja fechada */
-  }
+  geracao++;
+  await fecharSilencioso(ch);
+  await fecharSilencioso(conn);
 }

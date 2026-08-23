@@ -83,22 +83,34 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     expect(await prisma.outboxEvent.count()).toBe(1);
   });
 
-  it('CASO G3: pedido ja PAGO por outro caminho e ack sem nova transicao', async () => {
+  it('CASO G3: pedido ja PAGO recebendo OUTRO pagamento gera compensacao', async () => {
+    // Semantica mudou no review (achado 4.1). Com eventId derivado do
+    // paymentId, a redentrega do MESMO pagamento colide no @unique antes de
+    // chegar aqui — entao tudo que alcanca a checagem de status e OUTRO
+    // pagamento. Confirmar como "ja pago" era cobranca dupla em silencio.
     const o = await pedido(OrderStatus.PAGO);
 
-    await expect(aplicarCaptura(evento(o.id))).resolves.toEqual({ tipo: 'ja-pago' });
+    const r = await aplicarCaptura(evento(o.id, { paymentId: 'pay_2' }));
+    expect(r).toEqual(expect.objectContaining({ tipo: 'compensacao-registrada' }));
 
     expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(0);
-    // O evento FOI contabilizado, entao a marca fica.
-    expect(await prisma.inboxEvent.count()).toBe(1);
+    const pend = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pend).toHaveLength(1);
+    expect(pend[0].reason).toContain('pay_2');
+    // A linha do inbox e o registro individual desta captura.
+    const linhas = await prisma.inboxEvent.findMany({ where: { orderId: o.id } });
+    expect(linhas).toHaveLength(1);
+    expect(linhas[0].paymentId).toBe('pay_2');
+    expect(linhas[0].amountCents).toBe(10000);
+    expect(linhas[0].currency).toBe('BRL');
   });
 
   it('CASO G4: pedido CANCELADO registra compensacao em vez de transicao', async () => {
     const o = await pedido(OrderStatus.CANCELADO);
 
-    await expect(aplicarCaptura(evento(o.id))).resolves.toEqual({
-      tipo: 'compensacao-registrada',
-    });
+    await expect(aplicarCaptura(evento(o.id))).resolves.toEqual(
+      expect.objectContaining({ tipo: 'compensacao-registrada' }),
+    );
 
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
     expect(atual.status).toBe(OrderStatus.CANCELADO);
@@ -123,8 +135,12 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
   it('CASO G6: valor divergente NAO deixa marca e NAO muda o pedido', async () => {
     const o = await pedido(OrderStatus.PENDENTE, 100);
 
+    // Evento COERENTE consigo mesmo (autorizado == capturado) e divergente do
+    // total do pedido. A checagem de captura parcial roda antes e sombrearia
+    // este caso se o evento fosse incoerente — que era o erro original deste
+    // teste: ele dizia "valor divergente" e provava "captura parcial".
     await expect(
-      aplicarCaptura(evento(o.id, { capturedAmountCents: 9900 })),
+      aplicarCaptura(evento(o.id, { amountCents: 9900, capturedAmountCents: 9900 })),
     ).resolves.toEqual({ tipo: 'valor-divergente', esperadoCents: 10000, recebidoCents: 9900 });
 
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
@@ -137,25 +153,55 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     const o = await pedido(OrderStatus.CANCELADO);
 
     await aplicarCaptura(evento(o.id, { paymentId: 'pay_1' }));
-    await expect(aplicarCaptura(evento(o.id, { paymentId: 'pay_2' }))).resolves.toEqual({
-      tipo: 'compensacao-registrada',
-    });
+    await expect(aplicarCaptura(evento(o.id, { paymentId: 'pay_2' }))).resolves.toEqual(
+      expect.objectContaining({ tipo: 'compensacao-registrada' }),
+    );
 
     // O unique parcial permite UMA pendencia aberta por pedido.
     expect(await prisma.pendingCompensation.count({ where: { orderId: o.id } })).toBe(1);
     expect(await prisma.inboxEvent.count()).toBe(2);
   });
 
-  it('CASO G8: pedido ENVIADO recebe captura tardia sem loop de requeue', async () => {
-    // ENVIADO so e alcancavel passando por PAGO, entao o efeito ja aconteceu.
-    // Deixar cair em aplicarTransicao lancaria TRANSICAO_INVALIDA -> requeue
-    // eterno, porque ENVIADO -> PAGO nunca vira valido.
+  it('CASO G8: pedido ENVIADO recebendo captura gera compensacao, nao loop', async () => {
+    // ENVIADO so e alcancavel passando por PAGO. Cair em aplicarTransicao
+    // lancaria TRANSICAO_INVALIDA -> requeue eterno; confirmar como ja-pago
+    // esconderia uma segunda cobranca. Compensacao e a unica saida honesta.
     const o = await pedido(OrderStatus.ENVIADO);
 
-    await expect(aplicarCaptura(evento(o.id))).resolves.toEqual({ tipo: 'ja-pago' });
+    const r = await aplicarCaptura(evento(o.id, { paymentId: 'pay_3' }));
+    expect(r).toEqual(expect.objectContaining({ tipo: 'compensacao-registrada' }));
 
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
     expect(atual.status).toBe(OrderStatus.ENVIADO);
     expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(0);
+    expect(await prisma.pendingCompensation.count({ where: { orderId: o.id } })).toBe(1);
+  });
+
+  it('CASO G9: moeda divergente NAO deixa marca e NAO muda o pedido', async () => {
+    const o = await pedido(OrderStatus.PENDENTE, 100);
+
+    await expect(aplicarCaptura(evento(o.id, { currency: 'USD' }))).resolves.toEqual({
+      tipo: 'moeda-divergente',
+      esperada: 'BRL',
+      recebida: 'USD',
+    });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.status).toBe(OrderStatus.PENDENTE);
+    expect(await prisma.inboxEvent.count()).toBe(0);
+  });
+
+  it('CASO G10: captura parcial NAO deixa marca e NAO muda o pedido', async () => {
+    // amountCents autorizado != capturedAmountCents. O valor capturado ate bate
+    // com o total? Nao importa: parcial nao e representavel no pedido.
+    const o = await pedido(OrderStatus.PENDENTE, 100);
+
+    await expect(
+      aplicarCaptura(evento(o.id, { amountCents: 20000, capturedAmountCents: 10000 })),
+    ).resolves.toEqual({ tipo: 'captura-parcial', autorizadoCents: 20000, capturadoCents: 10000 });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.status).toBe(OrderStatus.PENDENTE);
+    expect(await prisma.inboxEvent.count()).toBe(0);
   });
 });

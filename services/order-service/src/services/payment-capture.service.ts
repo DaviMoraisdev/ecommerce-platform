@@ -10,6 +10,11 @@ import { aplicarTransicao } from './order.service';
 // deixaria quem publica no exchange escolher quem assina a auditoria.
 const AUTOR = 'payment-service';
 
+// O order nao tem coluna de moeda: todo total e em BRL por construcao. Evento
+// em outra moeda comparado numericamente com o total marcaria como pago um
+// valor que nao corresponde.
+const MOEDA = 'BRL';
+
 /**
  * Erro de controle: desfecho legitimo que NAO deve deixar rastro.
  *
@@ -41,7 +46,14 @@ export async function aplicarCaptura(ev: CapturaEvent): Promise<ResultadoAplicac
       // A marca ANTES do efeito, no mesmo commit. Se o efeito falhar, ela
       // desaparece junto; se ela colidir, o efeito nao acontece.
       await tx.inboxEvent.create({
-        data: { eventId: ev.eventId, routingKey: BINDING_PAYMENT_CAPTURED },
+        data: {
+          eventId: ev.eventId,
+          routingKey: BINDING_PAYMENT_CAPTURED,
+          orderId: ev.orderId,
+          paymentId: ev.paymentId,
+          amountCents: ev.capturedAmountCents,
+          currency: ev.currency,
+        },
       });
 
       const order = await tx.order.findUnique({ where: { id: ev.orderId } });
@@ -50,6 +62,20 @@ export async function aplicarCaptura(ev: CapturaEvent): Promise<ResultadoAplicac
       // total e Decimal(12,2) em reais; o evento traz centavos inteiros.
       // Aritmetica do Decimal, nao Number(total) * 100: ponto flutuante
       // transformaria divergencia de contrato em bug intermitente de teste.
+      if (ev.currency !== MOEDA) {
+        throw new SemEfeito({ tipo: 'moeda-divergente', esperada: MOEDA, recebida: ev.currency });
+      }
+
+      // Captura parcial nao e suportada: o pedido so tem PAGO ou nao-PAGO, e
+      // aceitar parcial levaria a PAGO com dinheiro faltando.
+      if (ev.amountCents !== ev.capturedAmountCents) {
+        throw new SemEfeito({
+          tipo: 'captura-parcial',
+          autorizadoCents: ev.amountCents,
+          capturadoCents: ev.capturedAmountCents,
+        });
+      }
+
       const esperadoCents = order.total.mul(100).toNumber();
       if (esperadoCents !== ev.capturedAmountCents) {
         throw new SemEfeito({
@@ -59,7 +85,16 @@ export async function aplicarCaptura(ev: CapturaEvent): Promise<ResultadoAplicac
         });
       }
 
-      if (order.status === OrderStatus.CANCELADO) {
+      if (order.status !== OrderStatus.PENDENTE) {
+        // Qualquer estado diferente de PENDENTE significa que este e OUTRO
+        // pagamento (o mesmo teria colidido no @unique do inbox). Segunda
+        // cobranca real: registra para reconciliacao em vez de confirmar em
+        // silencio. O detalhe de cada captura fica nas linhas do inbox,
+        // buscaveis por orderId.
+        const motivo =
+          order.status === OrderStatus.CANCELADO
+            ? 'captura_apos_cancelamento:' + ev.paymentId
+            : 'captura_para_pedido_' + order.status.toLowerCase() + ':' + ev.paymentId;
         // findFirst antes de criar, em vez de create-e-trata-P2002: em Postgres
         // um erro DENTRO da transacao a envenena, e o catch daria a ilusao de
         // ter tratado enquanto o proximo statement falharia.
@@ -67,22 +102,9 @@ export async function aplicarCaptura(ev: CapturaEvent): Promise<ResultadoAplicac
           where: { orderId: ev.orderId, resolvedAt: null },
         });
         if (aberta === null) {
-          await tx.pendingCompensation.create({
-            data: {
-              orderId: ev.orderId,
-              reason: 'captura_apos_cancelamento:' + ev.paymentId,
-            },
-          });
+          await tx.pendingCompensation.create({ data: { orderId: ev.orderId, reason: motivo } });
         }
-        return { tipo: 'compensacao-registrada' };
-      }
-
-      // PAGO, ENVIADO ou ENTREGUE: o efeito ja aconteceu (os dois ultimos so
-      // sao alcancaveis passando por PAGO). Chamar aplicarTransicao aqui
-      // lancaria TRANSICAO_INVALIDA -> requeue -> loop eterno, porque
-      // ENVIADO -> PAGO nunca vai virar valido.
-      if (order.status !== OrderStatus.PENDENTE) {
-        return { tipo: 'ja-pago' };
+        return { tipo: 'compensacao-registrada', motivo };
       }
 
       await aplicarTransicao(tx, ev.orderId, OrderStatus.PAGO, AUTOR);
@@ -95,7 +117,10 @@ export async function aplicarCaptura(ev: CapturaEvent): Promise<ResultadoAplicac
       // SO o inbox vira duplicata. Colisao do unique parcial da compensacao e
       // corrida: abortou o inbox junto, entao precisa reprocessar (requeue).
       // P2002 desconhecido cai no lado conservador: relanca.
-      if (alvo.includes('eventId') || alvo.includes('inbox_events')) {
+      // Alvo EXATO, nao includes: outro indice cujo nome contenha "inbox_events"
+      // ou outro campo terminado em "eventId" viraria falso positivo, e a
+      // mensagem receberia ack como duplicata com a transacao revertida.
+      if (alvo === 'eventId' || alvo === 'inbox_events_eventId_key') {
         return { tipo: 'duplicata' };
       }
     }

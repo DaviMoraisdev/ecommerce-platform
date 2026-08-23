@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { CapturaEvent, parseCaptura } from './payment-events';
 import { BINDING_PAYMENT_CAPTURED } from './payments.topology';
 
@@ -11,24 +12,81 @@ export type DeliveryAction =
 export type ResultadoAplicacao =
   | { tipo: 'aplicado' }
   | { tipo: 'duplicata' }
-  | { tipo: 'ja-pago' }
-  | { tipo: 'compensacao-registrada' }
+  // Nao existe mais 'ja-pago': com eventId derivado do paymentId, a redentrega
+  // do MESMO pagamento colide no @unique antes de chegar ao estado do pedido.
+  // Logo, tudo que alcanca a checagem de status e OUTRO pagamento — segunda
+  // cobranca, nunca "o efeito ja existe".
+  | { tipo: 'compensacao-registrada'; motivo: string }
   | { tipo: 'pedido-inexistente' }
-  | { tipo: 'valor-divergente'; esperadoCents: number; recebidoCents: number };
+  | { tipo: 'valor-divergente'; esperadoCents: number; recebidoCents: number }
+  | { tipo: 'captura-parcial'; autorizadoCents: number; capturadoCents: number }
+  | { tipo: 'moeda-divergente'; esperada: string; recebida: string };
+
+// Codigos do Prisma que NAO melhoram com o tempo: chave estrangeira violada,
+// registro ausente, valor fora do tipo. Tentar de novo repete o mesmo erro.
+const CODIGOS_DETERMINISTICOS = new Set(['P2000', 'P2002', 'P2003', 'P2011', 'P2012', 'P2025']);
+
+/**
+ * Classifica a falha. So volta true quando da para AFIRMAR que o erro e
+ * deterministico — o desconhecido cai como transitorio e vira requeue.
+ *
+ * A assimetria e proposital: classificar transitorio como deterministico
+ * DESCARTA um pagamento; o contrario apenas repete tentativa. Entre perder
+ * dinheiro e gastar ciclo, gasta-se ciclo.
+ *
+ * O que isto resolve (achado 4.4): sem classificacao, um bug de programacao ou
+ * uma constraint violada voltava para a fila indefinidamente e monopolizava o
+ * unico slot do prefetch(1), travando mensagens validas atras dele.
+ */
+export function ehDeterministico(err: unknown): boolean {
+  if (err instanceof TypeError || err instanceof RangeError || err instanceof SyntaxError) {
+    return true;
+  }
+  if (err instanceof Prisma.PrismaClientValidationError) return true;
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    return CODIGOS_DETERMINISTICOS.has(err.code);
+  }
+  return false;
+}
 
 export interface ConsumerDeps {
   aplicar: (ev: CapturaEvent) => Promise<ResultadoAplicacao>;
 }
 
-// Conteudo vindo do broker entra em log. Caractere de controle em log permite
-// forjar linha falsa (CR/LF) e sujar terminal; o cap evita despejar payload.
+// Teto de bytes da mensagem. prefetch(1) limita QUANTAS mensagens chegam por
+// vez, nao o TAMANHO de uma. Sem isto, uma mensagem gigante e convertida em
+// string e parseada antes de qualquer defesa.
+export const MAX_PAYLOAD_BYTES = 64 * 1024;
+
+// Decide pelo TAMANHO, antes de converter para string. Retorna null quando o
+// tamanho e aceitavel e o fluxo normal deve seguir.
+export function decidirPorTamanho(bytes: number): DeliveryAction | null {
+  if (bytes <= MAX_PAYLOAD_BYTES) return null;
+  // DLQ, nao requeue: a mesma mensagem grande voltaria para sempre.
+  return {
+    type: 'nack-dlq',
+    reason: 'payload acima do limite: ' + bytes + ' bytes (max ' + MAX_PAYLOAD_BYTES + ')',
+  };
+}
+
+// Conteudo vindo do broker entra em log. Duas defesas distintas:
+//  - caractere de controle: CR/LF permite forjar linha de log falsa;
+//  - credencial: err.message de biblioteca costuma trazer a URL do broker
+//    inteira, com a senha dentro do userinfo.
+// A redacao e por token, sem regex: regex sobre entrada nao controlada e
+// superficie de ReDoS e sempre deixa um caso escapar. Mesma abordagem do
+// motivoSeguro do payment-service.
 export function sanitizarParaLog(s: string): string {
-  let out = '';
+  let semControle = '';
   for (const ch of s) {
     const code = ch.charCodeAt(0);
-    out += code < 32 || code === 127 ? '?' : ch;
+    semControle += code < 32 || code === 127 ? '?' : ch;
   }
-  return out.length > 200 ? out.slice(0, 200) + '...' : out;
+  const redigido = semControle
+    .split(' ')
+    .map((parte) => (parte.includes('://') ? '[uri redigida]' : parte))
+    .join(' ');
+  return redigido.length > 200 ? redigido.slice(0, 200) + '...' : redigido;
 }
 
 /**
@@ -64,12 +122,15 @@ export async function decidirEntrega(
   try {
     resultado = await deps.aplicar(evento);
   } catch (err) {
+    const motivo = sanitizarParaLog(err instanceof Error ? err.message : String(err));
+    if (ehDeterministico(err)) {
+      // Erro que nao muda com o tempo. Requeue aqui seria loop eterno ocupando
+      // o unico slot do prefetch(1) e travando mensagens validas atras.
+      return { type: 'nack-dlq', reason: 'falha deterministica ao aplicar: ' + motivo };
+    }
     // C6 — falha de infra. NUNCA DLQ: perder evento por indisponibilidade
     // momentanea e o pior desfecho possivel aqui.
-    return {
-      type: 'nack-requeue',
-      reason: 'falha ao aplicar: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)),
-    };
+    return { type: 'nack-requeue', reason: 'falha transitoria ao aplicar: ' + motivo };
   }
 
   switch (resultado.tipo) {
@@ -79,13 +140,10 @@ export async function decidirEntrega(
       // C1 — o @unique do inbox abortou a transacao inteira: o efeito nao
       // repetiu porque ja tinha acontecido.
       return { type: 'ack', reason: 'duplicata' };
-    case 'ja-pago':
-      // C4 — inbox sem a linha (purga, por exemplo) mas o efeito ja existe.
-      return { type: 'ack', reason: 'pedido ja pago' };
     case 'compensacao-registrada':
-      // C5 — dinheiro capturado com pedido cancelado. O evento FOI processado;
-      // o que ele produziu foi uma pendencia de estorno.
-      return { type: 'ack', reason: 'compensacao registrada' };
+      // C5 — o evento FOI processado; o que ele produziu foi uma pendencia de
+      // estorno em vez de uma transicao.
+      return { type: 'ack', reason: 'compensacao registrada: ' + resultado.motivo };
     case 'pedido-inexistente':
       // C3 — o payment so emite captura para pedido que consultou antes.
       return { type: 'nack-dlq', reason: 'pedido inexistente' };
@@ -96,6 +154,20 @@ export async function decidirEntrega(
         reason:
           'valor divergente: pedido ' + resultado.esperadoCents +
           ' centavos, evento ' + resultado.recebidoCents,
+      };
+    case 'captura-parcial':
+      // Captura parcial NAO e suportada: o pedido nao tem como representar
+      // pagamento incompleto. Aceitar levaria a PAGO com dinheiro faltando.
+      return {
+        type: 'nack-dlq',
+        reason:
+          'captura parcial nao suportada: autorizado ' + resultado.autorizadoCents +
+          ', capturado ' + resultado.capturadoCents,
+      };
+    case 'moeda-divergente':
+      return {
+        type: 'nack-dlq',
+        reason: 'moeda divergente: esperada ' + resultado.esperada + ', recebida ' + resultado.recebida,
       };
   }
 }

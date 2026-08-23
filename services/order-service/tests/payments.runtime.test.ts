@@ -9,25 +9,39 @@ import {
 
 function canalFalso() {
   return {
-    assertExchange: jest.fn(async () => undefined),
-    assertQueue: jest.fn(async () => undefined),
-    bindQueue: jest.fn(async () => undefined),
-    prefetch: jest.fn(async () => undefined),
+    // Parametros DECLARADOS: sem eles o TS infere mock.calls como tupla vazia
+    // e nao deixa inspecionar os argumentos.
+    assertExchange: jest.fn(async (_nome: string, _tipo: string, _opts: object) => undefined),
+    assertQueue: jest.fn(async (_nome: string, _opts: object) => undefined),
+    bindQueue: jest.fn(async (_fila: string, _exchange: string, _chave: string) => undefined),
+    prefetch: jest.fn(async (_n: number) => undefined),
     ack: jest.fn(),
     nack: jest.fn(),
   } satisfies ChannelLike & Record<string, unknown>;
 }
 
 describe('montarTopologia', () => {
-  it('CASO C10: declara DLX e DLQ antes de ligar a fila principal', async () => {
-    // Sem dead-letter, uma mensagem rejeitada some. Erro silencioso: a fila
-    // sobe, o consumidor loga "consumindo", e a mensagem ruim evapora.
+  it('CASO C10: declara DLX e DLQ ANTES da fila principal, na ordem real', async () => {
+    // Sem dead-letter, uma mensagem rejeitada some. E argumento de fila duravel
+    // e IMUTAVEL: apontar para uma DLX inexistente so se corrige recriando a
+    // fila. Por isso a ORDEM importa, nao so o conjunto de chamadas.
     const ch = canalFalso();
     await montarTopologia(ch);
 
     expect(ch.assertExchange).toHaveBeenCalledWith(DLX_PAGAMENTOS, 'fanout', { durable: true });
     expect(ch.assertQueue).toHaveBeenCalledWith(DLQ_PAGAMENTOS, { durable: true });
     expect(ch.bindQueue).toHaveBeenCalledWith(DLQ_PAGAMENTOS, DLX_PAGAMENTOS, '');
+
+    // toHaveBeenCalledWith nao prova ordem nenhuma: o teste anterior continuaria
+    // verde com a topologia declarada ao contrario. invocationCallOrder da a
+    // sequencia global das chamadas entre mocks diferentes.
+    const ordemDlx = ch.assertExchange.mock.invocationCallOrder[
+      ch.assertExchange.mock.calls.findIndex((c) => c[0] === DLX_PAGAMENTOS)
+    ];
+    const ordemFila = ch.assertQueue.mock.invocationCallOrder[
+      ch.assertQueue.mock.calls.findIndex((c) => c[0] === QUEUE_PAGAMENTOS)
+    ];
+    expect(ordemDlx).toBeLessThan(ordemFila);
   });
 
   it('CASO C11: fila principal aponta para a DLX e usa binding ESTRITO', async () => {
