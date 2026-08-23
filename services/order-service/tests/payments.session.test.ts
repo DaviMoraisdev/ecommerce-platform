@@ -146,6 +146,36 @@ describe('sessao do consumidor — aquisicao e encerramento', () => {
     expect(cx.close).toHaveBeenCalled();
   });
 
+  it('CASO C30: apos o encerramento, a abertura PARA em vez de criar canal', async () => {
+    // A sabotagem T16 mostrou que o C28 sozinho nao cobre isto: com
+    // createChannel mock resolvendo na hora, o descarte acontece no ponto de
+    // checagem seguinte e o teste passa. No mundo real encerra-se PORQUE algo
+    // esta ruim, entao o createChannel pendura — e a conexao vaza enquanto o
+    // shutdown trava esperando. Mesmo erro cometido no publisher do payment.
+    const ch = canalFalso({
+      // nunca resolve
+    });
+    const cx = conexaoFalsa(ch, {
+      createChannel: jest.fn(() => new Promise(() => undefined)),
+    });
+    const { mod, connect } = carregar();
+    let liberar = (_v: unknown): void => undefined;
+    connect.mockImplementation(
+      () => new Promise((r) => {
+        liberar = r as (v: unknown) => void;
+      }),
+    );
+
+    const emVoo = mod.iniciarConsumidorPagamentos().catch(() => undefined);
+    await mod.pararConsumidorPagamentos();
+    liberar(cx);
+    await emVoo;
+
+    expect(cx.createChannel).not.toHaveBeenCalled();
+    expect(cx.close).toHaveBeenCalled();
+    expect(mod.estaConsumindo()).toBe(false);
+  }, 5_000);
+
   it('CASO C29: dois inicios concorrentes abrem UMA conexao', async () => {
     // Sem single-flight, uma reconexao agendada coincidindo com um inicio
     // manual abre duas conexoes e a referencia global fica com uma orfa.
