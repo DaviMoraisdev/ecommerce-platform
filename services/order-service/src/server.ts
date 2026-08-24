@@ -6,6 +6,7 @@ import { connectDatabase } from './config/database';
 import { validateRequiredEnv, resolvePort } from './config/env';
 import { closeEventPublisher } from './events/publisher';
 import { startOutboxRelay, stopOutboxRelay } from './events/outbox.relay';
+import { iniciarConsumidorPagamentos, pararConsumidorPagamentos } from './events/payments.runtime';
 
 async function startServer() {
   // process.exit fica SO aqui, no ponto de entrada.
@@ -31,10 +32,15 @@ async function startServer() {
   // publicar os eventos gravados na transacao (at-least-once). Nao bloqueia o boot.
   startOutboxRelay();
 
+  // Consumidor de payment.captured. NAO bloqueia o boot e NAO derruba o HTTP
+  // se o broker estiver fora: degradacao parcial em vez de indisponibilidade.
+  void iniciarConsumidorPagamentos();
+
   // Encerramento gracioso: drena o HTTP (com teto), fecha o publisher e sai.
   async function shutdown(signal: string): Promise<void> {
     console.log('[order] ' + signal + ' recebido; encerrando graciosamente...');
     await stopOutboxRelay();
+    await pararConsumidorPagamentos();
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, 10000);
       server.close(() => {

@@ -124,3 +124,30 @@ model OutboxEvent {
   @@index([status, createdAt])
   @@map("outbox_events")
 }
+
+model InboxEvent {
+  id String @id @default(uuid())
+  // eventId que veio DENTRO do evento (determinstico do lado do payment:
+  // "payment.captured:<paymentId>"). UNIQUE e a trava de duplicata: a garantia
+  // vem da constraint, nao de um SELECT previo — checar-e-depois-inserir tem
+  // corrida entre a checagem e o insert.
+  eventId String @unique
+  routingKey String
+  // Campos financeiros da captura. Nao sao decorativos: sao o REGISTRO por
+  // pagamento que o order nao tinha. Sem eles, uma segunda captura com outro
+  // identificador de pagamento para um pedido ja PAGO era indistinguivel da
+  // primeira e recebia ack em silencio — cobranca dupla sem reconciliacao
+  // (achado 4.1 do review). Uma linha por captura, reconciliavel por orderId.
+  orderId String
+  paymentId String
+  amountCents Int
+  currency String
+  // Quando o efeito commitou. Como o insert vive na MESMA transacao do efeito,
+  // esta linha existir prova que o efeito aconteceu — e o contrario tambem.
+  processedAt DateTime @default(now())
+
+  // Reconciliacao busca todas as capturas de um pedido.
+  @@index([orderId])
+  @@index([processedAt])
+  @@map("inbox_events")
+}

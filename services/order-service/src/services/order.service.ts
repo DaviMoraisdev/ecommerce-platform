@@ -24,14 +24,22 @@ function normalizeChangedBy(changedBy: unknown): string {
   return v;
 }
 
-export async function updateOrderStatus(
+/**
+ * Miolo da transicao, SEM abrir transacao: recebe o tx de quem chama.
+ *
+ * Extraido para o Bloco 5b. O consumidor de payment.captured precisa gravar a
+ * marca do inbox e aplicar a transicao no MESMO commit — se esta funcao abrisse
+ * a propria transacao, marca e efeito ficariam em transacoes distintas e
+ * voltaria a existir o instante em que uma aconteceu e a outra nao.
+ */
+export async function aplicarTransicao(
+  tx: Prisma.TransactionClient,
   orderId: string,
   newStatus: OrderStatus,
   changedBy: string
 ): Promise<Order> {
   const autor = normalizeChangedBy(changedBy);
-
-  return prisma.$transaction(async (tx) => {
+  {
     const order = await tx.order.findUnique({ where: { id: orderId } });
     if (!order) {
       throw new DomainError('PEDIDO_NAO_ENCONTRADO');
@@ -74,7 +82,17 @@ export async function updateOrderStatus(
       },
     });
     return atualizado;
-  });
+  }
+}
+
+// Embrulho: abre a transacao e delega. Assinatura e comportamento inalterados
+// para todos os chamadores existentes.
+export async function updateOrderStatus(
+  orderId: string,
+  newStatus: OrderStatus,
+  changedBy: string
+): Promise<Order> {
+  return prisma.$transaction((tx) => aplicarTransicao(tx, orderId, newStatus, changedBy));
 }
 
 // Ordena por seq (monotonica), nao por createdAt: empates de milissegundo
