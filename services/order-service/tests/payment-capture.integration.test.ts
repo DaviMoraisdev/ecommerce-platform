@@ -62,11 +62,18 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     // assina a trilha de auditoria.
     expect(trilha[0].changedBy).toBe('payment-service');
 
-    expect(await prisma.inboxEvent.count()).toBe(1);
+    // Contagem POR PEDIDO, nao global: contagem global torna o caso sensivel a
+    // residuo de qualquer outro teste no mesmo banco, e foi assim que ele caiu
+    // junto numa sabotagem que nao tinha nada a ver com ele.
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
 
     // A transicao emite order.status_changed na MESMA transacao: o notification
     // e avisado sem nenhum codigo novo.
-    const saida = await prisma.outboxEvent.findMany();
+    // OutboxEvent nao tem coluna orderId: filtra pelo caminho do JSON, para nao
+    // depender de a tabela estar vazia.
+    const saida = await prisma.outboxEvent.findMany({
+      where: { payload: { path: ['orderId'], equals: o.id } },
+    });
     expect(saida).toHaveLength(1);
     expect(saida[0].routingKey).toBe('order.status_changed');
   });
@@ -78,9 +85,9 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     await expect(aplicarCaptura(ev)).resolves.toEqual({ tipo: 'aplicado' });
     await expect(aplicarCaptura(ev)).resolves.toEqual({ tipo: 'duplicata' });
 
-    expect(await prisma.inboxEvent.count()).toBe(1);
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
     expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(1);
-    expect(await prisma.outboxEvent.count()).toBe(1);
+    expect(await prisma.outboxEvent.count({ where: { payload: { path: ['orderId'], equals: o.id } } })).toBe(1);
   });
 
   it('CASO G3: pedido ja PAGO recebendo OUTRO pagamento gera compensacao', async () => {
@@ -118,18 +125,19 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     const pend = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
     expect(pend).toHaveLength(1);
     expect(pend[0].resolvedAt).toBeNull();
-    expect(await prisma.inboxEvent.count()).toBe(1);
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
   });
 
   it('CASO G5: pedido inexistente NAO deixa marca no inbox', async () => {
     // O invariante do inbox: linha existe se e somente se o efeito aconteceu.
     // Commitar a marca de um evento que nao produziu efeito faria a redentrega
     // ser tratada como duplicata — o mesmo buraco do claim no Redis.
-    await expect(aplicarCaptura(evento('00000000-0000-0000-0000-000000000000'))).resolves.toEqual(
+    const inexistente = '00000000-0000-0000-0000-000000000000';
+    await expect(aplicarCaptura(evento(inexistente))).resolves.toEqual(
       { tipo: 'pedido-inexistente' },
     );
 
-    expect(await prisma.inboxEvent.count()).toBe(0);
+    expect(await prisma.inboxEvent.count({ where: { orderId: inexistente } })).toBe(0);
   });
 
   it('CASO G6: valor divergente NAO deixa marca e NAO muda o pedido', async () => {
@@ -145,7 +153,7 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
 
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
     expect(atual.status).toBe(OrderStatus.PENDENTE);
-    expect(await prisma.inboxEvent.count()).toBe(0);
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(0);
     expect(await prisma.orderStatusHistory.count()).toBe(0);
   });
 
@@ -159,7 +167,7 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
 
     // O unique parcial permite UMA pendencia aberta por pedido.
     expect(await prisma.pendingCompensation.count({ where: { orderId: o.id } })).toBe(1);
-    expect(await prisma.inboxEvent.count()).toBe(2);
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(2);
   });
 
   it('CASO G8: pedido ENVIADO recebendo captura gera compensacao, nao loop', async () => {
@@ -188,7 +196,7 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
 
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
     expect(atual.status).toBe(OrderStatus.PENDENTE);
-    expect(await prisma.inboxEvent.count()).toBe(0);
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(0);
   });
 
   it('CASO G10: captura parcial NAO deixa marca e NAO muda o pedido', async () => {
@@ -202,7 +210,7 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
 
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
     expect(atual.status).toBe(OrderStatus.PENDENTE);
-    expect(await prisma.inboxEvent.count()).toBe(0);
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(0);
   });
 
   it('CASO G11: duas capturas disparadas juntas produzem UMA transicao', async () => {
