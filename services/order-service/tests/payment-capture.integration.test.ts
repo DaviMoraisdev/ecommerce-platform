@@ -234,7 +234,13 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     expect(atual.status).toBe(OrderStatus.PAGO);
     expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(1);
 
-    // Invariante do inbox sob corrida: so a captura que commitou deixou marca.
-    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
+    // Invariante do inbox sob QUALQUER entrelacamento: uma marca por chamada que
+    // commitou, nenhuma pela que abortou. A versao anterior deste teste fixava
+    // 1 e era INTERMITENTE — ela presumia que houve disputa. Com serializacao,
+    // a segunda captura le o pedido ja PAGO, registra compensacao e commita:
+    // duas linhas, e correto. Amarrar a contagem ao desfecho observado vale
+    // para os dois casos e ainda testa a invariante que importa.
+    const commitadas = r.filter((x) => x.status === 'fulfilled').length;
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(commitadas);
   });
 });
