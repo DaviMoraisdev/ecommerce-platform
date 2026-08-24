@@ -205,12 +205,19 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     expect(await prisma.inboxEvent.count()).toBe(0);
   });
 
-  it('CASO G11: duas capturas simultaneas produzem UMA transicao', async () => {
-    // Ate aqui a atomicidade sob concorrencia era afirmacao minha: o CAS do
-    // aplicarTransicao existe, mas nenhum teste punha duas transacoes reais em
-    // corrida. Quem perde o CAS ve count 0, lanca CONFLITO_DE_ESTADO e a
-    // transacao inteira aborta — inclusive o insert do inbox, que e o que
-    // permite a redentrega reprocessar e virar compensacao.
+  it('CASO G11: duas capturas disparadas juntas produzem UMA transicao', async () => {
+    // O QUE ESTE TESTE PROVA: qualquer que seja o entrelacamento, o desfecho e
+    // um so — uma transicao, uma trilha, uma marca no inbox.
+    //
+    // O QUE ELE NAO PROVA: que houve disputa. A sabotagem V7 (remover o CAS do
+    // aplicarTransicao) NAO o derrubou, o que indica que as duas transacoes
+    // acabam serializadas e a segunda ja le o pedido PAGO, caindo no ramo de
+    // compensacao sem nunca disputar. Quem cobre o CAS de verdade e o teste
+    // 'updateOrderStatus > concorrencia: a MESMA transicao aplicada 2x so vale
+    // uma vez', em order.integration.test.ts — foi ele que a V7 derrubou.
+    // Forcar entrelacamento deterministico exigiria controlar o agendamento das
+    // transacoes; sem isso, o teste ficaria intermitente. Registrado no
+    // TECH_DEBT como nao coberto.
     const o = await pedido(OrderStatus.PENDENTE, 100);
 
     const r = await Promise.allSettled([
