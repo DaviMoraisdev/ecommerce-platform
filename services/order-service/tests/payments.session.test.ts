@@ -4,6 +4,7 @@ jest.mock('amqplib', () => ({
 
 // Knobs sao lidos no import: encurtar aqui evita esperar os defaults.
 process.env.RABBITMQ_URL = 'amqp://localhost:5672';
+process.env.PAYMENTS_CONSUMER_ENABLED = 'true';
 process.env.PAYMENTS_RECONNECT_DELAY_MS = '100';
 process.env.PAYMENTS_REQUEUE_DELAY_MS = '50';
 // Curto para o C35: a abertura pendurada precisa terminar DENTRO do teste,
@@ -66,6 +67,38 @@ beforeEach(() => {
 
 afterEach(() => {
   jest.restoreAllMocks();
+});
+
+describe('ativacao', () => {
+  it('CASO C40: consumidor fica DESLIGADO por padrao', async () => {
+    // Superficie que altera estado financeiro a partir de mensagem nao
+    // autenticada nao pode subir por omissao.
+    const anterior = process.env.PAYMENTS_CONSUMER_ENABLED;
+    delete process.env.PAYMENTS_CONSUMER_ENABLED;
+    const { mod, connect } = carregar();
+    connect.mockResolvedValue(conexaoFalsa(canalFalso()));
+
+    await mod.iniciarConsumidorPagamentos();
+
+    expect(connect).not.toHaveBeenCalled();
+    expect(mod.estaConsumindo()).toBe(false);
+    await mod.pararConsumidorPagamentos();
+    if (anterior !== undefined) process.env.PAYMENTS_CONSUMER_ENABLED = anterior;
+  });
+
+  it('CASO C41: so a string exata "true" liga', async () => {
+    // '1', 'yes' ou 'TRUE' nao ligam: aceitar variantes transforma erro de
+    // digitacao em ativacao acidental de superficie financeira.
+    for (const valor of ['1', 'yes', 'TRUE', 'false', '']) {
+      process.env.PAYMENTS_CONSUMER_ENABLED = valor;
+      const { mod, connect } = carregar();
+      connect.mockResolvedValue(conexaoFalsa(canalFalso()));
+      await mod.iniciarConsumidorPagamentos();
+      expect(connect).not.toHaveBeenCalled();
+      await mod.pararConsumidorPagamentos();
+    }
+    process.env.PAYMENTS_CONSUMER_ENABLED = 'true';
+  });
 });
 
 describe('sessao do consumidor — perda e recuperacao', () => {

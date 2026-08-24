@@ -237,6 +237,23 @@ export function iniciarConsumidorPagamentos(): Promise<void> {
 async function abrirSessao(): Promise<void> {
   if (encerrando || canal !== null) return;
 
+  // FAIL-CLOSED por decisao explicita. Este consumidor altera estado FINANCEIRO
+  // a partir de mensagem cuja origem o servico nao consegue autenticar (ver
+  // TECH_DEBT: nenhum publicador de evento e autenticado, correcao de
+  // infraestrutura na Fase 7). Enquanto ACL por servico ou assinatura do evento
+  // nao existirem, ligar por padrao seria expor uma superficie financeira nova
+  // a qualquer principal com permissao de publicacao no exchange.
+  //
+  // A pre-condicao ja estava escrita no TECH_DEBT, mas escrita nao impede nada:
+  // a flag e o que a torna efetiva.
+  if (process.env.PAYMENTS_CONSUMER_ENABLED !== 'true') {
+    console.warn(
+      '[payments] consumidor DESATIVADO (PAYMENTS_CONSUMER_ENABLED != true). ' +
+        'Ative apenas com credencial por servico e ACL de publicacao no exchange payments.',
+    );
+    return;
+  }
+
   const url = process.env.RABBITMQ_URL;
   if (!url) {
     console.warn('[payments] RABBITMQ_URL nao definida, consumidor desativado');
