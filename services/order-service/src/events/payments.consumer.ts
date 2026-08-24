@@ -130,9 +130,13 @@ export function sanitizarParaLog(s: string): string {
 }
 
 /**
- * Traduz o resultado do efeito em acao no broker. Funcao PURA: nao toca banco
- * nem canal — o efeito entra por deps.aplicar. E isso que torna C1-C9
- * testaveis sem RabbitMQ e sem Postgres.
+ * Traduz o resultado do efeito em acao no broker. Nao toca banco nem canal — o
+ * efeito entra por deps.aplicar, e e isso que torna os casos C testaveis sem
+ * RabbitMQ e sem Postgres.
+ *
+ * NAO e pura: le e escreve o Map `tentativas`. O comentario anterior dizia
+ * "PURA" e ficou falso quando o teto de tentativas entrou. Contar tentativas
+ * exige memoria ENTRE entregas — ver a justificativa em `tentativas`.
  *
  * A regra que organiza a tabela toda: ack quando o efeito desejado ja existe
  * (ainda que produzido por outra entrega), requeue quando a proxima tentativa
@@ -175,7 +179,11 @@ export async function decidirEntrega(
     if (n > MAX_TENTATIVAS) {
       // ...mas nao para sempre: um erro permanente que a classificacao nao
       // reconhece travaria a fila inteira. DLQ preserva a mensagem.
-      tentativas.delete(evento.eventId);
+      //
+      // A contagem NAO e apagada aqui de proposito. Decidir DLQ nao e o mesmo
+      // que a mensagem ter sido dispensada: se o proprio nack falhar e ela
+      // voltar, apagar teria dado a ela um ciclo novo de 5 tentativas. Ela e
+      // limpa apenas em desfecho confirmado (ack) ou em erro deterministico.
       return {
         type: 'nack-dlq',
         reason: 'excedeu ' + MAX_TENTATIVAS + ' tentativas transitorias: ' + motivo,

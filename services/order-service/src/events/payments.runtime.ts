@@ -171,6 +171,11 @@ function invalidarSessao(motivo: string): void {
 interface EmAbertura {
   conn: Conexao | null;
   ch: Canal | null;
+  // comDeadline REJEITA a promise observada, mas nao cancela o trabalho: a
+  // execucao antiga segue criando canal, topologia e ate um consume. Sem esta
+  // marca, o resultado tardio viraria um consumidor orfao, sem referencia
+  // global e com listeners na mesma geracao da sessao nova.
+  abortado: boolean;
 }
 
 /**
@@ -186,8 +191,12 @@ let emAbertura: EmAbertura | null = null;
 // Fecha o que ja foi adquirido e SO ENTAO lanca. Lancar antes de fechar deixa
 // conexao viva, sem referencia e sem dono — cada ciclo de retry vazaria uma.
 async function abortarSePreciso(ref: EmAbertura, minhaGeracao: number): Promise<void> {
-  if (!encerrando && geracao === minhaGeracao) return;
-  const motivo = encerrando ? 'encerramento durante a abertura' : 'sessao obsoleta';
+  if (!ref.abortado && !encerrando && geracao === minhaGeracao) return;
+  const motivo = ref.abortado
+    ? 'aquisicao abandonada pelo deadline'
+    : encerrando
+      ? 'encerramento durante a abertura'
+      : 'sessao obsoleta';
   await fecharSilencioso(ref.ch);
   await fecharSilencioso(ref.conn);
   ref.ch = null;
@@ -235,7 +244,7 @@ async function abrirSessao(): Promise<void> {
   }
 
   const minhaGeracao = geracao;
-  const ref: EmAbertura = { conn: null, ch: null };
+  const ref: EmAbertura = { conn: null, ch: null, abortado: false };
   emAbertura = ref;
 
   try {
@@ -253,6 +262,11 @@ async function abrirSessao(): Promise<void> {
     console.log('[payments] consumindo ' + QUEUE_PAGAMENTOS + ' (binding ' + BINDING_PAYMENT_CAPTURED + '); DLQ: ' + DLQ_PAGAMENTOS);
   } catch (err) {
     console.error('[payments] falha ao iniciar consumidor: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
+    // ANTES de fechar: a abertura pode ainda estar rodando (deadline apenas
+    // abandona a promise). A marca faz o proximo ponto de checagem dela fechar
+    // o que adquirir depois daqui; a geracao invalida os listeners tardios.
+    ref.abortado = true;
+    geracao++;
     await fecharSilencioso(ref.ch);
     await fecharSilencioso(ref.conn);
     if (!encerrando) agendarReconexao();
@@ -288,6 +302,11 @@ async function adquirir(url: string, ref: EmAbertura, minhaGeracao: number): Pro
       // exatamente o que o isolamento deste consumidor existe para evitar.
       void tratarMensagem(ch as Canal, msg).catch((err) => {
         console.error('[payments] falha nao tratada no handler: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
+        // So logar deixaria a mensagem UNACKED. Com prefetch(1) isso bloqueia
+        // todas as seguintes e o servico segue parecendo saudavel. Fechar o
+        // canal devolve as nao confirmadas para a fila — nao ha como dispor da
+        // mensagem por um canal que acabou de falhar.
+        if (geracao === minhaGeracao) invalidarSessao('falha ao dispor da mensagem');
       });
     });
   await abortarSePreciso(ref, minhaGeracao);
@@ -306,11 +325,9 @@ export async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: 
     console.warn('[payments] ' + sanitizarParaLog(porTamanho.reason));
     // MESMA protecao do caminho normal: este ramo estava fora do try/catch, e
     // um nack falhando com o canal ja morto rejeitava sem observador.
-    try {
-      await executarAcao(ch, msg, porTamanho, () => sleep(REQUEUE_DELAY_MS));
-    } catch (err) {
-      console.error('[payments] falha ao aplicar acao no canal: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
-    }
+    // NAO engole: quem chama invalida a sessao, porque uma mensagem sem
+    // destino trava o slot do prefetch(1).
+    await executarAcao(ch, msg, porTamanho, () => sleep(REQUEUE_DELAY_MS));
     return;
   }
 
@@ -329,12 +346,9 @@ export async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: 
     console.warn('[payments] ' + acao.type + ' (' + sanitizarParaLog(routingKey) + '): ' + sanitizarParaLog(acao.reason));
   }
 
-  try {
-    await executarAcao(ch, msg, acao, () => sleep(REQUEUE_DELAY_MS));
-  } catch (err) {
-    // Canal morto: a mensagem volta para a fila sozinha, sem ack.
-    console.error('[payments] falha ao aplicar acao no canal: ' + sanitizarParaLog(err instanceof Error ? err.message : String(err)));
-  }
+  // Sem try/catch: falha aqui significa mensagem sem destino, e quem chama
+  // precisa saber para invalidar a sessao.
+  await executarAcao(ch, msg, acao, () => sleep(REQUEUE_DELAY_MS));
 }
 
 export async function pararConsumidorPagamentos(): Promise<void> {

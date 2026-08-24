@@ -107,7 +107,7 @@ describe('sessao do consumidor — perda e recuperacao', () => {
 });
 
 describe('handler — nenhuma rejeicao sem observador', () => {
-  it('CASO C33: nack que falha no caminho de payload grande nao rejeita', async () => {
+  it('CASO C33: falha ao dispor PROPAGA para quem chama invalidar', async () => {
     // Este ramo estava fora do try/catch. Com o canal ja morto, o nack rejeita,
     // a promise do handler nao tem observador e vira unhandledRejection — que
     // pode derrubar o processo HTTP, o oposto do isolamento que o consumidor
@@ -124,10 +124,71 @@ describe('handler — nenhuma rejeicao sem observador', () => {
       fields: { routingKey: 'payment.captured' },
     };
 
-    await expect(
-      mod.tratarMensagem(ch as never, grande),
-    ).resolves.toBeUndefined();
+    // A versao anterior deste teste afirmava que tratarMensagem RESOLVE quando o
+    // nack falha. Ausencia de rejeicao nao e destino: a mensagem ficava unacked
+    // e travava o prefetch(1) inteiro. Agora ela PROPAGA, e quem observa
+    // (o callback do broker) invalida a sessao — fechar o canal devolve as nao
+    // confirmadas para a fila, que e o unico destino possivel quando o proprio
+    // canal e que falhou. O C39 prova o efeito ponta a ponta.
+    await expect(mod.tratarMensagem(ch as never, grande)).rejects.toThrow();
   });
+});
+
+describe('sessao do consumidor — resultado tardio e disposicao', () => {
+  it('CASO C38: conexao que chega DEPOIS do deadline nao vira sessao orfa', async () => {
+    // comDeadline rejeita a promise observada, mas nao cancela o trabalho: sem
+    // marcar a aquisicao como abandonada, a execucao antiga segue criando canal,
+    // topologia e ate um consume — um consumidor sem referencia global, com
+    // listeners na mesma geracao da sessao nova.
+    const ch = canalFalso();
+    const cx = conexaoFalsa(ch);
+    const { mod, connect } = carregar();
+    let liberar = (_v: unknown): void => undefined;
+    connect.mockImplementation(
+      () => new Promise((r) => {
+        liberar = r as (v: unknown) => void;
+      }),
+    );
+
+    const emVoo = mod.iniciarConsumidorPagamentos().catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 300)); // deixa o deadline de 200ms vencer
+    liberar(cx);
+    await emVoo;
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(cx.createChannel).not.toHaveBeenCalled();
+    expect(cx.close).toHaveBeenCalled();
+    expect(mod.estaConsumindo()).toBe(false);
+  }, 5_000);
+
+  it('CASO C39: falha ao dispor da mensagem invalida a sessao', async () => {
+    // Com prefetch(1), uma mensagem unacked bloqueia TODAS as seguintes. Apenas
+    // logar deixa o consumidor travado parecendo saudavel. Fechar o canal
+    // devolve as nao confirmadas para a fila, que e o desfecho correto.
+    const ch = canalFalso({
+      nack: jest.fn(() => {
+        throw new Error('canal ja fechado');
+      }),
+      ack: jest.fn(() => {
+        throw new Error('canal ja fechado');
+      }),
+    });
+    const { mod, connect } = carregar();
+    connect.mockResolvedValue(conexaoFalsa(ch));
+
+    await mod.iniciarConsumidorPagamentos();
+    expect(mod.estaConsumindo()).toBe(true);
+
+    const callback = ch.consume.mock.calls[0][1] as (m: unknown) => void;
+    callback({
+      content: Buffer.from('{ nao e json'),
+      fields: { routingKey: 'payment.captured' },
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mod.estaConsumindo()).toBe(false);
+    await mod.pararConsumidorPagamentos();
+  }, 5_000);
 });
 
 describe('sessao do consumidor — aquisicao e encerramento', () => {

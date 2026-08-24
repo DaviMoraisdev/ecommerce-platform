@@ -204,4 +204,30 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     expect(atual.status).toBe(OrderStatus.PENDENTE);
     expect(await prisma.inboxEvent.count()).toBe(0);
   });
+
+  it('CASO G11: duas capturas simultaneas produzem UMA transicao', async () => {
+    // Ate aqui a atomicidade sob concorrencia era afirmacao minha: o CAS do
+    // aplicarTransicao existe, mas nenhum teste punha duas transacoes reais em
+    // corrida. Quem perde o CAS ve count 0, lanca CONFLITO_DE_ESTADO e a
+    // transacao inteira aborta — inclusive o insert do inbox, que e o que
+    // permite a redentrega reprocessar e virar compensacao.
+    const o = await pedido(OrderStatus.PENDENTE, 100);
+
+    const r = await Promise.allSettled([
+      aplicarCaptura(evento(o.id, { paymentId: 'pay_a' })),
+      aplicarCaptura(evento(o.id, { paymentId: 'pay_b' })),
+    ]);
+
+    const aplicadas = r.filter(
+      (x) => x.status === 'fulfilled' && (x.value as { tipo: string }).tipo === 'aplicado',
+    );
+    expect(aplicadas).toHaveLength(1);
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.status).toBe(OrderStatus.PAGO);
+    expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(1);
+
+    // Invariante do inbox sob corrida: so a captura que commitou deixou marca.
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
+  });
 });
