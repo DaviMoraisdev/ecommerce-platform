@@ -383,20 +383,42 @@ describe('idempotency_records', () => {
     expect(erro.message).toContain('idempotency_completed_exige_pagamento');
   });
 
-  it('aceita COMPLETED com paymentId — a unica forma valida', async () => {
+  it('aceita COMPLETED com paymentId E resposta congelada', async () => {
+    // Deixou de ser "a unica forma valida" no Bloco 6a: COMPLETED passou a
+    // exigir TAMBEM completedResponse, senao o replay nao teria o que devolver.
     const pagamento = await prisma.payment.create({ data: pagamentoValido() });
-
     const registro = await prisma.idempotencyRecord.create({
       data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID() },
     });
-
     const concluido = await prisma.idempotencyRecord.update({
       where: { id: registro.id },
-      data: { status: 'COMPLETED', paymentId: pagamento.id },
+      data: {
+        status: 'COMPLETED',
+        paymentId: pagamento.id,
+        completedResponse: { paymentId: pagamento.id, status: 'CAPTURED' },
+      },
     });
-
     expect(concluido.status).toBe('COMPLETED');
     expect(concluido.paymentId).toBe(pagamento.id);
+    expect(concluido.completedResponse).not.toBeNull();
+  });
+
+  it('recusa COMPLETED sem resposta congelada — a restricao vale no UPDATE', async () => {
+    // A restricao nasceu NOT VALID para nao quebrar em banco que ja tivesse
+    // COMPLETED antigo. NOT VALID dispensa as linhas EXISTENTES, mas vale para
+    // toda linha INSERIDA OU ALTERADA — e e este caso que prova isso, porque a
+    // violacao acontece num UPDATE, nao num INSERT.
+    const pagamento = await prisma.payment.create({ data: pagamentoValido() });
+    const registro = await prisma.idempotencyRecord.create({
+      data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID() },
+    });
+    const erro = await capturarViolacao(() =>
+      prisma.idempotencyRecord.update({
+        where: { id: registro.id },
+        data: { status: 'COMPLETED', paymentId: pagamento.id },
+      }),
+    );
+    expect(erro.message).toContain('idempotency_completed_exige_resposta');
   });
 
   it('recusa paymentId que nao existe (integridade referencial)', async () => {

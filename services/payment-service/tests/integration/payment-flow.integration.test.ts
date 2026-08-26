@@ -478,3 +478,37 @@ describe('captura SINCRONA tambem emite o evento', () => {
     expect(await prisma.outboxEvent.count()).toBe(0);
   });
 });
+
+describe('replay idempotente', () => {
+  it('CASO F3: replay de chave RECUSADA nao pode devolver o sucesso de outra chave', async () => {
+    // Achado 4.4 do review do PR #52, em forma executavel.
+    //
+    // O replay le o Payment VIVO e o failureCode da transacao MAIS RECENTE.
+    // Como o orderId e unique, a segunda tentativa reusa a MESMA linha de
+    // Payment — entao, depois que outra chave captura, a chave recusada passa a
+    // responder CAPTURED. O sistema afirma sobre AQUELA tentativa um desfecho
+    // que ela nunca teve.
+    const { service, input } = cenario(FAKE_TOKENS.DECLINED_INSUFFICIENT_FUNDS);
+    const chaveRecusada = input.idempotencyKey;
+
+    const recusada = await service.criarPagamento(input);
+    expect(recusada.status).toBe(PaymentStatus.FAILED);
+    expect(recusada.declineCode).toBe('insufficient_funds');
+
+    // Outra chave, mesmo pedido, agora com sucesso: reusa a linha de Payment
+    // com attemptCount + 1.
+    const sucesso = await service.criarPagamento({
+      ...input,
+      paymentMethodToken: FAKE_TOKENS.SUCCESS,
+      idempotencyKey: randomUUID(),
+    });
+    expect(sucesso.status).toBe(PaymentStatus.CAPTURED);
+
+    // O replay da PRIMEIRA chave tem de descrever a PRIMEIRA tentativa.
+    const replay = await service.criarPagamento({ ...input, idempotencyKey: chaveRecusada });
+    expect(replay.replay).toBe(true);
+    expect(replay.status).toBe(PaymentStatus.FAILED);
+    expect(replay.declineCode).toBe('insufficient_funds');
+    expect(replay.attemptCount).toBe(recusada.attemptCount);
+  });
+});

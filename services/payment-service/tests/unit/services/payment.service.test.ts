@@ -229,7 +229,24 @@ describe('criarPagamento — idempotencia', () => {
   });
 
   it('devolve replay sem novo efeito quando a chave ja foi COMPLETED', async () => {
-    const falso = comColisao({ id: 'rec_1', status: 'COMPLETED', paymentId: 'pay_1' });
+    // O congelado e DELIBERADAMENTE diferente do Payment vivo: se o codigo
+    // voltar a ler o vivo, este teste cai. Com valores iguais ele passaria dos
+    // dois jeitos e nao provaria nada.
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      completedResponse: {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.FAILED,
+        amountCents: 12990,
+        capturedAmountCents: 0,
+        currency: 'BRL',
+        attemptCount: 1,
+        declineCode: 'insufficient_funds',
+      },
+    });
     falso.payment.findUnique.mockResolvedValue({
       ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
       transactions: [{ failureCode: null }],
@@ -239,7 +256,11 @@ describe('criarPagamento — idempotencia', () => {
     const resultado = await service.criarPagamento(entrada());
 
     expect(resultado.replay).toBe(true);
-    expect(resultado.status).toBe(PaymentStatus.CAPTURED);
+    expect(resultado.status).toBe(PaymentStatus.FAILED);
+    expect(resultado.capturedAmountCents).toBe(0);
+    expect(resultado.declineCode).toBe('insufficient_funds');
+    // Caminho congelado nao precisa do Payment: nem consulta.
+    expect(falso.payment.findUnique).not.toHaveBeenCalled();
     // O ponto da idempotencia: repetir a chave NAO cobra de novo.
     expect(espiaoCharge).not.toHaveBeenCalled();
   });
@@ -275,7 +296,14 @@ describe('criarPagamento — idempotencia', () => {
   });
 
   it('falha de forma explicita quando a chave COMPLETED aponta para pagamento inexistente', async () => {
-    const falso = comColisao({ id: 'rec_1', status: 'COMPLETED', paymentId: 'pay_sumiu' });
+    // completedResponse null: registro anterior a migration do Bloco 6a, entao
+    // o replay cai no ramo LEGADO que reconstroi a partir do Payment vivo.
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_sumiu',
+      completedResponse: null,
+    });
     falso.payment.findUnique.mockResolvedValue(null);
     const { service } = montar({ prisma: falso });
 
@@ -475,7 +503,24 @@ describe('criarPagamento — desfecho de sucesso', () => {
     });
 
     const chamadas = falso.idempotencyRecord.update.mock.calls;
-    expect(chamadas[chamadas.length - 1][0].data).toEqual({ status: 'COMPLETED' });
+    // toEqual ESTRITO de proposito: pega campo novo vazando para dentro da
+    // resposta congelada. Ela vai para o banco e e devolvida ao cliente em todo
+    // replay, entao o que entra ali precisa ser deliberado, nunca herdado.
+    // Note a AUSENCIA de declineCode: no caminho de sucesso a chave nao existe,
+    // porque JSON nao representa undefined e gravar null mudaria a forma do
+    // objeto entre uma tentativa recusada e uma bem-sucedida.
+    expect(chamadas[chamadas.length - 1][0].data).toEqual({
+      status: 'COMPLETED',
+      completedResponse: {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.CAPTURED,
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      },
+    });
   });
 
   it('grava o provider e a moeda vindos das dependencias', async () => {

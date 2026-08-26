@@ -64,19 +64,22 @@ export interface PagamentoCriado {
   /**
    * true quando a resposta veio de replay idempotente, sem novo efeito.
    *
-   * SEMANTICA DECLARADA (achado 4.3 do segundo review do PR #52): o replay
-   * devolve o ESTADO ATUAL do pagamento, nao uma copia congelada da primeira
-   * resposta.
+   * SEMANTICA (mudada no Bloco 6a): o replay devolve a resposta CONGELADA no
+   * momento em que a chave finalizou, lida de IdempotencyRecord.completedResponse.
+   * Nao le mais o Payment vivo.
    *
-   * Consequencia assumida: uma chave cuja tentativa foi recusada passa a
-   * devolver CAPTURED se OUTRA chave concluir uma tentativa bem-sucedida no
-   * mesmo pedido. O `replay: true` continua indicando corretamente que esta
-   * chamada nao produziu efeito novo.
+   * Antes disto, o replay lia o estado atual — e como o orderId e unique, a
+   * segunda tentativa reusa a MESMA linha de Payment. Uma chave RECUSADA passava
+   * a responder CAPTURED depois que OUTRA chave capturava o pedido, com o
+   * attemptCount e o declineCode da tentativa alheia. Nao era um campo vazando
+   * estado de outra tentativa: eram todos.
    *
-   * A escolha e deliberada — "qual e o estado do meu pagamento?" e a pergunta
-   * que o cliente costuma estar fazendo ao repetir. A alternativa (congelar a
-   * resposta) esta registrada no TECH_DEBT como decisao em aberto, com o custo
-   * anotado: coluna de resposta serializada e politica de retencao.
+   * O contra-argumento que sustentava o desenho antigo — "qual e o estado do meu
+   * pagamento?" e a pergunta que o cliente costuma fazer ao repetir — continua
+   * valendo, e a resposta e outra rota: quem quer o estado ATUAL consulta o
+   * pagamento. Resposta congelada com um campo vivo dentro nao seria congelada.
+   *
+   * `replay: true` NAO e congelado: vale false na gravacao e true na leitura.
    *
    * O que NAO e ambiguo, e ja esta garantido pelo requestFingerprint: a chave so
    * pode ser reusada para a MESMA requisicao.
@@ -214,6 +217,20 @@ export class PaymentService {
     }
 
     if (existente.status === 'COMPLETED') {
+      // Caminho normal: devolve o que foi congelado quando a chave finalizou.
+      if (existente.completedResponse !== null) {
+        const congelada = existente.completedResponse as unknown as Omit<PagamentoCriado, 'replay'>;
+        return { replay: { ...congelada, replay: true } };
+      }
+
+      // Linha anterior a esta migration: nao ha resposta congelada. Reconstroi
+      // do Payment VIVO — comportamento antigo, com o defeito antigo (pode
+      // devolver o desfecho de outra tentativa no mesmo pedido). Declarado e
+      // logado, nunca silencioso. Some quando o backfill rodar e o
+      // VALIDATE CONSTRAINT fechar a restricao.
+      console.warn(
+        '[payment-service] replay de registro legado sem resposta congelada: ' + existente.id,
+      );
       // O CHECK idempotency_completed_exige_pagamento garante paymentId nao nulo.
       const payment = await this.deps.prisma.payment.findUnique({
         where: { id: existente.paymentId as string },
@@ -528,9 +545,15 @@ export class PaymentService {
         },
       });
 
+      // A resposta e congelada na MESMA transacao do desfecho. Fora dela,
+      // existiria um instante com a chave COMPLETED e sem o que devolver — e o
+      // CHECK NOT VALID recusaria o UPDATE de qualquer forma.
       await tx.idempotencyRecord.update({
         where: { id: registroId },
-        data: { status: 'COMPLETED' },
+        data: {
+          status: 'COMPLETED',
+          completedResponse: this.paraCongelar(p, declineCode),
+        },
       });
 
       return p;
@@ -542,6 +565,36 @@ export class PaymentService {
   // ==========================================================
   // Auxiliares
   // ==========================================================
+
+  /**
+   * Corpo que vai para `completedResponse`.
+   *
+   * DERIVA de comoResposta em vez de repetir a lista de campos: se um campo
+   * novo entrar na resposta da API, ele passa a ser congelado automaticamente.
+   * Repetir a lista aqui criaria duas fontes de verdade que divergem no dia em
+   * que alguem acrescentar um campo e esquecer deste arquivo.
+   *
+   * `replay` fica de fora por ser contextual — vale false na gravacao e true na
+   * leitura. Congelar `replay: false` e devolve-lo assim no replay seria mentir
+   * sobre a natureza da chamada.
+   *
+   * `declineCode` so entra quando existe: JSON nao representa `undefined`, e
+   * gravar a chave com valor nulo mudaria a forma do objeto entre uma tentativa
+   * recusada e uma bem-sucedida.
+   */
+  private paraCongelar(
+    payment: Payment,
+    declineCode: string | null | undefined,
+  ): Prisma.InputJsonObject {
+    const { replay: _replay, declineCode: codigo, ...resto } = this.comoResposta(
+      payment,
+      declineCode,
+      false,
+    );
+    const corpo: Record<string, unknown> = { ...resto };
+    if (codigo !== undefined) corpo.declineCode = codigo;
+    return corpo as Prisma.InputJsonObject;
+  }
 
   private comoResposta(
     payment: Payment,
