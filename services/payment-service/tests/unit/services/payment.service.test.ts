@@ -265,6 +265,96 @@ describe('criarPagamento — idempotencia', () => {
     expect(espiaoCharge).not.toHaveBeenCalled();
   });
 
+  it('congelada com forma INVALIDA cai no ramo degradado, logando erro', async () => {
+    // A coluna e JSONB: o banco aceita qualquer JSON. Sem validacao de forma, um
+    // objeto incompleto viraria resposta sem campos obrigatorios. Achado 3.1 do
+    // review do PR #56.
+    const erroLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      completedResponse: { paymentId: 'pay_1', status: 'CAPTURED' },
+    });
+    falso.payment.findUnique.mockResolvedValue({
+      ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
+      transactions: [{ failureCode: null }],
+    });
+    const { service } = montar({ prisma: falso });
+
+    const resultado = await service.criarPagamento(entrada());
+
+    // Degradado, nao lixo: reconstroi do Payment vivo em vez de devolver um
+    // objeto sem amountCents, currency e attemptCount.
+    expect(resultado.amountCents).toBe(12990);
+    expect(erroLog).toHaveBeenCalledWith(expect.stringContaining('forma invalida'));
+
+    erroLog.mockRestore();
+  });
+
+  it('propriedade EXTRA na congelada nao vaza para a resposta', async () => {
+    // A validacao RECONSTROI campo a campo em vez de espalhar o JSON. Espalhar
+    // devolveria ao cliente qualquer coisa gravada na coluna.
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      completedResponse: {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.CAPTURED,
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+        segredoInterno: 'nao deveria sair daqui',
+      },
+    });
+    const { service } = montar({ prisma: falso });
+
+    const resultado = await service.criarPagamento(entrada());
+
+    expect(resultado).toEqual({
+      paymentId: 'pay_1',
+      orderId: 'ord_1',
+      status: PaymentStatus.CAPTURED,
+      amountCents: 12990,
+      capturedAmountCents: 12990,
+      currency: 'BRL',
+      attemptCount: 1,
+      replay: true,
+    });
+    expect(resultado).not.toHaveProperty('segredoInterno');
+  });
+
+  it('registro LEGADO sem congelada reconstroi do Payment vivo e avisa', async () => {
+    // Caminho que existe so ate o backfill/expiracao. Ele carrega o defeito
+    // antigo de proposito — e por isso avisa em log, nunca em silencio.
+    const aviso = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const falso = comColisao({
+      id: 'rec_legado',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      completedResponse: null,
+    });
+    falso.payment.findUnique.mockResolvedValue({
+      ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
+      transactions: [{ failureCode: null }],
+    });
+    const { service } = montar({ prisma: falso });
+
+    const resultado = await service.criarPagamento(entrada());
+
+    expect(resultado.replay).toBe(true);
+    expect(resultado.status).toBe(PaymentStatus.CAPTURED);
+    expect(aviso).toHaveBeenCalledWith(expect.stringContaining('registro legado'));
+
+    aviso.mockRestore();
+  });
+
   it('recusa chave que ja foi usada numa requisicao FAILED, sem retentativa', async () => {
     const falso = comColisao({ id: 'rec_1', status: 'FAILED', paymentId: null });
     const { service, espiaoCharge } = montar({ prisma: falso });

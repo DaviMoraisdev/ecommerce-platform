@@ -506,9 +506,18 @@ describe('replay idempotente', () => {
 
     // O replay da PRIMEIRA chave tem de descrever a PRIMEIRA tentativa.
     const replay = await service.criarPagamento({ ...input, idempotencyKey: chaveRecusada });
-    expect(replay.replay).toBe(true);
-    expect(replay.status).toBe(PaymentStatus.FAILED);
-    expect(replay.declineCode).toBe('insufficient_funds');
-    expect(replay.attemptCount).toBe(recusada.attemptCount);
+    // Objeto INTEIRO, nao tres campos: fixa tambem a AUSENCIA de campo
+    // inesperado na resposta congelada, que e metade do ponto de congela-la.
+    expect(replay).toEqual({
+      paymentId: recusada.paymentId,
+      orderId: recusada.orderId,
+      status: PaymentStatus.FAILED,
+      amountCents: recusada.amountCents,
+      capturedAmountCents: 0,
+      currency: recusada.currency,
+      attemptCount: recusada.attemptCount,
+      declineCode: 'insufficient_funds',
+      replay: true,
+    });
   });
 });

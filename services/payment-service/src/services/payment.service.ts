@@ -219,8 +219,12 @@ export class PaymentService {
     if (existente.status === 'COMPLETED') {
       // Caminho normal: devolve o que foi congelado quando a chave finalizou.
       if (existente.completedResponse !== null) {
-        const congelada = existente.completedResponse as unknown as Omit<PagamentoCriado, 'replay'>;
-        return { replay: { ...congelada, replay: true } };
+        const congelada = this.lerCongelada(existente.completedResponse);
+        if (congelada !== null) return { replay: { ...congelada, replay: true } };
+        console.error(
+          '[payment-service] resposta congelada com forma invalida: ' + existente.id,
+        );
+        // Segue para o ramo degradado abaixo em vez de devolver lixo.
       }
 
       // Linha anterior a esta migration: nao ha resposta congelada. Reconstroi
@@ -569,14 +573,17 @@ export class PaymentService {
   /**
    * Corpo que vai para `completedResponse`.
    *
-   * DERIVA de comoResposta em vez de repetir a lista de campos: se um campo
-   * novo entrar na resposta da API, ele passa a ser congelado automaticamente.
-   * Repetir a lista aqui criaria duas fontes de verdade que divergem no dia em
-   * que alguem acrescentar um campo e esquecer deste arquivo.
+   * A lista de campos e FECHADA e usada nas DUAS direcoes — para montar o
+   * congelado e para valida-lo na leitura. A versao anterior derivava de
+   * comoResposta, o que fazia todo campo novo da resposta da API virar dado em
+   * repouso automaticamente, sem ninguem revisar. Apontado no review do
+   * PR #56 (achado 5.1), e o revisor tem razao: para dado gravado, explicito
+   * vale mais que automatico. Uma lista usada nos dois sentidos continua sendo
+   * fonte de verdade unica, e ainda e revisavel.
    *
    * `replay` fica de fora por ser contextual — vale false na gravacao e true na
-   * leitura. Congelar `replay: false` e devolve-lo assim no replay seria mentir
-   * sobre a natureza da chamada.
+   * leitura. Congelar `replay: false` e devolve-lo assim seria mentir sobre a
+   * natureza da chamada.
    *
    * `declineCode` so entra quando existe: JSON nao representa `undefined`, e
    * gravar a chave com valor nulo mudaria a forma do objeto entre uma tentativa
@@ -586,14 +593,55 @@ export class PaymentService {
     payment: Payment,
     declineCode: string | null | undefined,
   ): Prisma.InputJsonObject {
-    const { replay: _replay, declineCode: codigo, ...resto } = this.comoResposta(
-      payment,
-      declineCode,
-      false,
-    );
-    const corpo: Record<string, unknown> = { ...resto };
-    if (codigo !== undefined) corpo.declineCode = codigo;
+    const corpo: Record<string, unknown> = {
+      paymentId: payment.id,
+      orderId: payment.orderId,
+      status: payment.status,
+      amountCents: payment.amountCents,
+      capturedAmountCents: payment.capturedAmountCents,
+      currency: payment.currency,
+      attemptCount: payment.attemptCount,
+    };
+    if (declineCode) corpo.declineCode = declineCode;
     return corpo as Prisma.InputJsonObject;
+  }
+
+  /**
+   * Le a resposta congelada, RECONSTRUINDO o objeto campo a campo.
+   *
+   * Nao espalha o JSON: propriedade extra gravada na coluna — por versao futura,
+   * por escrita manual, por bug — seria devolvida direto na resposta da API.
+   * Achado 3.1 do review do PR #56.
+   *
+   * Devolve null quando a forma nao confere. Quem chama trata como registro
+   * degradado: LOGA e cai no ramo legado. Lancar erro seria pior — impediria um
+   * cliente legitimo de descobrir o desfecho do proprio pagamento por causa de
+   * uma linha corrompida.
+   */
+  private lerCongelada(valor: unknown): Omit<PagamentoCriado, 'replay'> | null {
+    if (typeof valor !== 'object' || valor === null || Array.isArray(valor)) return null;
+    const o = valor as Record<string, unknown>;
+
+    const texto = (v: unknown): v is string => typeof v === 'string' && v !== '';
+    const inteiro = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v);
+
+    if (!texto(o.paymentId) || !texto(o.orderId) || !texto(o.currency)) return null;
+    if (!inteiro(o.amountCents) || !inteiro(o.capturedAmountCents)) return null;
+    if (!inteiro(o.attemptCount)) return null;
+    if (!texto(o.status) || !(o.status in PaymentStatus)) return null;
+    if (o.declineCode !== undefined && !texto(o.declineCode)) return null;
+
+    const corpo: Omit<PagamentoCriado, 'replay'> = {
+      paymentId: o.paymentId,
+      orderId: o.orderId,
+      status: o.status as PaymentStatus,
+      amountCents: o.amountCents,
+      capturedAmountCents: o.capturedAmountCents,
+      currency: o.currency,
+      attemptCount: o.attemptCount,
+    };
+    if (o.declineCode !== undefined) corpo.declineCode = o.declineCode;
+    return corpo;
   }
 
   private comoResposta(

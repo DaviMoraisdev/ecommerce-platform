@@ -224,14 +224,24 @@ model IdempotencyRecord {
   /// declineCode da tentativa alheia. Nao era um campo vazando estado de outra
   /// tentativa: eram todos.
   ///
-  /// Guarda apenas o corpo que a API ja devolve (nove campos nossos, nada do
-  /// provedor alem do declineCode, que ja vai para o cliente). Nao guarda
+  /// Guarda uma lista FECHADA de campos: paymentId, orderId, status,
+  /// amountCents, capturedAmountCents, currency e attemptCount, mais
+  /// declineCode quando existe. `replay` fica de fora por ser contextual.
+  /// A mesma lista e usada para montar e para VALIDAR na leitura — a resposta e
+  /// reconstruida campo a campo, entao propriedade extra gravada na coluna nao
+  /// vaza para a API.
+  ///
+  /// Nada do provedor alem do declineCode, que ja vai para o cliente. Nao guarda
   /// snapshot do provedor: dado desconhecido gravado e o que custou cinco
   /// rodadas de review no inbox do webhook.
   ///
-  /// Nullable por causa das linhas anteriores a esta migration. O CHECK
-  /// idempotency_completed_exige_resposta e NOT VALID: exige a resposta em toda
-  /// linha nova ou alterada, sem quebrar em banco que ja tenha COMPLETED antigo.
+  /// Nullable por causa das linhas anteriores a esta migration, e SEM CHECK
+  /// nesta entrega. Um CHECK aqui — mesmo NOT VALID — passaria a valer para todo
+  /// UPDATE, e uma instancia da versao ANTERIOR ainda em execucao concluiria a
+  /// chave sem preencher a coluna: o UPDATE seria recusado DEPOIS de o provedor
+  /// ja ter cobrado, deixando o pagamento preso. Achado 4.1 do review do PR #56.
+  /// A constraint entra em migration posterior, quando nao houver mais escritor
+  /// antigo — expand/contract. Ate la o invariante e mantido pela aplicacao.
   completedResponse Json?
   createdAt DateTime          @default(now())
   updatedAt DateTime          @updatedAt
