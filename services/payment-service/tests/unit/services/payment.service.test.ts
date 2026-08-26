@@ -272,24 +272,55 @@ describe('criarPagamento — idempotencia', () => {
     const erroLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-    const falso = comColisao({
-      id: 'rec_1',
-      status: 'COMPLETED',
-      paymentId: 'pay_1',
-      completedResponse: { paymentId: 'pay_1', status: 'CAPTURED' },
-    });
-    falso.payment.findUnique.mockResolvedValue({
-      ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
-      transactions: [{ failureCode: null }],
-    });
-    const { service } = montar({ prisma: falso });
+    // JSONB aceita qualquer JSON, entao a validacao precisa cobrir MAIS que
+    // objeto incompleto: array, string e numero tambem sao JSON valido e
+    // passariam por uma checagem que so olha campos.
+    const formasInvalidas: unknown[] = [
+      [],
+      'texto solto',
+      42,
+      { paymentId: 'pay_1', status: 'CAPTURED' },
+      {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: 'ESTADO_QUE_NAO_EXISTE',
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      },
+      {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.CAPTURED,
+        amountCents: '12990',
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      },
+    ];
 
-    const resultado = await service.criarPagamento(entrada());
+    for (const forma of formasInvalidas) {
+      erroLog.mockClear();
+      const falso = comColisao({
+        id: 'rec_1',
+        status: 'COMPLETED',
+        paymentId: 'pay_1',
+        completedResponse: forma,
+      });
+      falso.payment.findUnique.mockResolvedValue({
+        ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
+        transactions: [{ failureCode: null }],
+      });
+      const { service } = montar({ prisma: falso });
 
-    // Degradado, nao lixo: reconstroi do Payment vivo em vez de devolver um
-    // objeto sem amountCents, currency e attemptCount.
-    expect(resultado.amountCents).toBe(12990);
-    expect(erroLog).toHaveBeenCalledWith(expect.stringContaining('forma invalida'));
+      const resultado = await service.criarPagamento(entrada());
+
+      // Degradado, nao lixo: reconstroi do Payment vivo em vez de devolver um
+      // objeto sem amountCents, currency e attemptCount.
+      expect(resultado.amountCents).toBe(12990);
+      expect(erroLog).toHaveBeenCalledWith(expect.stringContaining('forma invalida'));
+    }
 
     erroLog.mockRestore();
   });
