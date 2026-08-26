@@ -87,6 +87,16 @@ export interface PagamentoCriado {
   replay: boolean;
 }
 
+/**
+ * VALORES aceitos do enum, para validar dado vindo do banco.
+ *
+ * `status in PaymentStatus` NAO serve: `in` percorre a cadeia de prototipos,
+ * entao 'toString', 'constructor' e 'valueOf' passariam. Achado 3.1 da segunda
+ * rodada de review do PR #56 — e o comentario que eu tinha escrito ali afirmava
+ * o contrario, o que e pior que a ausencia de comentario.
+ */
+const ESTADOS_VALIDOS: ReadonlySet<string> = new Set<string>(Object.values(PaymentStatus));
+
 const NOVA_TENTATIVA_PERMITIDA: ReadonlySet<PaymentStatus> = new Set([
   PaymentStatus.PENDING,
   PaymentStatus.FAILED,
@@ -221,10 +231,22 @@ export class PaymentService {
       if (existente.completedResponse !== null) {
         const congelada = this.lerCongelada(existente.completedResponse);
         if (congelada !== null) return { replay: { ...congelada, replay: true } };
+
+        // Snapshot PRESENTE mas corrompido: falha explicita, sem consultar o
+        // Payment vivo. Eu tinha escolhido degradar aqui, para nao impedir o
+        // cliente de descobrir o desfecho — argumento fraco, apontado no review:
+        // a resposta degradada pode estar ERRADA sobre dinheiro (o Payment vivo
+        // e justamente a fonte do defeito que este bloco corrige), e ela sairia
+        // sem nenhuma marca de degradacao. Errar alto e melhor que errar
+        // plausivelmente. O fallback para o vivo fica restrito ao legado de
+        // verdade, com completedResponse === null.
         console.error(
           '[payment-service] resposta congelada com forma invalida: ' + existente.id,
         );
-        // Segue para o ramo degradado abaixo em vez de devolver lixo.
+        throw erroDeDominio(
+          'DEPENDENCIA_INDISPONIVEL',
+          'Registro de idempotencia com resposta armazenada invalida',
+        );
       }
 
       // Linha anterior a esta migration: nao ha resposta congelada. Reconstroi
@@ -549,9 +571,10 @@ export class PaymentService {
         },
       });
 
-      // A resposta e congelada na MESMA transacao do desfecho. Fora dela,
-      // existiria um instante com a chave COMPLETED e sem o que devolver — e o
-      // CHECK NOT VALID recusaria o UPDATE de qualquer forma.
+      // A resposta e congelada na MESMA transacao do desfecho: fora dela
+      // existiria um instante com a chave COMPLETED e sem o que devolver no
+      // replay. Nesta entrega o invariante e mantido SO pela aplicacao — o
+      // CHECK entra na fase contract, quando nao houver escritor antigo.
       await tx.idempotencyRecord.update({
         where: { id: registroId },
         data: {
@@ -634,7 +657,7 @@ export class PaymentService {
     if (!texto(o.paymentId) || !texto(o.orderId) || !texto(o.currency)) return null;
     if (!inteiro(o.amountCents) || !inteiro(o.capturedAmountCents)) return null;
     if (!inteiro(o.attemptCount)) return null;
-    if (!texto(o.status) || !(o.status in PaymentStatus)) return null;
+    if (!texto(o.status) || !ESTADOS_VALIDOS.has(o.status)) return null;
     if (o.declineCode !== undefined && !texto(o.declineCode)) return null;
 
     const corpo: Omit<PagamentoCriado, 'replay'> = {

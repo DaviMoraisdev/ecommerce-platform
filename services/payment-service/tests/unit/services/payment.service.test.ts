@@ -265,12 +265,12 @@ describe('criarPagamento — idempotencia', () => {
     expect(espiaoCharge).not.toHaveBeenCalled();
   });
 
-  it('congelada com forma INVALIDA cai no ramo degradado, logando erro', async () => {
+  it('congelada com forma INVALIDA falha explicito, sem consultar o Payment vivo', async () => {
     // A coluna e JSONB: o banco aceita qualquer JSON. Sem validacao de forma, um
     // objeto incompleto viraria resposta sem campos obrigatorios. Achado 3.1 do
     // review do PR #56.
     const erroLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const avisoLog = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
 
     // JSONB aceita qualquer JSON, entao a validacao precisa cobrir MAIS que
     // objeto incompleto: array, string e numero tambem sao JSON valido e
@@ -289,6 +289,18 @@ describe('criarPagamento — idempotencia', () => {
         currency: 'BRL',
         attemptCount: 1,
       },
+      // Bypass pela cadeia de prototipos: `'toString' in PaymentStatus` e TRUE,
+      // porque `in` percorre o prototipo e nao os VALORES do enum. Achado 3.1
+      // da segunda rodada de review do PR #56.
+      ...['toString', 'constructor', '__proto__', 'valueOf'].map((estado) => ({
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: estado,
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      })),
       {
         paymentId: 'pay_1',
         orderId: 'ord_1',
@@ -314,15 +326,18 @@ describe('criarPagamento — idempotencia', () => {
       });
       const { service } = montar({ prisma: falso });
 
-      const resultado = await service.criarPagamento(entrada());
-
-      // Degradado, nao lixo: reconstroi do Payment vivo em vez de devolver um
-      // objeto sem amountCents, currency e attemptCount.
-      expect(resultado.amountCents).toBe(12990);
+      // Falha ALTA. Degradar para o Payment vivo devolveria uma resposta
+      // plausivel e possivelmente errada sobre dinheiro, sem marca nenhuma —
+      // e o Payment vivo e justamente a fonte do defeito que o bloco corrige.
+      await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+        code: 'DEPENDENCIA_INDISPONIVEL',
+      });
       expect(erroLog).toHaveBeenCalledWith(expect.stringContaining('forma invalida'));
+      expect(falso.payment.findUnique).not.toHaveBeenCalled();
     }
 
     erroLog.mockRestore();
+    avisoLog.mockRestore();
   });
 
   it('propriedade EXTRA na congelada nao vaza para a resposta', async () => {

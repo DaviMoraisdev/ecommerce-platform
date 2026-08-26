@@ -383,9 +383,31 @@ describe('idempotency_records', () => {
     expect(erro.message).toContain('idempotency_completed_exige_pagamento');
   });
 
+  it('ACEITA COMPLETED sem resposta congelada — exigido pelo expand/contract', async () => {
+    // Contra-intuitivo de proposito, e por isso vale um teste: o invariante
+    // "COMPLETED exige resposta" e mantido pela APLICACAO nesta entrega, NAO
+    // pelo banco. Um CHECK aqui — mesmo NOT VALID — passaria a valer para todo
+    // UPDATE, e uma instancia da versao ANTERIOR concluiria a chave sem
+    // preencher a coluna: o UPDATE seria recusado DEPOIS de o provedor ja ter
+    // cobrado. Este caso fixa a tolerancia deliberada e vai ser INVERTIDO na
+    // migration da fase contract, quando nao houver mais escritor antigo.
+    const pagamento = await prisma.payment.create({ data: pagamentoValido() });
+    const registro = await prisma.idempotencyRecord.create({
+      data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID() },
+    });
+
+    const escritorAntigo = await prisma.idempotencyRecord.update({
+      where: { id: registro.id },
+      data: { status: 'COMPLETED', paymentId: pagamento.id },
+    });
+
+    expect(escritorAntigo.status).toBe('COMPLETED');
+    expect(escritorAntigo.completedResponse).toBeNull();
+  });
+
   it('aceita COMPLETED com paymentId E resposta congelada', async () => {
-    // Deixou de ser "a unica forma valida" no Bloco 6a: COMPLETED passou a
-    // exigir TAMBEM completedResponse, senao o replay nao teria o que devolver.
+    // O caminho que o codigo NOVO produz. O banco aceita os dois; quem exige a
+    // resposta e a aplicacao, ate a fase contract.
     const pagamento = await prisma.payment.create({ data: pagamentoValido() });
     const registro = await prisma.idempotencyRecord.create({
       data: { requestFingerprint: FINGERPRINT_DE_TESTE, userId: randomUUID(), key: randomUUID() },
