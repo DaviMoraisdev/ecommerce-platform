@@ -73,8 +73,13 @@ describe('ativacao', () => {
   it('CASO C40: consumidor fica DESLIGADO por padrao', async () => {
     // Superficie que altera estado financeiro a partir de mensagem nao
     // autenticada nao pode subir por omissao.
-    const anterior = process.env.PAYMENTS_CONSUMER_ENABLED;
-    delete process.env.PAYMENTS_CONSUMER_ENABLED;
+    // NAO usa `delete`. Apagar a variavel cria a condicao que autoriza o
+    // dotenv.config() do database.ts — importado em cadeia pelo runtime — a
+    // preencher a partir do .env da maquina, porque sem `override` o dotenv so
+    // define o que AINDA NAO existe. O delete, que parecia neutro, era o que
+    // reintroduzia PAYMENTS_CONSUMER_ENABLED=true e ligava o consumidor.
+    // Atribuir vazio testa a mesma coisa e nao depende do .env de ninguem.
+    process.env.PAYMENTS_CONSUMER_ENABLED = '';
     const { mod, connect } = carregar();
     connect.mockResolvedValue(conexaoFalsa(canalFalso()));
 
@@ -83,7 +88,7 @@ describe('ativacao', () => {
     expect(connect).not.toHaveBeenCalled();
     expect(mod.estaConsumindo()).toBe(false);
     await mod.pararConsumidorPagamentos();
-    if (anterior !== undefined) process.env.PAYMENTS_CONSUMER_ENABLED = anterior;
+    process.env.PAYMENTS_CONSUMER_ENABLED = 'true';
   });
 
   it('CASO C41: so a string exata "true" liga', async () => {
