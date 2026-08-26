@@ -619,6 +619,12 @@ export class PaymentService {
    * uma linha corrompida.
    */
   private lerCongelada(valor: unknown): Omit<PagamentoCriado, 'replay'> | null {
+    // Guarda de tipo REDUNDANTE por construcao, mantida de proposito.
+    // Nenhum teste consegue isola-la: para array, string ou numero, o acesso
+    // `o.paymentId` ja devolve undefined e a checagem de campo abaixo rejeita.
+    // A sabotagem X1 removeu esta linha e NADA falhou — resultado esperado, e
+    // nao uma lacuna. Ela fica porque declara a intencao e volta a importar se
+    // alguem afrouxar as validacoes de campo.
     if (typeof valor !== 'object' || valor === null || Array.isArray(valor)) return null;
     const o = valor as Record<string, unknown>;
 
