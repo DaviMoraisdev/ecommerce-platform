@@ -229,7 +229,24 @@ describe('criarPagamento — idempotencia', () => {
   });
 
   it('devolve replay sem novo efeito quando a chave ja foi COMPLETED', async () => {
-    const falso = comColisao({ id: 'rec_1', status: 'COMPLETED', paymentId: 'pay_1' });
+    // O congelado e DELIBERADAMENTE diferente do Payment vivo: se o codigo
+    // voltar a ler o vivo, este teste cai. Com valores iguais ele passaria dos
+    // dois jeitos e nao provaria nada.
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      completedResponse: {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.FAILED,
+        amountCents: 12990,
+        capturedAmountCents: 0,
+        currency: 'BRL',
+        attemptCount: 1,
+        declineCode: 'insufficient_funds',
+      },
+    });
     falso.payment.findUnique.mockResolvedValue({
       ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
       transactions: [{ failureCode: null }],
@@ -239,9 +256,149 @@ describe('criarPagamento — idempotencia', () => {
     const resultado = await service.criarPagamento(entrada());
 
     expect(resultado.replay).toBe(true);
-    expect(resultado.status).toBe(PaymentStatus.CAPTURED);
+    expect(resultado.status).toBe(PaymentStatus.FAILED);
+    expect(resultado.capturedAmountCents).toBe(0);
+    expect(resultado.declineCode).toBe('insufficient_funds');
+    // Caminho congelado nao precisa do Payment: nem consulta.
+    expect(falso.payment.findUnique).not.toHaveBeenCalled();
     // O ponto da idempotencia: repetir a chave NAO cobra de novo.
     expect(espiaoCharge).not.toHaveBeenCalled();
+  });
+
+  it('congelada com forma INVALIDA falha explicito, sem consultar o Payment vivo', async () => {
+    // A coluna e JSONB: o banco aceita qualquer JSON. Sem validacao de forma, um
+    // objeto incompleto viraria resposta sem campos obrigatorios. Achado 3.1 do
+    // review do PR #56.
+    const erroLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const avisoLog = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    // JSONB aceita qualquer JSON, entao a validacao precisa cobrir MAIS que
+    // objeto incompleto: array, string e numero tambem sao JSON valido e
+    // passariam por uma checagem que so olha campos.
+    const formasInvalidas: unknown[] = [
+      [],
+      'texto solto',
+      42,
+      { paymentId: 'pay_1', status: 'CAPTURED' },
+      {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: 'ESTADO_QUE_NAO_EXISTE',
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      },
+      // Bypass pela cadeia de prototipos: `'toString' in PaymentStatus` e TRUE,
+      // porque `in` percorre o prototipo e nao os VALORES do enum. Achado 3.1
+      // da segunda rodada de review do PR #56.
+      ...['toString', 'constructor', '__proto__', 'valueOf'].map((estado) => ({
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: estado,
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      })),
+      {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.CAPTURED,
+        amountCents: '12990',
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      },
+    ];
+
+    for (const forma of formasInvalidas) {
+      erroLog.mockClear();
+      const falso = comColisao({
+        id: 'rec_1',
+        status: 'COMPLETED',
+        paymentId: 'pay_1',
+        completedResponse: forma,
+      });
+      falso.payment.findUnique.mockResolvedValue({
+        ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
+        transactions: [{ failureCode: null }],
+      });
+      const { service } = montar({ prisma: falso });
+
+      // Falha ALTA. Degradar para o Payment vivo devolveria uma resposta
+      // plausivel e possivelmente errada sobre dinheiro, sem marca nenhuma —
+      // e o Payment vivo e justamente a fonte do defeito que o bloco corrige.
+      await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+        code: 'DEPENDENCIA_INDISPONIVEL',
+      });
+      expect(erroLog).toHaveBeenCalledWith(expect.stringContaining('forma invalida'));
+      expect(falso.payment.findUnique).not.toHaveBeenCalled();
+    }
+
+    erroLog.mockRestore();
+    avisoLog.mockRestore();
+  });
+
+  it('propriedade EXTRA na congelada nao vaza para a resposta', async () => {
+    // A validacao RECONSTROI campo a campo em vez de espalhar o JSON. Espalhar
+    // devolveria ao cliente qualquer coisa gravada na coluna.
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      completedResponse: {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.CAPTURED,
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+        segredoInterno: 'nao deveria sair daqui',
+      },
+    });
+    const { service } = montar({ prisma: falso });
+
+    const resultado = await service.criarPagamento(entrada());
+
+    expect(resultado).toEqual({
+      paymentId: 'pay_1',
+      orderId: 'ord_1',
+      status: PaymentStatus.CAPTURED,
+      amountCents: 12990,
+      capturedAmountCents: 12990,
+      currency: 'BRL',
+      attemptCount: 1,
+      replay: true,
+    });
+    expect(resultado).not.toHaveProperty('segredoInterno');
+  });
+
+  it('registro LEGADO sem congelada reconstroi do Payment vivo e avisa', async () => {
+    // Caminho que existe so ate o backfill/expiracao. Ele carrega o defeito
+    // antigo de proposito — e por isso avisa em log, nunca em silencio.
+    const aviso = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const falso = comColisao({
+      id: 'rec_legado',
+      status: 'COMPLETED',
+      paymentId: 'pay_1',
+      completedResponse: null,
+    });
+    falso.payment.findUnique.mockResolvedValue({
+      ...paymentDeTeste({ status: PaymentStatus.CAPTURED, capturedAmountCents: 12990 }),
+      transactions: [{ failureCode: null }],
+    });
+    const { service } = montar({ prisma: falso });
+
+    const resultado = await service.criarPagamento(entrada());
+
+    expect(resultado.replay).toBe(true);
+    expect(resultado.status).toBe(PaymentStatus.CAPTURED);
+    expect(aviso).toHaveBeenCalledWith(expect.stringContaining('registro legado'));
+
+    aviso.mockRestore();
   });
 
   it('recusa chave que ja foi usada numa requisicao FAILED, sem retentativa', async () => {
@@ -275,7 +432,14 @@ describe('criarPagamento — idempotencia', () => {
   });
 
   it('falha de forma explicita quando a chave COMPLETED aponta para pagamento inexistente', async () => {
-    const falso = comColisao({ id: 'rec_1', status: 'COMPLETED', paymentId: 'pay_sumiu' });
+    // completedResponse null: registro anterior a migration do Bloco 6a, entao
+    // o replay cai no ramo LEGADO que reconstroi a partir do Payment vivo.
+    const falso = comColisao({
+      id: 'rec_1',
+      status: 'COMPLETED',
+      paymentId: 'pay_sumiu',
+      completedResponse: null,
+    });
     falso.payment.findUnique.mockResolvedValue(null);
     const { service } = montar({ prisma: falso });
 
@@ -475,7 +639,24 @@ describe('criarPagamento — desfecho de sucesso', () => {
     });
 
     const chamadas = falso.idempotencyRecord.update.mock.calls;
-    expect(chamadas[chamadas.length - 1][0].data).toEqual({ status: 'COMPLETED' });
+    // toEqual ESTRITO de proposito: pega campo novo vazando para dentro da
+    // resposta congelada. Ela vai para o banco e e devolvida ao cliente em todo
+    // replay, entao o que entra ali precisa ser deliberado, nunca herdado.
+    // Note a AUSENCIA de declineCode: no caminho de sucesso a chave nao existe,
+    // porque JSON nao representa undefined e gravar null mudaria a forma do
+    // objeto entre uma tentativa recusada e uma bem-sucedida.
+    expect(chamadas[chamadas.length - 1][0].data).toEqual({
+      status: 'COMPLETED',
+      completedResponse: {
+        paymentId: 'pay_1',
+        orderId: 'ord_1',
+        status: PaymentStatus.CAPTURED,
+        amountCents: 12990,
+        capturedAmountCents: 12990,
+        currency: 'BRL',
+        attemptCount: 1,
+      },
+    });
   });
 
   it('grava o provider e a moeda vindos das dependencias', async () => {

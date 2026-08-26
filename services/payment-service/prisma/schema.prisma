@@ -214,6 +214,35 @@ model IdempotencyRecord {
   /// linhas gravadas com a receita antiga.
   requestFingerprint String
   status    IdempotencyStatus @default(PROCESSING)
+  /// Resposta CONGELADA da tentativa que finalizou esta chave.
+  ///
+  /// Idempotencia estrita: a mesma requisicao devolve a MESMA resposta. Antes
+  /// disto o replay lia o Payment VIVO e o failureCode da transacao mais
+  /// recente — e como o orderId e unique, a segunda tentativa reusa a MESMA
+  /// linha de Payment. Consequencia: uma chave RECUSADA passava a responder
+  /// CAPTURED depois que OUTRA chave capturava o pedido, com o attemptCount e o
+  /// declineCode da tentativa alheia. Nao era um campo vazando estado de outra
+  /// tentativa: eram todos.
+  ///
+  /// Guarda uma lista FECHADA de campos: paymentId, orderId, status,
+  /// amountCents, capturedAmountCents, currency e attemptCount, mais
+  /// declineCode quando existe. `replay` fica de fora por ser contextual.
+  /// A mesma lista e usada para montar e para VALIDAR na leitura — a resposta e
+  /// reconstruida campo a campo, entao propriedade extra gravada na coluna nao
+  /// vaza para a API.
+  ///
+  /// Nada do provedor alem do declineCode, que ja vai para o cliente. Nao guarda
+  /// snapshot do provedor: dado desconhecido gravado e o que custou cinco
+  /// rodadas de review no inbox do webhook.
+  ///
+  /// Nullable por causa das linhas anteriores a esta migration, e SEM CHECK
+  /// nesta entrega. Um CHECK aqui — mesmo NOT VALID — passaria a valer para todo
+  /// UPDATE, e uma instancia da versao ANTERIOR ainda em execucao concluiria a
+  /// chave sem preencher a coluna: o UPDATE seria recusado DEPOIS de o provedor
+  /// ja ter cobrado, deixando o pagamento preso. Achado 4.1 do review do PR #56.
+  /// A constraint entra em migration posterior, quando nao houver mais escritor
+  /// antigo — expand/contract. Ate la o invariante e mantido pela aplicacao.
+  completedResponse Json?
   createdAt DateTime          @default(now())
   updatedAt DateTime          @updatedAt
 
