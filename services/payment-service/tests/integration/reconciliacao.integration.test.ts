@@ -215,4 +215,42 @@ describe('reconciliacao de tentativa presa', () => {
     expect(capturas).toHaveLength(1);
     expect(await prisma.outboxEvent.count()).toBe(1);
   });
+
+  it('CASO J7: liberar NAO passa por cima de um desfecho ja aplicado', async () => {
+    // A corrida que custa dinheiro: o job consulta, recebe null e decide
+    // liberar; enquanto isso a requisicao original — em voo ha 15 minutos —
+    // recebe SUCCEEDED e grava o desfecho. Sem a condicao de estado no CAS o
+    // liberar sobrescreve tudo com FAILED, COM o provedor tendo cobrado:
+    // dinheiro capturado, pedido marcado como falho e o providerRef apagado da
+    // trilha. O J2 so exercita este metodo sobre uma tentativa ainda PENDING,
+    // onde o where nunca precisa filtrar nada.
+    const { service, provider, payment, tentativa } = await tentativaPresa(
+      FAKE_TOKENS.TIMEOUT_AFTER_CHARGE,
+    );
+
+    const snapshot = await provider.buscarCobrancaPorTentativa(payment.id, payment.attemptCount);
+    const acao = decidirReconciliacao(snapshot);
+    if (acao.tipo !== 'aplicar') throw new Error('esperado aplicar');
+    await expect(
+      service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado),
+    ).resolves.toBe(true);
+
+    // Chega o liberar atrasado, decidido sobre um snapshot ja obsoleto.
+    await expect(service.liberarTentativaPresa(tentativa.id)).resolves.toBe(false);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+
+    const t = await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: tentativa.id } });
+    expect(t.status).toBe(TransactionStatus.SUCCEEDED);
+    expect(t.providerRef).not.toBeNull();
+    expect(t.failureCode).toBeNull();
+
+    const chave = await prisma.idempotencyRecord.findFirstOrThrow({
+      where: { paymentId: payment.id },
+    });
+    expect(chave.status).toBe('COMPLETED');
+
+    expect(await prisma.outboxEvent.count()).toBe(1);
+  });
 });
