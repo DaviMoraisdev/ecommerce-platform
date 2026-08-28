@@ -208,7 +208,7 @@ export async function tickReconciliacao(deps: ReconciliacaoDeps): Promise<Resumo
     if (presas.length < lote) return resumo;
 
     // `.at(-1)` nao compila com o `lib` atual do tsconfig (divida registrada).
-    const ultima = presas[presas.length - 1];
+    const ultima = presas[0];
     cursor = { createdAt: ultima.createdAt, id: ultima.id };
   }
 
