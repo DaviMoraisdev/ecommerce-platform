@@ -339,6 +339,25 @@ export interface PaymentProvider {
     attemptCount: number,
   ): Promise<ChargeSnapshot | null>;
 
+  /**
+   * O `null` de `buscarCobrancaPorTentativa` significa ausencia DEFINITIVA?
+   *
+   * Achado 3.1 do review do PR #57. O job so pode LIBERAR uma tentativa presa
+   * quando a ausencia prova que a cobranca nunca existiu. Num provedor cuja
+   * consulta e eventualmente consistente, `null` tambem significa "cobrou, mas
+   * ainda nao aparece" — e liberar ali produz SEGUNDA COBRANCA, exatamente o
+   * que o job existe para evitar.
+   *
+   * Esta e uma PRE-CONDICAO DE ATIVACAO imposta pelo codigo, no mesmo modelo da
+   * flag do consumer do Bloco 5b: com `false`, a ausencia vira TRIAGEM e o
+   * pagamento continua preso e visivel — que e o estado seguro. Documentar nao
+   * protegeria; a declaracao protege.
+   *
+   * Um adapter so pode declarar `true` com garantia do provedor de leitura
+   * read-after-write consistente nesta consulta. Na duvida, `false`.
+   */
+  readonly ausenciaEDefinitiva: boolean;
+
   cancelCharge(input: CancelChargeInput): Promise<ChargeSnapshot>;
 
   refund(input: RefundInput): Promise<RefundResult>;

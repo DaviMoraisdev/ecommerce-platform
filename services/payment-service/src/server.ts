@@ -60,6 +60,7 @@ bootstrap({
       aplicar: (transactionId, resultado) =>
         service.aplicarDesfechoDeReconciliacao(transactionId, resultado),
       liberar: (transactionId) => service.liberarTentativaPresa(transactionId),
+      ausenciaEDefinitiva: provider.ausenciaEDefinitiva,
       janelaMinutos: config.paymentWindowMinutes,
     });
   },

@@ -120,7 +120,7 @@ describe('buscarTentativasPresas', () => {
     });
 
     const snapshot = await provider.buscarCobrancaPorTentativa(payment.id, payment.attemptCount);
-    const acao = decidirReconciliacao(snapshot);
+    const acao = decidirReconciliacao(snapshot, provider.ausenciaEDefinitiva);
     if (acao.tipo !== 'aplicar') throw new Error('esperado aplicar');
     await service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado);
 
@@ -138,7 +138,7 @@ describe('reconciliacao de tentativa presa', () => {
     );
 
     const snapshot = await provider.buscarCobrancaPorTentativa(payment.id, payment.attemptCount);
-    const acao = decidirReconciliacao(snapshot);
+    const acao = decidirReconciliacao(snapshot, provider.ausenciaEDefinitiva);
     expect(acao.tipo).toBe('aplicar');
     if (acao.tipo !== 'aplicar') return;
 
@@ -174,7 +174,9 @@ describe('reconciliacao de tentativa presa', () => {
 
     const snapshot = await provider.buscarCobrancaPorTentativa(payment.id, payment.attemptCount);
     expect(snapshot).toBeNull();
-    expect(decidirReconciliacao(snapshot)).toEqual({ tipo: 'liberar' });
+    expect(decidirReconciliacao(snapshot, provider.ausenciaEDefinitiva)).toEqual({
+      tipo: 'liberar',
+    });
 
     await expect(service.liberarTentativaPresa(tentativa.id)).resolves.toBe(true);
 
@@ -200,7 +202,7 @@ describe('reconciliacao de tentativa presa', () => {
     );
 
     const snapshot = await provider.buscarCobrancaPorTentativa(payment.id, payment.attemptCount);
-    const acao = decidirReconciliacao(snapshot);
+    const acao = decidirReconciliacao(snapshot, provider.ausenciaEDefinitiva);
     if (acao.tipo !== 'aplicar') throw new Error('esperado aplicar');
 
     const primeira = await service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado);
@@ -229,7 +231,7 @@ describe('reconciliacao de tentativa presa', () => {
     );
 
     const snapshot = await provider.buscarCobrancaPorTentativa(payment.id, payment.attemptCount);
-    const acao = decidirReconciliacao(snapshot);
+    const acao = decidirReconciliacao(snapshot, provider.ausenciaEDefinitiva);
     if (acao.tipo !== 'aplicar') throw new Error('esperado aplicar');
     await expect(
       service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado),

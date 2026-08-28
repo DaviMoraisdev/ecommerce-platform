@@ -28,6 +28,7 @@ function deps(over: Partial<ReconciliacaoDeps> = {}): ReconciliacaoDeps {
     consultarProvedor: jest.fn(async () => snapshot()),
     aplicar: jest.fn(async () => true),
     liberar: jest.fn(async () => true),
+    ausenciaEDefinitiva: true,
     agora: () => new Date('2026-08-26T12:00:00.000Z'),
     janelaMinutos: 15,
     lote: 20,
@@ -175,5 +176,20 @@ describe('tickReconciliacao', () => {
     expect(resumo.examinadas).toBe(2);
     expect(resumo.aguardando).toBe(2);
     expect(resumo.truncada).toBe(true);
+  });
+
+  it('CASO S10: sem garantia de ausencia definitiva, a varredura NAO libera', async () => {
+    // R7 prova a decisao pura; este prova a FIACAO. Fixar `true` dentro do tick
+    // passaria pelo R7 sem deixar rastro — o job liberaria com qualquer provedor.
+    const d = deps({
+      ausenciaEDefinitiva: false,
+      consultarProvedor: jest.fn(async () => null),
+    });
+
+    const resumo = await tickReconciliacao(d);
+
+    expect(d.liberar).not.toHaveBeenCalled();
+    expect(resumo.liberadas).toBe(0);
+    expect(resumo.triagem).toBe(1);
   });
 });

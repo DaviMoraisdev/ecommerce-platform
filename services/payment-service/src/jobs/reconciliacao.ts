@@ -26,11 +26,22 @@ export type AcaoDeReconciliacao =
  * irreversivel do ponto de vista do cliente; NAO aplicar deixa a tentativa
  * presa, o que ja e o estado atual e continua visivel. Na duvida, nao aplica.
  */
-export function decidirReconciliacao(snapshot: ChargeSnapshot | null): AcaoDeReconciliacao {
+export function decidirReconciliacao(
+  snapshot: ChargeSnapshot | null,
+  ausenciaEDefinitiva: boolean,
+): AcaoDeReconciliacao {
   // Ausencia e a unica evidencia que autoriza refazer a tentativa: a chamada
   // nunca chegou, entao attemptCount + 1 (e chave de provedor nova) nao pode
-  // duplicar cobranca.
-  if (snapshot === null) return { tipo: 'liberar' };
+  // duplicar cobranca. Mas isso so vale se a ausencia for DEFINITIVA: num
+  // provedor eventualmente consistente, `null` tambem significa "cobrou e ainda
+  // nao aparece", e liberar ali produz a segunda cobranca. Sem a garantia, a
+  // ausencia vira triagem — preso e visivel e melhor que liberado no escuro.
+  if (snapshot === null) {
+    if (!ausenciaEDefinitiva) {
+      return { tipo: 'triagem', motivo: 'cobranca ausente e provedor sem garantia de ausencia definitiva' };
+    }
+    return { tipo: 'liberar' };
+  }
 
   switch (snapshot.state) {
     case 'SUCCEEDED':
@@ -96,6 +107,8 @@ export interface ReconciliacaoDeps {
   consultarProvedor: (paymentId: string, attemptCount: number) => Promise<ChargeSnapshot | null>;
   aplicar: (transactionId: string, resultado: ChargeResult) => Promise<boolean>;
   liberar: (transactionId: string) => Promise<boolean>;
+  /** Ver `PaymentProvider.ausenciaEDefinitiva`. Sem default: escolher em silencio e o risco. */
+  ausenciaEDefinitiva: boolean;
   agora?: () => Date;
   janelaMinutos?: number;
   lote?: number;
@@ -166,7 +179,7 @@ export async function tickReconciliacao(deps: ReconciliacaoDeps): Promise<Resumo
     for (const presa of presas) {
       try {
         const snapshot = await deps.consultarProvedor(presa.paymentId, presa.attemptCount);
-        const acao = decidirReconciliacao(snapshot);
+        const acao = decidirReconciliacao(snapshot, deps.ausenciaEDefinitiva);
 
         switch (acao.tipo) {
           case 'liberar':

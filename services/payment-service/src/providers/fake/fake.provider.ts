@@ -105,6 +105,12 @@ export interface SimularTransicaoInput {
 export class FakeProvider implements PaymentProvider {
   readonly name: ProviderName = 'fake';
 
+  /**
+   * O fake responde da propria memoria, no mesmo processo: o que ele gravou ja
+   * esta visivel na consulta seguinte. Ausencia aqui e definitiva de verdade.
+   */
+  readonly ausenciaEDefinitiva = true;
+
   private readonly cobrancas = new Map<ProviderRef, Cobranca>();
 
   /**
