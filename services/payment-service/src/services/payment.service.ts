@@ -169,7 +169,11 @@ export class PaymentService {
         currency: this.deps.currency,
         paymentMethodToken: input.paymentMethodToken,
         idempotencyKey: chaveDoProvedor,
-        reference: { paymentId: payment.id, orderId: payment.orderId },
+        reference: {
+          paymentId: payment.id,
+          orderId: payment.orderId,
+          attemptCount: payment.attemptCount,
+        },
       });
     } catch (erro) {
       await this.tratarFalhaDoProvedor(payment.id, registroId, transactionId, erro);

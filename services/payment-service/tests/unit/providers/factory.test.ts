@@ -20,7 +20,7 @@ function entradaDeCobranca() {
     currency: 'BRL' as const,
     paymentMethodToken: FAKE_TOKENS.PROCESSING,
     idempotencyKey: randomUUID(),
-    reference: { paymentId: randomUUID(), orderId: randomUUID() },
+    reference: { paymentId: randomUUID(), orderId: randomUUID(), attemptCount: 1 },
   };
 }
 

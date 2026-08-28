@@ -49,6 +49,13 @@ function podeTransicionar(de: ChargeState, para: ChargeState): boolean {
 /** Estado interno. Nunca devolvido por referencia — sempre copia. */
 interface Cobranca {
   providerRef: ProviderRef;
+  /**
+   * Correlacao recebida no createCharge. Nao e "dado nosso guardado a mais":
+   * e o que o provedor real registra como metadata, e o que torna possivel
+   * responder "existe cobranca para esta tentativa?" sem providerRef.
+   */
+  paymentId: string;
+  attemptCount: number;
   state: ChargeState;
   amountCents: number;
   capturedAmountCents: number;
@@ -153,6 +160,9 @@ export class FakeProvider implements PaymentProvider {
       input.paymentMethodToken,
       input.reference.paymentId,
       input.reference.orderId,
+      // Sem isto, reusar a chave com OUTRA tentativa devolveria a cobranca
+      // anterior em silencio, em vez de acusar reuso com parametros diferentes.
+      input.reference.attemptCount,
     ]);
 
     const anterior = this.criacaoPorChave.get(input.idempotencyKey);
@@ -169,6 +179,19 @@ export class FakeProvider implements PaymentProvider {
     if (!comportamento) {
       // Sem interpolar o token na mensagem: ele autoriza cobranca.
       throw new ProviderInvalidRequestError('paymentMethodToken desconhecido');
+    }
+
+    if (comportamento.kind === 'timeout_apos_cobranca') {
+      // A cobranca EXISTE e a chave FICA consumida: o provedor completou e
+      // registrou a resposta idempotente; foi o transporte que falhou. Nao
+      // consumir a chave aqui simularia um provedor que perde o proprio
+      // trabalho, que e justamente o cenario que nao acontece.
+      const cobrada = this.registrar(input, { kind: 'succeed' });
+      this.criacaoPorChave.set(input.idempotencyKey, {
+        digital,
+        resultado: structuredClone(this.comoResultado(cobrada)),
+      });
+      throw this.erroTecnico('unavailable');
     }
 
     if (comportamento.kind === 'error') {
@@ -191,6 +214,22 @@ export class FakeProvider implements PaymentProvider {
   // ==========================================================
   // getCharge — reconciliacao (Bloco 6)
   // ==========================================================
+
+  async buscarCobrancaPorTentativa(
+    paymentId: string,
+    attemptCount: number,
+  ): Promise<ChargeSnapshot | null> {
+    for (const cobranca of this.cobrancas.values()) {
+      if (cobranca.paymentId === paymentId && cobranca.attemptCount === attemptCount) {
+        return this.comoSnapshot(cobranca);
+      }
+    }
+    // Ausencia e resposta LEGITIMA, nao erro: significa que a chamada nunca
+    // chegou. Lancar ChargeNotFoundError aqui obrigaria o chamador a tratar
+    // ausencia como excecao e apagaria a distincao entre "nao existe" e "nao
+    // consegui perguntar" — que e a distincao de que o job depende.
+    return null;
+  }
 
   async getCharge(providerRef: ProviderRef): Promise<ChargeSnapshot> {
     return this.comoSnapshot(this.exigirCobranca(providerRef));
@@ -509,6 +548,8 @@ export class FakeProvider implements PaymentProvider {
 
     const cobranca: Cobranca = {
       providerRef,
+      paymentId: input.reference.paymentId,
+      attemptCount: input.reference.attemptCount,
       state: 'PROCESSING',
       amountCents: input.amountCents,
       capturedAmountCents: 0,
