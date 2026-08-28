@@ -1,5 +1,9 @@
 import { bootstrap } from './bootstrap';
-import { construirApp } from './composition';
+import { construirApp, montarNucleo, type NucleoDoServico } from './composition';
+import { decidirReconciliacao } from './jobs/reconciliacao';
+import { buscarTentativasPresas } from './jobs/reconciliacao.repository';
+import { startReconciliacao, stopReconciliacao } from './jobs/reconciliacao.runtime';
+import type { AppConfig } from './config/env';
 import { loadConfig } from './config/env';
 import { connectDatabase, disconnectDatabase } from './config/database';
 import { registrarEncerramento } from './shutdown';
@@ -13,10 +17,24 @@ import { fetchPending, markRetry, markSent } from './events/outbox.repository';
 // Ressalva: publisher.ts e outbox.relay.ts leem process.env em tempo de import
 // para os knobs de tuning (faixa fechada, default seguro, nada que afete
 // seguranca). E por isso que os testes deles precisam de jest.resetModules().
+/**
+ * O nucleo e montado UMA vez e compartilhado entre o HTTP e o job.
+ *
+ * Memoizado porque o bootstrap chama iniciarRelay, iniciarReconciliacao e
+ * createApp em momentos diferentes — todos DEPOIS do connectDatabase, entao o
+ * getPrisma() la dentro encontra o cliente conectado. Duas instancias fariam o
+ * job nao enxergar as cobrancas do caminho HTTP quando o provedor for o fake.
+ */
+let nucleo: NucleoDoServico | null = null;
+function obterNucleo(config: AppConfig): NucleoDoServico {
+  if (nucleo === null) nucleo = montarNucleo(config);
+  return nucleo;
+}
+
 bootstrap({
   loadConfig,
   connectDatabase,
-  createApp: construirApp,
+  createApp: (config) => construirApp(config, obterNucleo(config)),
   // Sem broker configurado (permitido fora de producao) o relay nao sobe.
   iniciarRelay: (config) => {
     if (config.rabbitmqUrl === null) {
@@ -33,6 +51,18 @@ bootstrap({
       markRetry,
     });
   },
+  iniciarReconciliacao: (config) => {
+    const { provider, service } = obterNucleo(config);
+    startReconciliacao({
+      buscarPresas: buscarTentativasPresas,
+      consultarProvedor: (paymentId, attemptCount) =>
+        provider.buscarCobrancaPorTentativa(paymentId, attemptCount),
+      aplicar: (transactionId, resultado) =>
+        service.aplicarDesfechoDeReconciliacao(transactionId, resultado),
+      liberar: (transactionId) => service.liberarTentativaPresa(transactionId),
+      janelaMinutos: config.paymentWindowMinutes,
+    });
+  },
 })
   .then((server) => {
     registrarEncerramento({
@@ -40,6 +70,7 @@ bootstrap({
         new Promise<void>((resolve, reject) => {
           server.close((erro) => (erro ? reject(erro) : resolve()));
         }),
+      pararReconciliacao: stopReconciliacao,
       pararRelay: stopOutboxRelay,
       fecharPublisher: closeEventPublisher,
       desconectarBanco: disconnectDatabase,

@@ -24,6 +24,9 @@ function montarDeps(ordem: string[], overrides: Partial<BootstrapDeps> = {}) {
     iniciarRelay: jest.fn(() => {
       ordem.push('relay');
     }),
+    iniciarReconciliacao: jest.fn(() => {
+      ordem.push('reconciliacao');
+    }),
     ...overrides,
   };
 
@@ -35,7 +38,7 @@ beforeEach(() => {
 });
 
 describe('bootstrap', () => {
-  it('executa na ordem: configuracao, conexao, relay, porta', async () => {
+  it('executa na ordem: configuracao, conexao, relay, reconciliacao, porta', async () => {
     const ordem: string[] = [];
     const { deps } = montarDeps(ordem);
 
@@ -44,7 +47,18 @@ describe('bootstrap', () => {
     // O relay entra DEPOIS do banco porque o ciclo dele le a outbox, e ANTES
     // da porta porque nao depende de HTTP — atrasar a saida de eventos ate o
     // servidor subir nao traz beneficio nenhum.
-    expect(ordem).toEqual(['config', 'connect', 'relay', 'listen']);
+    expect(ordem).toEqual([
+      'config',
+      'connect',
+      // Relay e reconciliacao entram DEPOIS do banco (ambos consultam e
+      // escrevem) e ANTES do listen: nenhum dos dois depende de HTTP, e
+      // atrasa-los nao traz beneficio nenhum. A reconciliacao vem depois do
+      // relay para que o relay ja esteja de pe quando o job comecar a produzir
+      // eventos de captura descoberta.
+      'relay',
+      'reconciliacao',
+      'listen',
+    ]);
   });
 
   it('passa ao banco a URL vinda da configuracao validada', async () => {

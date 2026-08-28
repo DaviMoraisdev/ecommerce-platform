@@ -74,3 +74,106 @@ export function decidirReconciliacao(snapshot: ChargeSnapshot | null): AcaoDeRec
       return { tipo: 'triagem', motivo: 'cobranca cancelada no provedor' };
   }
 }
+
+/** Uma tentativa presa, com o minimo que a varredura precisa saber. */
+export interface TentativaPresa {
+  id: string;
+  paymentId: string;
+  attemptCount: number;
+}
+
+export interface ReconciliacaoDeps {
+  /** Tentativas PENDING sem providerRef criadas ANTES do limite. */
+  buscarPresas: (limite: Date, lote: number) => Promise<TentativaPresa[]>;
+  consultarProvedor: (paymentId: string, attemptCount: number) => Promise<ChargeSnapshot | null>;
+  aplicar: (transactionId: string, resultado: ChargeResult) => Promise<boolean>;
+  liberar: (transactionId: string) => Promise<boolean>;
+  agora?: () => Date;
+  janelaMinutos?: number;
+  lote?: number;
+}
+
+export interface ResumoDaVarredura {
+  examinadas: number;
+  aplicadas: number;
+  liberadas: number;
+  aguardando: number;
+  triagem: number;
+  falhas: number;
+}
+
+function inteiroNaFaixa(valor: number | undefined, padrao: number, min: number, max: number): number {
+  return valor !== undefined && Number.isInteger(valor) && valor >= min && valor <= max
+    ? valor
+    : padrao;
+}
+
+/**
+ * Um ciclo da varredura.
+ *
+ * NAO escreve no banco de pagamento: pergunta ao provedor, decide, e delega a
+ * aplicacao a quem e dono dos invariantes. O job e uma varredura com um relogio.
+ */
+export async function tickReconciliacao(deps: ReconciliacaoDeps): Promise<ResumoDaVarredura> {
+  const agora = deps.agora ? deps.agora() : new Date();
+  const janela = inteiroNaFaixa(deps.janelaMinutos, 15, 1, 1440);
+  const lote = inteiroNaFaixa(deps.lote, 20, 1, 500);
+
+  // A janela nao e otimizacao, e correcao: sem ela o job pegaria uma tentativa
+  // cuja chamada ao provedor ainda esta em voo e aplicaria desfecho por baixo
+  // dela — competindo com a propria requisicao que a criou.
+  const limite = new Date(agora.getTime() - janela * 60_000);
+
+  const presas = await deps.buscarPresas(limite, lote);
+  const resumo: ResumoDaVarredura = {
+    examinadas: presas.length,
+    aplicadas: 0,
+    liberadas: 0,
+    aguardando: 0,
+    triagem: 0,
+    falhas: 0,
+  };
+
+  for (const presa of presas) {
+    try {
+      const snapshot = await deps.consultarProvedor(presa.paymentId, presa.attemptCount);
+      const acao = decidirReconciliacao(snapshot);
+
+      switch (acao.tipo) {
+        case 'liberar':
+          if (await deps.liberar(presa.id)) resumo.liberadas += 1;
+          break;
+        case 'aplicar':
+          // false = outra execucao ganhou o CAS. Contar como aplicada inflaria
+          // a metrica e esconderia que este ciclo nao fez nada.
+          if (await deps.aplicar(presa.id, acao.resultado)) resumo.aplicadas += 1;
+          break;
+        case 'aguardar':
+          resumo.aguardando += 1;
+          break;
+        case 'triagem':
+          resumo.triagem += 1;
+          console.warn(
+            '[payment-service] reconciliacao exige triagem: tentativa ' +
+              presa.id +
+              ' — ' +
+              acao.motivo,
+          );
+          break;
+      }
+    } catch (erro) {
+      // Falha de UM item nao aborta o lote. Abortar deixaria todas as outras
+      // presas por causa de uma, e a proxima execucao repetiria o mesmo item
+      // primeiro — bloqueio de cabeca de fila, num ciclo que nunca avanca.
+      resumo.falhas += 1;
+      console.error(
+        '[payment-service] falha ao reconciliar a tentativa ' +
+          presa.id +
+          ': ' +
+          (erro instanceof Error ? erro.message : String(erro)),
+      );
+    }
+  }
+
+  return resumo;
+}

@@ -1,0 +1,112 @@
+import { tickReconciliacao, type ReconciliacaoDeps } from '../../../src/jobs/reconciliacao';
+import type { ChargeSnapshot } from '../../../src/providers/payment-provider.port';
+
+function snapshot(over: Partial<ChargeSnapshot> = {}): ChargeSnapshot {
+  return {
+    providerRef: 'ch_1',
+    state: 'SUCCEEDED',
+    amountCents: 12990,
+    capturedAmountCents: 12990,
+    refundedAmountCents: 0,
+    ...over,
+  };
+}
+
+function deps(over: Partial<ReconciliacaoDeps> = {}): ReconciliacaoDeps {
+  return {
+    buscarPresas: jest.fn(async () => [{ id: 'tx_1', paymentId: 'pay_1', attemptCount: 1 }]),
+    consultarProvedor: jest.fn(async () => snapshot()),
+    aplicar: jest.fn(async () => true),
+    liberar: jest.fn(async () => true),
+    agora: () => new Date('2026-08-26T12:00:00.000Z'),
+    janelaMinutos: 15,
+    lote: 20,
+    ...over,
+  };
+}
+
+describe('tickReconciliacao', () => {
+  it('CASO S1: so considera tentativas ANTERIORES a janela', async () => {
+    // A janela nao e otimizacao, e correcao: sem ela o job pegaria uma tentativa
+    // cuja chamada HTTP ainda esta em voo e aplicaria desfecho por baixo dela.
+    const d = deps();
+    await tickReconciliacao(d);
+
+    const [limite, lote] = (d.buscarPresas as jest.Mock).mock.calls[0];
+    expect(limite).toEqual(new Date('2026-08-26T11:45:00.000Z'));
+    expect(lote).toBe(20);
+  });
+
+  it('CASO S2: sem cobranca no provedor, LIBERA e nao aplica', async () => {
+    const d = deps({ consultarProvedor: jest.fn(async () => null) });
+    const resumo = await tickReconciliacao(d);
+
+    expect(d.liberar).toHaveBeenCalledWith('tx_1');
+    expect(d.aplicar).not.toHaveBeenCalled();
+    expect(resumo.liberadas).toBe(1);
+  });
+
+  it('CASO S3: cobranca capturada, APLICA o desfecho', async () => {
+    const d = deps();
+    const resumo = await tickReconciliacao(d);
+
+    expect(d.aplicar).toHaveBeenCalledWith('tx_1', expect.objectContaining({ state: 'SUCCEEDED' }));
+    expect(d.liberar).not.toHaveBeenCalled();
+    expect(resumo.aplicadas).toBe(1);
+  });
+
+  it('CASO S4: cobranca em processamento nao toca em nada', async () => {
+    const d = deps({
+      consultarProvedor: jest.fn(async () => snapshot({ state: 'PROCESSING', capturedAmountCents: 0 })),
+    });
+    const resumo = await tickReconciliacao(d);
+
+    expect(d.aplicar).not.toHaveBeenCalled();
+    expect(d.liberar).not.toHaveBeenCalled();
+    expect(resumo.aguardando).toBe(1);
+  });
+
+  it('CASO S5: estado que o job nao sabe aplicar vai para triagem, sem tocar', async () => {
+    const d = deps({
+      consultarProvedor: jest.fn(async () => snapshot({ state: 'CANCELED', capturedAmountCents: 0 })),
+    });
+    const resumo = await tickReconciliacao(d);
+
+    expect(d.aplicar).not.toHaveBeenCalled();
+    expect(d.liberar).not.toHaveBeenCalled();
+    expect(resumo.triagem).toBe(1);
+  });
+
+  it('CASO S6: falha numa tentativa NAO aborta o lote', async () => {
+    // Provedor fora do ar para um item e transiente. Abortar o lote deixaria
+    // todas as outras presas por causa de uma — e a proxima execucao repetiria
+    // o mesmo item primeiro, num ciclo que nunca avanca.
+    const consultar = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('provedor fora do ar'))
+      .mockResolvedValueOnce(snapshot());
+    const d = deps({
+      buscarPresas: jest.fn(async () => [
+        { id: 'tx_ruim', paymentId: 'pay_1', attemptCount: 1 },
+        { id: 'tx_bom', paymentId: 'pay_2', attemptCount: 1 },
+      ]),
+      consultarProvedor: consultar,
+    });
+
+    const resumo = await tickReconciliacao(d);
+
+    expect(resumo.falhas).toBe(1);
+    expect(resumo.aplicadas).toBe(1);
+    expect(d.aplicar).toHaveBeenCalledWith('tx_bom', expect.anything());
+  });
+
+  it('CASO S7: item cujo CAS foi perdido nao conta como aplicado', async () => {
+    // Outra execucao ganhou. Contar como aplicado inflaria a metrica e
+    // esconderia que este tick nao fez nada.
+    const d = deps({ aplicar: jest.fn(async () => false) });
+    const resumo = await tickReconciliacao(d);
+
+    expect(resumo.aplicadas).toBe(0);
+    expect(resumo.examinadas).toBe(1);
+  });
+});

@@ -17,7 +17,7 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
-      pararRelay: async () => undefined,
+      pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
       fecharPublisher: async () => undefined,
       fecharServidor: async () => void ordem.push('servidor'),
       desconectarBanco: async () => void ordem.push('banco'),
@@ -35,7 +35,7 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
-      pararRelay: async () => undefined,
+      pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
       fecharPublisher: async () => undefined,
       fecharServidor: async () => {
         throw new Error('servidor travado');
@@ -54,7 +54,7 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
-      pararRelay: async () => undefined,
+      pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
       fecharPublisher: async () => undefined,
       fecharServidor: async () => undefined,
       desconectarBanco: async () => {
@@ -71,7 +71,7 @@ describe('encerrar', () => {
     const c = coletores();
 
     const codigo = await encerrar({
-      pararRelay: async () => undefined,
+      pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
       fecharPublisher: async () => undefined,
       // Nunca resolve: simula requisicao em voo que nao termina.
       fecharServidor: () => new Promise<void>(() => undefined),
@@ -89,7 +89,7 @@ describe('encerrar', () => {
 
     await expect(
       encerrar({
-        pararRelay: async () => undefined,
+        pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
         fecharPublisher: async () => undefined,
         fecharServidor: async () => {
           throw new Error('a');
@@ -118,7 +118,7 @@ describe('registrarEncerramento', () => {
     const espiao = espionarSinais();
 
     registrarEncerramento({
-      pararRelay: async () => undefined,
+      pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
       fecharPublisher: async () => undefined,
       fecharServidor: async () => undefined,
       desconectarBanco: async () => undefined,
@@ -136,7 +136,7 @@ describe('registrarEncerramento', () => {
     const codigos: number[] = [];
 
     registrarEncerramento({
-      pararRelay: async () => undefined,
+      pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
       fecharPublisher: async () => undefined,
       fecharServidor: async () => void (fechamentos += 1),
       desconectarBanco: async () => undefined,
@@ -163,7 +163,7 @@ describe('registrarEncerramento', () => {
     const codigos: number[] = [];
 
     registrarEncerramento({
-      pararRelay: async () => undefined,
+      pararReconciliacao: async () => undefined, pararRelay: async () => undefined,
       fecharPublisher: async () => undefined,
       fecharServidor: async () => {
         throw new Error('falhou');
@@ -189,7 +189,7 @@ describe('encerrar — relay e publisher', () => {
     const c = coletores();
     const codigo = await encerrar({
       fecharServidor: async () => void ordem.push('servidor'),
-      pararRelay: async () => void ordem.push('relay'),
+      pararReconciliacao: async () => undefined, pararRelay: async () => void ordem.push('relay'),
       fecharPublisher: async () => void ordem.push('publisher'),
       desconectarBanco: async () => void ordem.push('banco'),
       ...c,
