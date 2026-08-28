@@ -494,6 +494,109 @@ export class PaymentService {
   }
 
   // ==========================================================
+  // 5b. Reconciliacao (job do Bloco 6b)
+  // ==========================================================
+
+  /**
+   * Aplica um desfecho que o JOB descobriu no provedor.
+   *
+   * Devolve false quando outra execucao ja aplicou — o compare-and-swap vive na
+   * MESMA transacao do desfecho, entao nao ha janela entre reivindicar e
+   * aplicar. Aplicar duas vezes criaria duas linhas de CAPTURE e dois eventos
+   * para a mesma captura.
+   *
+   * O job NAO escreve no banco de pagamento: ele varre, pergunta ao provedor e
+   * decide. Os invariantes continuam morando aqui, num lugar so. Duplica-los
+   * dentro do job e como o publisher do order e do payment divergiram.
+   */
+  async aplicarDesfechoDeReconciliacao(
+    transactionId: string,
+    resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
+  ): Promise<boolean> {
+    return this.deps.prisma.$transaction(async (tx) => {
+      // Reivindicacao: so segue quem encontrar a tentativa AINDA presa. Em
+      // Postgres a concorrente bloqueia no lock da linha e reavalia o WHERE
+      // depois do commit — o providerRef ja preenchido a exclui.
+      const reivindicada = await tx.paymentTransaction.updateMany({
+        where: {
+          id: transactionId,
+          status: TransactionStatus.PENDING,
+          providerRef: null,
+        },
+        data: { updatedAt: new Date() },
+      });
+      if (reivindicada.count === 0) return false;
+
+      const tentativa = await tx.paymentTransaction.findUniqueOrThrow({
+        where: { id: transactionId },
+      });
+      const payment = await tx.payment.findUniqueOrThrow({ where: { id: tentativa.paymentId } });
+
+      const registro = await tx.idempotencyRecord.findFirst({
+        where: { paymentId: payment.id, status: 'PROCESSING' },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (registro === null) {
+        // Estado que nao deveria existir: tentativa presa sem chave em
+        // andamento. Falhar alto, porque aplicar o desfecho sem finalizar a
+        // chave deixaria o cliente recebendo IDEMPOTENCIA_EM_ANDAMENTO para
+        // sempre sobre um pagamento ja concluido.
+        throw erroDeDominio(
+          'DEPENDENCIA_INDISPONIVEL',
+          'Tentativa presa sem chave de idempotencia em andamento',
+        );
+      }
+
+      await this.aplicarDesfecho(tx, payment, transactionId, registro.id, resultado);
+      return true;
+    });
+  }
+
+  /**
+   * Libera uma tentativa que o provedor afirma NUNCA ter recebido.
+   *
+   * E a operacao mais perigosa do bloco: ela destrava o cliente para cobrar de
+   * novo, com attemptCount + 1 e portanto chave de provedor NOVA. A seguranca
+   * disso nao vem daqui — vem de buscarCobrancaPorTentativa ter devolvido null.
+   * Se aquela busca estiver errada, e esta linha que produz a segunda cobranca.
+   *
+   * Os tres estados mudam juntos, como no ramo deterministico do
+   * tratarFalhaDoProvedor: sem o Payment voltando a FAILED, uma chave nova
+   * encontraria PROCESSING e receberia TENTATIVA_EM_ANDAMENTO para sempre.
+   */
+  async liberarTentativaPresa(transactionId: string): Promise<boolean> {
+    return this.deps.prisma.$transaction(async (tx) => {
+      const reivindicada = await tx.paymentTransaction.updateMany({
+        where: {
+          id: transactionId,
+          status: TransactionStatus.PENDING,
+          providerRef: null,
+        },
+        // Codigo proprio: na trilha, isto distingue uma recusa do provedor de
+        // uma liberacao feita pelo job.
+        data: { status: TransactionStatus.FAILED, failureCode: 'RECONCILIADO_SEM_COBRANCA' },
+      });
+      if (reivindicada.count === 0) return false;
+
+      const tentativa = await tx.paymentTransaction.findUniqueOrThrow({
+        where: { id: transactionId },
+      });
+
+      await tx.payment.update({
+        where: { id: tentativa.paymentId },
+        data: { status: PaymentStatus.FAILED },
+      });
+
+      await tx.idempotencyRecord.updateMany({
+        where: { paymentId: tentativa.paymentId, status: 'PROCESSING' },
+        data: { status: 'FAILED' },
+      });
+
+      return true;
+    });
+  }
+
+  // ==========================================================
   // 5. Desfecho
   // ==========================================================
 
@@ -503,6 +606,34 @@ export class PaymentService {
     registroId: string,
     resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
   ): Promise<PagamentoCriado> {
+    const declineCode = resultado.state === 'DECLINED' ? resultado.declineCode : undefined;
+
+    const atualizado = await this.deps.prisma.$transaction((tx) =>
+      this.aplicarDesfecho(tx, payment, transactionId, registroId, resultado),
+    );
+
+    return this.comoResposta(atualizado, declineCode, false);
+  }
+
+  /**
+   * Miolo do desfecho, SEM abrir transacao: recebe o tx de quem chama.
+   *
+   * Extraido no Bloco 6b. O job de reconciliacao precisa do compare-and-swap
+   * na tentativa e da aplicacao do desfecho no MESMO commit — senao existe
+   * janela entre reivindicar e aplicar, e duas execucoes concorrentes aplicam
+   * duas vezes. Mesma extracao que o aplicarTransicao do order-service no 5b.
+   *
+   * As validacoes vieram para DENTRO: o job passa por elas tambem. Custo
+   * declarado: desfecho invalido agora abre uma transacao vazia antes de
+   * lancar. Do lado de fora nada muda — mesmo erro, nada gravado.
+   */
+  private async aplicarDesfecho(
+    tx: Prisma.TransactionClient,
+    payment: Payment,
+    transactionId: string,
+    registroId: string,
+    resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
+  ): Promise<Payment> {
     const novoStatus = mapearEstadoDoProvedor(resultado.state);
     assertTransicao(payment.status, novoStatus);
 
@@ -510,87 +641,83 @@ export class PaymentService {
 
     const declineCode = resultado.state === 'DECLINED' ? resultado.declineCode : undefined;
 
-    const atualizado = await this.deps.prisma.$transaction(async (tx) => {
-      await tx.paymentTransaction.update({
-        where: { id: transactionId },
-        data: {
-          providerRef: resultado.providerRef,
-          // Achado 4.6 do review NAO se aplica aqui, e o compilador prova:
-          // `resultado.state === 'CANCELED'` nao compila, porque ChargeResult
-          // (retorno de createCharge) so admite SUCCEEDED, PROCESSING e DECLINED.
-          // CANCELED existe em ChargeState, que e o conjunto largo usado por
-          // getCharge e por webhook — e la a incoerencia apontada e REAL.
-          // Registrado como criterio herdado dos Blocos 4 e 6.
-          status:
-            resultado.state === 'SUCCEEDED'
-              ? TransactionStatus.SUCCEEDED
-              : resultado.state === 'DECLINED'
-                ? TransactionStatus.FAILED
-                : TransactionStatus.PENDING,
-          failureCode: declineCode,
-          failureMessage:
-            resultado.state === 'DECLINED' ? resultado.declineMessage : undefined,
-        },
-      });
-
-      // Captura automatica: quando o provedor captura na propria chamada, as DUAS
-      // etapas aconteceram. Registrar so o AUTHORIZE deixaria a trilha incompleta.
-      if (resultado.state === 'SUCCEEDED') {
-        await tx.paymentTransaction.create({
-          data: {
-            paymentId: payment.id,
-            type: TransactionType.CAPTURE,
-            status: TransactionStatus.SUCCEEDED,
-            amountCents: resultado.capturedAmountCents,
-            providerRef: resultado.providerRef,
-          },
-        });
-
-        // CAMINHO PRINCIPAL do projeto: sob captura automatica (decisao 10 da
-        // fase) o pagamento chega a CAPTURED AQUI, nao pelo webhook. Sem este
-        // enqueue nenhum evento e emitido, e um webhook posterior nao conserta
-        // porque o WebhookService curto-circuita quando o estado alvo ja e o
-        // atual. O `eventId` derivado garante que os dois caminhos nunca
-        // produzam duas linhas para a mesma captura.
-        await enqueue(
-          tx,
-          montarEventoDeCaptura(
-            {
-              paymentId: payment.id,
-              orderId: payment.orderId,
-              amountCents: payment.amountCents,
-              capturedAmountCents: resultado.capturedAmountCents,
-              currency: payment.currency,
-            },
-            new Date(),
-          ),
-        );
-      }
-
-      const p = await tx.payment.update({
-        where: { id: payment.id },
-        data: {
-          status: novoStatus,
-          capturedAmountCents: resultado.capturedAmountCents,
-        },
-      });
-
-      // A resposta e congelada na MESMA transacao do desfecho: fora dela
-      // existiria um instante com a chave COMPLETED e sem o que devolver no
-      // replay. Nesta entrega o invariante e mantido SO pela aplicacao — o
-      // CHECK entra na fase contract, quando nao houver escritor antigo.
-      await tx.idempotencyRecord.update({
-        where: { id: registroId },
-        data: {
-          status: 'COMPLETED',
-          completedResponse: this.paraCongelar(p, declineCode),
-        },
-      });
-
-      return p;
+    await tx.paymentTransaction.update({
+      where: { id: transactionId },
+      data: {
+        providerRef: resultado.providerRef,
+        // Achado 4.6 do review NAO se aplica aqui, e o compilador prova:
+        // `resultado.state === 'CANCELED'` nao compila, porque ChargeResult
+        // (retorno de createCharge) so admite SUCCEEDED, PROCESSING e DECLINED.
+        // CANCELED existe em ChargeState, que e o conjunto largo usado por
+        // getCharge e por webhook — e la a incoerencia apontada e REAL.
+        // Registrado como criterio herdado dos Blocos 4 e 6.
+        status:
+          resultado.state === 'SUCCEEDED'
+            ? TransactionStatus.SUCCEEDED
+            : resultado.state === 'DECLINED'
+              ? TransactionStatus.FAILED
+              : TransactionStatus.PENDING,
+        failureCode: declineCode,
+        failureMessage:
+          resultado.state === 'DECLINED' ? resultado.declineMessage : undefined,
+      },
     });
 
-    return this.comoResposta(atualizado, declineCode, false);
+    // Captura automatica: quando o provedor captura na propria chamada, as DUAS
+    // etapas aconteceram. Registrar so o AUTHORIZE deixaria a trilha incompleta.
+    if (resultado.state === 'SUCCEEDED') {
+      await tx.paymentTransaction.create({
+        data: {
+          paymentId: payment.id,
+          type: TransactionType.CAPTURE,
+          status: TransactionStatus.SUCCEEDED,
+          amountCents: resultado.capturedAmountCents,
+          providerRef: resultado.providerRef,
+        },
+      });
+
+      // CAMINHO PRINCIPAL do projeto: sob captura automatica (decisao 10 da
+      // fase) o pagamento chega a CAPTURED AQUI, nao pelo webhook. Sem este
+      // enqueue nenhum evento e emitido, e um webhook posterior nao conserta
+      // porque o WebhookService curto-circuita quando o estado alvo ja e o
+      // atual. O `eventId` derivado garante que os dois caminhos nunca
+      // produzam duas linhas para a mesma captura.
+      await enqueue(
+        tx,
+        montarEventoDeCaptura(
+          {
+            paymentId: payment.id,
+            orderId: payment.orderId,
+            amountCents: payment.amountCents,
+            capturedAmountCents: resultado.capturedAmountCents,
+            currency: payment.currency,
+          },
+          new Date(),
+        ),
+      );
+    }
+
+    const p = await tx.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: novoStatus,
+        capturedAmountCents: resultado.capturedAmountCents,
+      },
+    });
+
+    // A resposta e congelada na MESMA transacao do desfecho: fora dela
+    // existiria um instante com a chave COMPLETED e sem o que devolver no
+    // replay. Nesta entrega o invariante e mantido SO pela aplicacao — o
+    // CHECK entra na fase contract, quando nao houver escritor antigo.
+    await tx.idempotencyRecord.update({
+      where: { id: registroId },
+      data: {
+        status: 'COMPLETED',
+        completedResponse: this.paraCongelar(p, declineCode),
+      },
+    });
+
+    return p;
   }
 
   // ==========================================================
