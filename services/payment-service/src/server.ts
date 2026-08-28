@@ -1,7 +1,7 @@
 import { bootstrap } from './bootstrap';
 import { construirApp, montarNucleo, type NucleoDoServico } from './composition';
 import { decidirReconciliacao } from './jobs/reconciliacao';
-import { buscarTentativasPresas } from './jobs/reconciliacao.repository';
+import { montarDepsDeReconciliacao } from './jobs/reconciliacao.deps';
 import { startReconciliacao, stopReconciliacao } from './jobs/reconciliacao.runtime';
 import type { AppConfig } from './config/env';
 import { loadConfig } from './config/env';
@@ -53,16 +53,9 @@ bootstrap({
   },
   iniciarReconciliacao: (config) => {
     const { provider, service } = obterNucleo(config);
-    startReconciliacao({
-      buscarPresas: buscarTentativasPresas,
-      consultarProvedor: (paymentId, attemptCount) =>
-        provider.buscarCobrancaPorTentativa(paymentId, attemptCount),
-      aplicar: (transactionId, resultado) =>
-        service.aplicarDesfechoDeReconciliacao(transactionId, resultado),
-      liberar: (transactionId) => service.liberarTentativaPresa(transactionId),
-      ausenciaEDefinitiva: provider.ausenciaEDefinitiva,
-      janelaMinutos: config.paymentWindowMinutes,
-    });
+    startReconciliacao(
+      montarDepsDeReconciliacao(provider, service, config.paymentWindowMinutes),
+    );
   },
 })
   .then((server) => {
