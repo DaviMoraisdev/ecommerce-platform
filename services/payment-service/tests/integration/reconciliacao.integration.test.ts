@@ -8,6 +8,7 @@ import { assertTestDatabase } from '../helpers/testDbGuard';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { orderClientFalso, pedidoDeTeste } from '../helpers/prisma-fake';
 import { decidirReconciliacao } from '../../src/jobs/reconciliacao';
+import { buscarTentativasPresas } from '../../src/jobs/reconciliacao.repository';
 
 /**
  * O estado preso e montado de PONTA A PONTA, nao fabricado no banco: o token
@@ -74,6 +75,61 @@ async function tentativaPresa(token: string) {
 
   return { ...ctx, payment, tentativa };
 }
+
+describe('buscarTentativasPresas', () => {
+  it('CASO J4: so devolve tentativas PENDING, sem providerRef e ANTES do limite', async () => {
+    // Os casos S1-S7 injetam esta consulta como duble, entao o filtro real
+    // nunca foi exercitado. Filtro errado aqui nao quebra nada visivelmente:
+    // o job varre o vazio para sempre, ou pior, alcanca tentativas em voo.
+    const { payment, tentativa } = await tentativaPresa(FAKE_TOKENS.TIMEOUT_AFTER_CHARGE);
+
+    // Envelhece a tentativa para que ela caia dentro da janela.
+    await prisma.paymentTransaction.update({
+      where: { id: tentativa.id },
+      data: { createdAt: new Date(Date.now() - 60 * 60 * 1000) },
+    });
+
+    const limite = new Date(Date.now() - 15 * 60 * 1000);
+    const encontradas = await buscarTentativasPresas(limite, 20);
+
+    expect(encontradas.map((t) => t.id)).toContain(tentativa.id);
+    expect(encontradas.find((t) => t.id === tentativa.id)?.attemptCount).toBe(
+      payment.attemptCount,
+    );
+  });
+
+  it('CASO J5: tentativa RECENTE nao e candidata', async () => {
+    // A janela e correcao, nao otimizacao: sem ela o job alcancaria uma
+    // tentativa cuja chamada ao provedor ainda esta em voo e aplicaria desfecho
+    // por baixo da propria requisicao que a criou.
+    const { tentativa } = await tentativaPresa(FAKE_TOKENS.TIMEOUT_AFTER_CHARGE);
+
+    const limite = new Date(Date.now() - 15 * 60 * 1000);
+    const encontradas = await buscarTentativasPresas(limite, 20);
+
+    expect(encontradas.map((t) => t.id)).not.toContain(tentativa.id);
+  });
+
+  it('CASO J6: tentativa ja resolvida deixa de ser candidata', async () => {
+    const { service, provider, payment, tentativa } = await tentativaPresa(
+      FAKE_TOKENS.TIMEOUT_AFTER_CHARGE,
+    );
+    await prisma.paymentTransaction.update({
+      where: { id: tentativa.id },
+      data: { createdAt: new Date(Date.now() - 60 * 60 * 1000) },
+    });
+
+    const snapshot = await provider.buscarCobrancaPorTentativa(payment.id, payment.attemptCount);
+    const acao = decidirReconciliacao(snapshot);
+    if (acao.tipo !== 'aplicar') throw new Error('esperado aplicar');
+    await service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado);
+
+    const limite = new Date(Date.now() - 15 * 60 * 1000);
+    const encontradas = await buscarTentativasPresas(limite, 20);
+
+    expect(encontradas.map((t) => t.id)).not.toContain(tentativa.id);
+  });
+});
 
 describe('reconciliacao de tentativa presa', () => {
   it('CASO J1: cobranca EXISTE e sucedeu — aplica o desfecho completo', async () => {
