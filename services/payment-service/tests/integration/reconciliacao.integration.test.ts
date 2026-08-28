@@ -205,11 +205,19 @@ describe('reconciliacao de tentativa presa', () => {
     const acao = decidirReconciliacao(snapshot, provider.ausenciaEDefinitiva);
     if (acao.tipo !== 'aplicar') throw new Error('esperado aplicar');
 
-    const primeira = await service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado);
-    const segunda = await service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado);
+    // Disparadas JUNTAS. Em sequencia (como era antes), o teste provava
+    // idempotencia DEPOIS do commit, nao contencao: a segunda chamada so via um
+    // estado ja resolvido. Achado 6.2 do review do PR #57.
+    //
+    // Nao ha nao-determinismo a temer: o CAS torna o desfecho identico sob
+    // qualquer entrelacamento — uma reivindica, a outra encontra a linha ja
+    // tomada. Por isso a assercao e sobre o CONJUNTO, nao sobre a ordem.
+    const [primeira, segunda] = await Promise.all([
+      service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado),
+      service.aplicarDesfechoDeReconciliacao(tentativa.id, acao.resultado),
+    ]);
 
-    expect(primeira).toBe(true);
-    expect(segunda).toBe(false);
+    expect([primeira, segunda].filter((r) => r)).toHaveLength(1);
 
     const capturas = await prisma.paymentTransaction.findMany({
       where: { paymentId: payment.id, type: TransactionType.CAPTURE },
