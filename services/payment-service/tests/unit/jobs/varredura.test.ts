@@ -1,5 +1,11 @@
-import { tickReconciliacao, type ReconciliacaoDeps } from '../../../src/jobs/reconciliacao';
+import {
+  tickReconciliacao,
+  type ReconciliacaoDeps,
+  type TentativaPresa,
+} from '../../../src/jobs/reconciliacao';
 import type { ChargeSnapshot } from '../../../src/providers/payment-provider.port';
+
+const NASCIMENTO = new Date('2026-08-26T10:00:00.000Z');
 
 function snapshot(over: Partial<ChargeSnapshot> = {}): ChargeSnapshot {
   return {
@@ -12,9 +18,13 @@ function snapshot(over: Partial<ChargeSnapshot> = {}): ChargeSnapshot {
   };
 }
 
+function presa(over: Partial<TentativaPresa> = {}): TentativaPresa {
+  return { id: 'tx_1', paymentId: 'pay_1', attemptCount: 1, createdAt: NASCIMENTO, ...over };
+}
+
 function deps(over: Partial<ReconciliacaoDeps> = {}): ReconciliacaoDeps {
   return {
-    buscarPresas: jest.fn(async () => [{ id: 'tx_1', paymentId: 'pay_1', attemptCount: 1 }]),
+    buscarPresas: jest.fn(async () => [presa()]),
     consultarProvedor: jest.fn(async () => snapshot()),
     aplicar: jest.fn(async () => true),
     liberar: jest.fn(async () => true),
@@ -87,8 +97,8 @@ describe('tickReconciliacao', () => {
       .mockResolvedValueOnce(snapshot());
     const d = deps({
       buscarPresas: jest.fn(async () => [
-        { id: 'tx_ruim', paymentId: 'pay_1', attemptCount: 1 },
-        { id: 'tx_bom', paymentId: 'pay_2', attemptCount: 1 },
+        presa({ id: 'tx_ruim', paymentId: 'pay_1' }),
+        presa({ id: 'tx_bom', paymentId: 'pay_2' }),
       ]),
       consultarProvedor: consultar,
     });
@@ -108,5 +118,62 @@ describe('tickReconciliacao', () => {
 
     expect(resumo.aplicadas).toBe(0);
     expect(resumo.examinadas).toBe(1);
+  });
+
+  it('CASO S8: item nao-acionavel no primeiro lote NAO impede os posteriores', async () => {
+    // Achado 4.1 do review do PR #57. `triagem` (como `aguardar` e falha) nao
+    // altera a linha: ela continua PENDING sem providerRef e continua entre as
+    // mais antigas. Sem paginar, o mesmo lote voltaria a cada ciclo e nenhuma
+    // tentativa posterior seria examinada — bastava o provedor cair uma vez.
+    const paginas: TentativaPresa[][] = [
+      [presa({ id: 'tx_travado_a', paymentId: 'pay_1' }), presa({ id: 'tx_travado_b', paymentId: 'pay_2' })],
+      [presa({ id: 'tx_novo', paymentId: 'pay_2' })],
+      [],
+    ];
+    const d = deps({
+      lote: 2,
+      buscarPresas: jest.fn(async () => paginas.shift() ?? []),
+      consultarProvedor: jest
+        .fn()
+        .mockResolvedValueOnce(snapshot({ state: 'CANCELED', capturedAmountCents: 0 }))
+        .mockResolvedValueOnce(snapshot({ state: 'CANCELED', capturedAmountCents: 0 }))
+        .mockResolvedValueOnce(snapshot()),
+    });
+
+    const resumo = await tickReconciliacao(d);
+
+    expect(resumo.triagem).toBe(2);
+    expect(resumo.aplicadas).toBe(1);
+    expect(d.aplicar).toHaveBeenCalledWith('tx_novo', expect.anything());
+    expect(resumo.truncada).toBe(false);
+
+    // O cursor da 2a busca tem de ser a ULTIMA linha da 1a pagina: e o que
+    // garante que a varredura anda em vez de reler o mesmo lote.
+    const [, , cursor] = (d.buscarPresas as jest.Mock).mock.calls[1];
+    // Pagina de DOIS itens: se o cursor viesse do primeiro, a varredura releria
+    // o segundo a cada ciclo. E o que distingue cursor certo de cursor qualquer.
+    expect(cursor).toEqual({ createdAt: NASCIMENTO, id: 'tx_travado_b' });
+  });
+
+  it('CASO S9: o teto de lotes encerra o ciclo e marca truncada', async () => {
+    // O teto existe para o ciclo nao virar varredura ilimitada. Marcar
+    // `truncada` e o que distingue "acabou a fila" de "parei no meio".
+    let n = 0;
+    const d = deps({
+      lote: 1,
+      maxLotes: 2,
+      buscarPresas: jest.fn(async () => {
+        n += 1;
+        return [presa({ id: 'tx_' + String(n) })];
+      }),
+      consultarProvedor: jest.fn(async () => snapshot({ state: 'PROCESSING', capturedAmountCents: 0 })),
+    });
+
+    const resumo = await tickReconciliacao(d);
+
+    expect(d.buscarPresas).toHaveBeenCalledTimes(2);
+    expect(resumo.examinadas).toBe(2);
+    expect(resumo.aguardando).toBe(2);
+    expect(resumo.truncada).toBe(true);
   });
 });

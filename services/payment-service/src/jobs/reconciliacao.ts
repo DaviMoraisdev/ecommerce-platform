@@ -80,17 +80,26 @@ export interface TentativaPresa {
   id: string;
   paymentId: string;
   attemptCount: number;
+  /** Compoe o cursor da paginacao junto com o `id`. */
+  createdAt: Date;
+}
+
+/** Ultima linha ja examinada neste ciclo. Ver a nota de keyset no repositorio. */
+export interface CursorDaVarredura {
+  createdAt: Date;
+  id: string;
 }
 
 export interface ReconciliacaoDeps {
-  /** Tentativas PENDING sem providerRef criadas ANTES do limite. */
-  buscarPresas: (limite: Date, lote: number) => Promise<TentativaPresa[]>;
+  /** Tentativas PENDING sem providerRef, criadas ANTES do limite e APOS o cursor. */
+  buscarPresas: (limite: Date, lote: number, apos?: CursorDaVarredura) => Promise<TentativaPresa[]>;
   consultarProvedor: (paymentId: string, attemptCount: number) => Promise<ChargeSnapshot | null>;
   aplicar: (transactionId: string, resultado: ChargeResult) => Promise<boolean>;
   liberar: (transactionId: string) => Promise<boolean>;
   agora?: () => Date;
   janelaMinutos?: number;
   lote?: number;
+  maxLotes?: number;
 }
 
 export interface ResumoDaVarredura {
@@ -100,6 +109,8 @@ export interface ResumoDaVarredura {
   aguardando: number;
   triagem: number;
   falhas: number;
+  /** true = o ciclo parou no teto de lotes, SEM provar que a fila acabou. */
+  truncada: boolean;
 }
 
 function inteiroNaFaixa(valor: number | undefined, padrao: number, min: number, max: number): number {
@@ -113,67 +124,99 @@ function inteiroNaFaixa(valor: number | undefined, padrao: number, min: number, 
  *
  * NAO escreve no banco de pagamento: pergunta ao provedor, decide, e delega a
  * aplicacao a quem e dono dos invariantes. O job e uma varredura com um relogio.
+ *
+ * PROGRESSO GARANTIDO: `aguardar`, `triagem` e falha NAO alteram a linha, entao
+ * ela continua candidata e continua entre as mais antigas. Sem paginar, um lote
+ * de itens nao-acionaveis congelaria a varredura e nenhuma tentativa posterior
+ * seria examinada — bastava o provedor ficar fora do ar durante um ciclo. O
+ * ciclo agora avanca pelo cursor ate esgotar a fila ou atingir `maxLotes`.
+ * LIMITE RESIDUAL: com mais itens travados que `maxLotes * lote`, o problema
+ * volta; a correcao definitiva e estado duravel de triagem (registrado em
+ * TECH_DEBT.md), que exige migracao.
  */
 export async function tickReconciliacao(deps: ReconciliacaoDeps): Promise<ResumoDaVarredura> {
   const agora = deps.agora ? deps.agora() : new Date();
   const janela = inteiroNaFaixa(deps.janelaMinutos, 15, 1, 1440);
   const lote = inteiroNaFaixa(deps.lote, 20, 1, 500);
+  const maxLotes = inteiroNaFaixa(deps.maxLotes, 5, 1, 100);
 
   // A janela nao e otimizacao, e correcao: sem ela o job pegaria uma tentativa
   // cuja chamada ao provedor ainda esta em voo e aplicaria desfecho por baixo
   // dela — competindo com a propria requisicao que a criou.
   const limite = new Date(agora.getTime() - janela * 60_000);
 
-  const presas = await deps.buscarPresas(limite, lote);
   const resumo: ResumoDaVarredura = {
-    examinadas: presas.length,
+    examinadas: 0,
     aplicadas: 0,
     liberadas: 0,
     aguardando: 0,
     triagem: 0,
     falhas: 0,
+    truncada: false,
   };
 
-  for (const presa of presas) {
-    try {
-      const snapshot = await deps.consultarProvedor(presa.paymentId, presa.attemptCount);
-      const acao = decidirReconciliacao(snapshot);
+  let cursor: CursorDaVarredura | undefined;
 
-      switch (acao.tipo) {
-        case 'liberar':
-          if (await deps.liberar(presa.id)) resumo.liberadas += 1;
-          break;
-        case 'aplicar':
-          // false = outra execucao ganhou o CAS. Contar como aplicada inflaria
-          // a metrica e esconderia que este ciclo nao fez nada.
-          if (await deps.aplicar(presa.id, acao.resultado)) resumo.aplicadas += 1;
-          break;
-        case 'aguardar':
-          resumo.aguardando += 1;
-          break;
-        case 'triagem':
-          resumo.triagem += 1;
-          console.warn(
-            '[payment-service] reconciliacao exige triagem: tentativa ' +
-              presa.id +
-              ' — ' +
-              acao.motivo,
-          );
-          break;
+  for (let pagina = 0; pagina < maxLotes; pagina += 1) {
+    const presas = await deps.buscarPresas(limite, lote, cursor);
+    if (presas.length === 0) return resumo;
+
+    resumo.examinadas += presas.length;
+
+    for (const presa of presas) {
+      try {
+        const snapshot = await deps.consultarProvedor(presa.paymentId, presa.attemptCount);
+        const acao = decidirReconciliacao(snapshot);
+
+        switch (acao.tipo) {
+          case 'liberar':
+            if (await deps.liberar(presa.id)) resumo.liberadas += 1;
+            break;
+          case 'aplicar':
+            // false = outra execucao ganhou o CAS. Contar como aplicada inflaria
+            // a metrica e esconderia que este ciclo nao fez nada.
+            if (await deps.aplicar(presa.id, acao.resultado)) resumo.aplicadas += 1;
+            break;
+          case 'aguardar':
+            resumo.aguardando += 1;
+            break;
+          case 'triagem':
+            resumo.triagem += 1;
+            console.warn(
+              '[payment-service] reconciliacao exige triagem: tentativa ' +
+                presa.id +
+                ' — ' +
+                acao.motivo,
+            );
+            break;
+        }
+      } catch (erro) {
+        // Falha de UM item nao aborta o lote. Abortar deixaria todas as outras
+        // presas por causa de uma, e a proxima execucao repetiria o mesmo item
+        // primeiro — bloqueio de cabeca de fila, num ciclo que nunca avanca.
+        resumo.falhas += 1;
+        console.error(
+          '[payment-service] falha ao reconciliar a tentativa ' +
+            presa.id +
+            ': ' +
+            (erro instanceof Error ? erro.message : String(erro)),
+        );
       }
-    } catch (erro) {
-      // Falha de UM item nao aborta o lote. Abortar deixaria todas as outras
-      // presas por causa de uma, e a proxima execucao repetiria o mesmo item
-      // primeiro — bloqueio de cabeca de fila, num ciclo que nunca avanca.
-      resumo.falhas += 1;
-      console.error(
-        '[payment-service] falha ao reconciliar a tentativa ' +
-          presa.id +
-          ': ' +
-          (erro instanceof Error ? erro.message : String(erro)),
-      );
     }
+
+    // Pagina incompleta significa fim da fila: nao ha proxima.
+    if (presas.length < lote) return resumo;
+
+    // `.at(-1)` nao compila com o `lib` atual do tsconfig (divida registrada).
+    const ultima = presas[presas.length - 1];
+    cursor = { createdAt: ultima.createdAt, id: ultima.id };
   }
 
+  resumo.truncada = true;
+  console.warn(
+    '[payment-service] reconciliacao parou no teto de ' +
+      maxLotes +
+      ' lotes por ciclo, sem provar que a fila acabou',
+  );
   return resumo;
 }
