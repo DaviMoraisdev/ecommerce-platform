@@ -124,6 +124,11 @@ export interface ResumoDaVarredura {
   falhas: number;
   /** true = o ciclo parou no teto de lotes, SEM provar que a fila acabou. */
   truncada: boolean;
+  /**
+   * De onde o PROXIMO ciclo deve continuar; `null` quando a fila foi esgotada
+   * e o proximo ciclo recomeca do inicio (wrap-around).
+   */
+  proximoCursor: CursorDaVarredura | null;
 }
 
 function inteiroNaFaixa(valor: number | undefined, padrao: number, min: number, max: number): number {
@@ -147,7 +152,10 @@ function inteiroNaFaixa(valor: number | undefined, padrao: number, min: number, 
  * volta; a correcao definitiva e estado duravel de triagem (registrado em
  * TECH_DEBT.md), que exige migracao.
  */
-export async function tickReconciliacao(deps: ReconciliacaoDeps): Promise<ResumoDaVarredura> {
+export async function tickReconciliacao(
+  deps: ReconciliacaoDeps,
+  cursorInicial?: CursorDaVarredura,
+): Promise<ResumoDaVarredura> {
   const agora = deps.agora ? deps.agora() : new Date();
   const janela = inteiroNaFaixa(deps.janelaMinutos, 15, 1, 1440);
   const lote = inteiroNaFaixa(deps.lote, 20, 1, 500);
@@ -166,9 +174,10 @@ export async function tickReconciliacao(deps: ReconciliacaoDeps): Promise<Resumo
     triagem: 0,
     falhas: 0,
     truncada: false,
+    proximoCursor: null,
   };
 
-  let cursor: CursorDaVarredura | undefined;
+  let cursor = cursorInicial;
 
   for (let pagina = 0; pagina < maxLotes; pagina += 1) {
     const presas = await deps.buscarPresas(limite, lote, cursor);
@@ -226,10 +235,36 @@ export async function tickReconciliacao(deps: ReconciliacaoDeps): Promise<Resumo
   }
 
   resumo.truncada = true;
+  resumo.proximoCursor = cursor ?? null;
   console.warn(
     '[payment-service] reconciliacao parou no teto de ' +
       maxLotes +
       ' lotes por ciclo, sem provar que a fila acabou',
   );
   return resumo;
+}
+
+/**
+ * Varredura com memoria entre ciclos.
+ *
+ * Achado 4.1 da 2a rodada de review do PR #57: com o cursor local ao tick, o
+ * ciclo seguinte recomecava do inicio. Com `maxLotes * lote` itens presos em
+ * triagem ou aguardando, todo ciclo relia exatamente os mesmos e o item
+ * seguinte NUNCA era examinado — o starvation tinha sido deslocado de 20 para
+ * 100 registros, nao removido. A correcao do achado 3.1 agrava isso, porque
+ * ausencia sem garantia vira triagem permanente nas primeiras posicoes.
+ *
+ * O estado e uma variavel de fechamento, nao de modulo: dois jobs no mesmo
+ * processo teriam cursores independentes, e o teste nao precisa de
+ * `jest.resetModules()`.
+ */
+export function criarVarredura(deps: ReconciliacaoDeps): () => Promise<ResumoDaVarredura> {
+  let cursor: CursorDaVarredura | undefined;
+  return async () => {
+    const resumo = await tickReconciliacao(deps, cursor);
+    // null = fila esgotada: o proximo ciclo recomeca do inicio, senao os itens
+    // mais antigos deixariam de ser reavaliados para sempre.
+    cursor = resumo.proximoCursor ?? undefined;
+    return resumo;
+  };
 }

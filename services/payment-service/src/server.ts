@@ -1,6 +1,5 @@
 import { bootstrap } from './bootstrap';
 import { construirApp, montarNucleo, type NucleoDoServico } from './composition';
-import { decidirReconciliacao } from './jobs/reconciliacao';
 import { montarDepsDeReconciliacao } from './jobs/reconciliacao.deps';
 import { startReconciliacao, stopReconciliacao } from './jobs/reconciliacao.runtime';
 import type { AppConfig } from './config/env';

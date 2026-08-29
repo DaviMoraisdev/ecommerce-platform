@@ -1,5 +1,7 @@
 import {
+  criarVarredura,
   tickReconciliacao,
+  type CursorDaVarredura,
   type ReconciliacaoDeps,
   type TentativaPresa,
 } from '../../../src/jobs/reconciliacao';
@@ -191,5 +193,45 @@ describe('tickReconciliacao', () => {
     expect(d.liberar).not.toHaveBeenCalled();
     expect(resumo.liberadas).toBe(0);
     expect(resumo.triagem).toBe(1);
+  });
+
+  it('CASO S11: o cursor sobrevive ao teto e o ciclo seguinte continua de onde parou', async () => {
+    // Achado 4.1 da 2a rodada. Com o cursor local ao tick, cada ciclo relia os
+    // mesmos maxLotes*lote itens e o seguinte nunca era alcancado: starvation
+    // deslocado de 20 para 100 registros, nao eliminado.
+    const todas = [
+      presa({ id: 'tx_a', paymentId: 'pay_a' }),
+      presa({ id: 'tx_b', paymentId: 'pay_b' }),
+      presa({ id: 'tx_c', paymentId: 'pay_c' }),
+    ];
+    const buscarPresas = jest.fn(async (_limite: Date, lote: number, apos?: CursorDaVarredura) => {
+      const inicio = apos ? todas.findIndex((t) => t.id === apos.id) + 1 : 0;
+      return todas.slice(inicio, inicio + lote);
+    });
+    const d = deps({
+      lote: 1,
+      maxLotes: 2,
+      buscarPresas,
+      consultarProvedor: jest.fn(async () => snapshot({ state: 'PROCESSING', capturedAmountCents: 0 })),
+    });
+
+    const varrer = criarVarredura(d);
+
+    const primeiro = await varrer();
+    expect(primeiro.truncada).toBe(true);
+    expect(primeiro.proximoCursor).toEqual({ createdAt: NASCIMENTO, id: 'tx_b' });
+
+    const segundo = await varrer();
+
+    // Sem memoria entre ciclos, a sequencia seria pay_a, pay_b, pay_a, pay_b —
+    // e pay_c ficaria preso para sempre.
+    expect((d.consultarProvedor as jest.Mock).mock.calls.map((c) => c[0])).toEqual([
+      'pay_a',
+      'pay_b',
+      'pay_c',
+    ]);
+    // Fila esgotada: o proximo ciclo recomeca do inicio, senao os mais antigos
+    // deixariam de ser reavaliados.
+    expect(segundo.proximoCursor).toBeNull();
   });
 });

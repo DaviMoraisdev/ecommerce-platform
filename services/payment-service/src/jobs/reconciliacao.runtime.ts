@@ -1,4 +1,4 @@
-import { tickReconciliacao, type ReconciliacaoDeps } from './reconciliacao';
+import { criarVarredura, type ReconciliacaoDeps } from './reconciliacao';
 
 function inteiroNaFaixa(raw: string | undefined, padrao: number, min: number, max: number): number {
   const n = Number(raw);
@@ -26,12 +26,14 @@ export function startReconciliacao(deps: ReconciliacaoDeps): void {
   iniciado = true;
   parado = false;
 
+  const varrer = criarVarredura(deps);
+
   const loop = async (): Promise<void> => {
     if (parado) return;
     // Falha do ciclo INTEIRO (banco fora, por exemplo) nao pode matar o laco:
     // sem este catch, uma rejeicao aqui derruba o processo e a reconciliacao
     // para de existir ate alguem reiniciar o servico.
-    cicloAtual = tickReconciliacao(deps).catch((erro: unknown) => {
+    cicloAtual = varrer().catch((erro: unknown) => {
       console.error(
         '[reconciliacao] ciclo falhou: ' + (erro instanceof Error ? erro.message : String(erro)),
       );

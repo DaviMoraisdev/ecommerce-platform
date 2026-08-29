@@ -353,8 +353,17 @@ export interface PaymentProvider {
    * pagamento continua preso e visivel — que e o estado seguro. Documentar nao
    * protegeria; a declaracao protege.
    *
-   * Um adapter so pode declarar `true` com garantia do provedor de leitura
-   * read-after-write consistente nesta consulta. Na duvida, `false`.
+   * CRITERIO (corrigido na 2a rodada de review do PR #57): consistencia
+   * read-after-write NAO basta. Ela garante visibilidade depois que uma escrita
+   * TERMINOU, e nao diz nada sobre uma cobranca que ainda VAI ser criada — uma
+   * requisicao em voo, ou aceita pelo provedor e ainda nao materializada. Nesse
+   * caso o `null` e verdadeiro no instante da leitura e falso um segundo depois.
+   *
+   * Um adapter so pode declarar `true` se o provedor garantir que "nao
+   * encontrado" e TERMINAL para aquela correlacao: nenhuma operacao com ela
+   * pode mais ser criada nem concluida depois do instante da consulta. A janela
+   * de retentativa e condicao NECESSARIA, nunca suficiente — ela torna o
+   * cenario improvavel, nao impossivel. Na duvida, `false`.
    */
   readonly ausenciaEDefinitiva: boolean;
 
