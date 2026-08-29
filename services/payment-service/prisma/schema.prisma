@@ -105,6 +105,18 @@ enum WebhookStatus {
   PROCESSED
   FAILED
   IGNORED
+
+  // Bloco 6c: DESISTIMOS de tentar aplicar este evento — por teto de tentativas
+  // (falha deterministica) ou por idade (inaplicavel por tempo demais).
+  //
+  // Distinto de IGNORED de proposito: IGNORED e uma DECISAO ("nao se aplica a
+  // nos", "sem providerCreatedAt"), quarentena e uma DESISTENCIA. Misturar os
+  // dois destroi a triagem, que e a unica razao de o estado existir.
+  //
+  // TERMINAL para o fluxo automatico: `registrar` trata QUARANTINED como
+  // duplicata. Sair da quarentena e acao humana (voltar a linha para RECEIVED),
+  // nunca automatica — ver o comentario em webhook.service.ts.
+  QUARANTINED
 }
 
 // INBOX (Bloco 4): espelho do outbox. Grava o evento do provedor antes
