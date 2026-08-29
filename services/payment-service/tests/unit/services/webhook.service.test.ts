@@ -101,6 +101,8 @@ function montar(
   contagens: number[],
   erroNaTransacao?: Error,
   transacao: PaymentTransaction | null = autorizacao(),
+  /** Tentativas JA registradas na linha. Serve para posicionar o teto do 6c. */
+  tentativasIniciais = 0,
 ) {
   const criadas: Criada[] = [];
   const inbox: Record<string, unknown>[] = [];
@@ -124,7 +126,7 @@ function montar(
     outboxEvent: { create: outboxNoTx },
   };
 
-  let tentativas = 0;
+  let tentativas = tentativasIniciais;
 
   const prisma = {
     webhookEvent: {
@@ -212,6 +214,52 @@ describe('WebhookService — CAS perdido na transicao de status (achado 4.2)', (
 
     expect(resultado.retentavel).toBe(true);
     expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+  });
+});
+
+describe('WebhookService — teto de tentativas (Bloco 6c)', () => {
+  it('CASO T1: ao atingir o teto, a linha vai para QUARANTINED e o erro NAO propaga', async () => {
+    // Falha DETERMINISTICA lanca a cada reentrega, a rota responde 5xx e o
+    // provedor reentrega — laco sem fim, reprocessando o evento inteiro a cada
+    // volta. Ao atingir o teto a rota precisa responder 200 para o provedor
+    // parar, e para isso o erro NAO pode propagar. E a unica diferenca
+    // observavel entre "ainda tentando" e "desistimos".
+    const falha = new Error('relation "payments" does not exist at character 42');
+    const { service, inbox } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
+      [],
+      falha,
+      autorizacao(),
+      4, // quatro tentativas ja registradas: esta falha fecha o teto de 5
+    );
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.status).toBe(WebhookStatus.QUARANTINED);
+    expect(resultado.retentavel).toBeUndefined();
+
+    const quarentena = inbox.find((d) => d.status === WebhookStatus.QUARANTINED);
+    expect(quarentena).toBeDefined();
+    expect(String(quarentena?.lastError)).toContain('teto de 5 tentativas atingido');
+    // A mensagem original do banco nao pode vazar nem por este caminho: o
+    // lastError da quarentena carrega o ultimo erro JA sanitizado.
+    expect(JSON.stringify(quarentena)).not.toContain('relation');
+  });
+
+  it('CASO T2: uma tentativa abaixo do teto continua propagando o erro', async () => {
+    // Contraparte do T1. Sem este caso, trocar o `gte` por `gt` (ou o teto por
+    // zero) passaria despercebido em uma das duas direcoes.
+    const falha = new Error('falha transitoria');
+    const { service, inbox } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
+      [],
+      falha,
+      autorizacao(),
+      3, // esta falha leva a 4, ainda abaixo do teto de 5
+    );
+
+    await expect(service.processar('fake', eventoDeCaptura())).rejects.toThrow(falha);
+    expect(inbox.find((d) => d.status === WebhookStatus.QUARANTINED)).toBeUndefined();
   });
 });
 

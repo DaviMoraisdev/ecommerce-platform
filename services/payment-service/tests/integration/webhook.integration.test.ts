@@ -988,3 +988,57 @@ describe('webhook — gravacao na outbox', () => {
     expect(await prisma.outboxEvent.count()).toBe(1);
   });
 });
+
+
+// ==========================================================
+// Bloco 6c — quarentena terminal
+// ==========================================================
+describe('webhook — quarentena (Bloco 6c)', () => {
+  it('CASO 20: reentrega sobre linha em QUARENTENA nao reprocessa nem aplica efeito', async () => {
+    // O caso que justifica `registrar` tratar QUARANTINED como duplicata.
+    // As guardas do catch e do encerrar filtram status in (RECEIVED, FAILED):
+    // se uma reentrega reprocessasse a linha em quarentena, o efeito financeiro
+    // seria aplicado e o desfecho NAO conseguiria ser gravado — a linha
+    // continuaria QUARANTINED e a reentrega seguinte aplicaria DE NOVO.
+    // Captura dupla, silenciosa, sem nada no rastro dizendo que aconteceu.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const eventoId = `evt_${randomUUID()}`;
+    const assinado = provider.assinarCorpo(corpo({ id: eventoId }, { charge_ref: chargeRef }));
+
+    await prisma.webhookEvent.create({
+      data: {
+        provider: 'fake',
+        providerEventId: eventoId,
+        eventType: 'payment.succeeded',
+        payload: {},
+        providerCreatedAt: new Date(),
+        status: WebhookStatus.QUARANTINED,
+        attempts: 5,
+        lastError: 'teto de 5 tentativas atingido',
+      },
+    });
+
+    const res = await postar(app, assinado);
+    // 200, nao 5xx: o proposito da quarentena e o provedor PARAR de reentregar.
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.PROCESSING);
+    expect(atual.capturedAmountCents).toBe(0);
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(0);
+    expect(await prisma.outboxEvent.count()).toBe(0);
+
+    // A linha nao foi tocada — nem contador, nem estado. Se tivesse
+    // reprocessado e falhado, `attempts` subiria; se tivesse aplicado,
+    // `status` mudaria.
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.QUARANTINED);
+    expect(linha.attempts).toBe(5);
+  });
+});
