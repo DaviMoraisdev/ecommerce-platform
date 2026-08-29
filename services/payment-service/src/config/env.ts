@@ -27,6 +27,19 @@ export interface AppConfig {
    */
   paymentWindowMinutes: number;
   /**
+   * Teto de tentativas do inbox de webhook (Bloco 6c). Ao atingi-lo, o evento
+   * vai para QUARANTINED e a rota passa a responder 200 — o que encerra o laco
+   * de reentrega do provedor.
+   *
+   * Vive no AppConfig, e nao em process.env solto como os knobs do relay, pelo
+   * GATILHO registrado no TECH_DEBT ("reavaliar se algum passar a ter efeito
+   * operacional relevante"): este decide quando o servico PARA DE TENTAR
+   * aplicar evento financeiro. Aumentar custa reprocessar mais vezes um evento
+   * que nunca vai passar; reduzir arrisca desistir de falha transitoria que se
+   * resolveria sozinha.
+   */
+  webhookMaxAttempts: number;
+  /**
    * URL do broker. `null` significa relay DESLIGADO — permitido apenas fora de
    * producao, para desenvolver sem RabbitMQ de pe.
    */
@@ -175,6 +188,21 @@ function parseMinutos(raw: string | undefined, nome: string, padrao: number): nu
     throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre 1 e 1440.`);
   }
   return minutos;
+}
+
+/**
+ * Mesmo idioma de parseTimeout e parseMinutos, INCLUSIVE na tolerancia do
+ * `Number()` a hexadecimal e exponencial. A divida registrada diz que os
+ * parsers irmaos endurecem juntos ou nenhum: corrigir so um cria divergencia
+ * silenciosa entre eles. Este e o terceiro da familia.
+ */
+function parseTentativas(raw: string | undefined, nome: string, padrao: number): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 100) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre 1 e 100.`);
+  }
+  return n;
 }
 
 function parsePort(raw: string): number {
@@ -340,6 +368,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       'PAYMENT_WINDOW_MINUTES',
       15,
     ),
+    webhookMaxAttempts: parseTentativas(source.WEBHOOK_MAX_ATTEMPTS, 'WEBHOOK_MAX_ATTEMPTS', 5),
     rabbitmqUrl: parseAmqpUrl(
       source.RABBITMQ_URL,
       nodeEnv,

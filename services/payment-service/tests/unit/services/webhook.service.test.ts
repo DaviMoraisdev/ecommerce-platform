@@ -124,6 +124,8 @@ function montar(
     outboxEvent: { create: outboxNoTx },
   };
 
+  let tentativas = 0;
+
   const prisma = {
     webhookEvent: {
       create: jest.fn(async () => ({ id: 'inbox_1' })),
@@ -131,6 +133,18 @@ function montar(
       updateMany: jest.fn(
         async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
           filtros.push(where);
+
+          // Modela o MINIMO do banco que o teto do Bloco 6c exige: `attempts` e
+          // um contador real e o filtro `gte` e avaliado sobre ele. Sem isto o
+          // duble devolveria count 1 para qualquer WHERE, a quarentena
+          // "aconteceria" sempre, e qualquer teste dos dois lados do teto
+          // provaria o duble em vez do servico.
+          const minimo = (where.attempts as { gte?: number } | undefined)?.gte;
+          if (typeof minimo === 'number' && tentativas < minimo) return { count: 0 };
+
+          const incremento = (data.attempts as { increment?: number } | undefined)?.increment;
+          if (typeof incremento === 'number') tentativas += incremento;
+
           inbox.push(data);
           return { count: 1 };
         },
@@ -150,7 +164,7 @@ function montar(
     }),
   } as unknown as PrismaClient;
 
-  return { service: new WebhookService({ prisma }), criadas, inbox, filtros, tx, outboxNoTx, outboxForaDaTx };
+  return { service: new WebhookService({ prisma, tetoDeTentativas: 5 }), criadas, inbox, filtros, tx, outboxNoTx, outboxForaDaTx };
 }
 
 describe('WebhookService — CAS perdido no reembolso (achado 4.1)', () => {

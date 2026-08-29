@@ -55,7 +55,7 @@ afterAll(async () => {
 
 function montarApp() {
   const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
-  const service = new WebhookService({ prisma });
+  const service = new WebhookService({ prisma, tetoDeTentativas: 5 });
   const app = createApp({
     // A rota de pagamento nao participa destes testes; um Router vazio evita
     // arrastar PaymentService, orderClient e config para ca.
