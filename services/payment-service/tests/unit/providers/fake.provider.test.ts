@@ -27,7 +27,7 @@ function entradaDeCobranca(overrides: Partial<CreateChargeInput> = {}): CreateCh
     currency: 'BRL',
     paymentMethodToken: FAKE_TOKENS.SUCCESS,
     idempotencyKey: randomUUID(),
-    reference: { paymentId: randomUUID(), orderId: randomUUID() },
+    reference: { paymentId: randomUUID(), orderId: randomUUID(), attemptCount: 1 },
     ...overrides,
   };
 }
@@ -42,10 +42,12 @@ rodarContratoDeProvedor({
     recusado: FAKE_TOKENS.DECLINED_INSUFFICIENT_FUNDS,
     desconhecido: 'tok_que_nao_existe',
     erroTransiente: FAKE_TOKENS.ERROR_UNAVAILABLE,
+    timeoutAposCobranca: FAKE_TOKENS.TIMEOUT_AFTER_CHARGE,
   },
   capacidades: {
     falhaTransiente: true,
     transicaoAssincrona: true,
+    falhaAmbigua: true,
   },
   assinarWebhook: (provider: PaymentProvider, input) =>
     (provider as FakeProvider).construirWebhook({
@@ -141,7 +143,7 @@ describe('FakeProvider — mapeamento de erro tecnico', () => {
   it('erro tecnico NAO consome a chave de idempotencia — retentar pode suceder', async () => {
     const provider = criarFake();
     const idempotencyKey = randomUUID();
-    const reference = { paymentId: randomUUID(), orderId: randomUUID() };
+    const reference = { paymentId: randomUUID(), orderId: randomUUID(), attemptCount: 1 };
 
     await expect(
       provider.createCharge(

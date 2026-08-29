@@ -66,6 +66,15 @@ export interface KitDeContrato {
     desconhecido: string;
     /** Exigido quando capacidades.falhaTransiente e true. */
     erroTransiente?: string;
+    /**
+     * Exigido quando capacidades.falhaAmbigua e true.
+     *
+     * Token que CRIA a cobranca no provedor e SO ENTAO falha, simulando a
+     * resposta perdida. E o unico cenario que o job de reconciliacao existe
+     * para resolver, e um duble que nunca cria a cobranca nao consegue
+     * representa-lo.
+     */
+    timeoutAposCobranca?: string;
   };
 
   /**
@@ -89,6 +98,11 @@ export interface KitDeContrato {
     falhaTransiente: boolean;
     /** false quando nao ha como avancar PROCESSING -> SUCCEEDED sob controle. */
     transicaoAssincrona: boolean;
+    /**
+     * false quando nao ha como simular "cobranca criada e resposta perdida".
+     * Provedor real pode nao oferecer gatilho deterministico para isso.
+     */
+    falhaAmbigua: boolean;
   };
 
   /** Exigido quando capacidades.transicaoAssincrona e true. */
@@ -109,7 +123,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         currency: 'BRL',
         paymentMethodToken: kit.tokens.sucesso,
         idempotencyKey: randomUUID(),
-        reference: { paymentId: randomUUID(), orderId: randomUUID() },
+        reference: { paymentId: randomUUID(), orderId: randomUUID(), attemptCount: 1 },
         ...overrides,
       };
     }
@@ -123,6 +137,75 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       if (kit.capacidades.transicaoAssincrona) {
         expect(typeof kit.simularSucesso).toBe('function');
       }
+      if (kit.capacidades.falhaAmbigua) {
+        expect(typeof kit.tokens.timeoutAposCobranca).toBe('string');
+      }
+    });
+
+    describe('buscarCobrancaPorTentativa', () => {
+      it('devolve null quando o provedor nunca recebeu a cobranca', async () => {
+        // null NAO e erro. E a informacao que autoriza o job a liberar a chave:
+        // a chamada nunca chegou, entao refazer a tentativa nao duplica dinheiro.
+        await expect(
+          provider.buscarCobrancaPorTentativa(randomUUID(), 1),
+        ).resolves.toBeNull();
+      });
+
+      it('encontra a cobranca criada, pela correlacao enviada no createCharge', async () => {
+        const paymentId = randomUUID();
+        const criada = await provider.createCharge(
+          entrada({ reference: { paymentId, orderId: randomUUID(), attemptCount: 1 } }),
+        );
+
+        const achada = await provider.buscarCobrancaPorTentativa(paymentId, 1);
+
+        expect(achada).not.toBeNull();
+        expect(achada?.providerRef).toBe(criada.providerRef);
+      });
+
+      it('distingue TENTATIVAS diferentes do mesmo pagamento', async () => {
+        // A janela de retentativa faz o MESMO Payment cobrar varias vezes. Uma
+        // busca so por paymentId devolveria varias e obrigaria o job a escolher
+        // qual e a dele — decisao que ninguem quer tomar com dinheiro no meio.
+        const paymentId = randomUUID();
+        const orderId = randomUUID();
+        const primeira = await provider.createCharge(
+          entrada({ reference: { paymentId, orderId, attemptCount: 1 } }),
+        );
+        const segunda = await provider.createCharge(
+          entrada({ reference: { paymentId, orderId, attemptCount: 2 } }),
+        );
+
+        expect(primeira.providerRef).not.toBe(segunda.providerRef);
+        expect((await provider.buscarCobrancaPorTentativa(paymentId, 1))?.providerRef).toBe(
+          primeira.providerRef,
+        );
+        expect((await provider.buscarCobrancaPorTentativa(paymentId, 2))?.providerRef).toBe(
+          segunda.providerRef,
+        );
+      });
+
+      it('encontra a cobranca mesmo quando a RESPOSTA se perdeu', async () => {
+        // O caso que justifica o job inteiro: o provedor cobrou, a resposta nao
+        // voltou, e do nosso lado ficou uma tentativa PENDING sem providerRef.
+        // Se a busca nao encontrasse aqui, o job nao teria como distinguir
+        // "cobrou" de "nao cobrou" — e liberar a chave nesse estado e a receita
+        // da segunda cobranca.
+        if (!kit.capacidades.falhaAmbigua) return;
+        const paymentId = randomUUID();
+
+        await expect(
+          provider.createCharge(
+            entrada({
+              paymentMethodToken: kit.tokens.timeoutAposCobranca as string,
+              reference: { paymentId, orderId: randomUUID(), attemptCount: 1 },
+            }),
+          ),
+        ).rejects.toBeInstanceOf(PaymentProviderError);
+
+        const achada = await provider.buscarCobrancaPorTentativa(paymentId, 1);
+        expect(achada).not.toBeNull();
+      });
     });
 
     describe('createCharge', () => {

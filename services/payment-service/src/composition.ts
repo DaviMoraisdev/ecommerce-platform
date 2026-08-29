@@ -19,15 +19,27 @@ import { WebhookService } from './services/webhook.service';
  * getPrisma() aqui encontra o cliente ja conectado. Se a ordem fosse invertida,
  * ele lancaria com mensagem explicita em vez de falhar na primeira consulta.
  */
-export function construirApp(config: AppConfig): Express {
+/**
+ * Pecas que o HTTP e o job de reconciliacao COMPARTILHAM.
+ *
+ * Extraido no Bloco 6b, e o motivo nao e estetico: o FakeProvider guarda as
+ * cobrancas em MEMORIA. Duas instancias fariam o job nao enxergar o que o
+ * caminho HTTP cobrou, e todo teste de ponta a ponta passaria a mentir. Com a
+ * Stripe o defeito seria invisivel — o que e pior, porque so apareceria no
+ * ambiente onde custa caro.
+ */
+export interface NucleoDoServico {
+  provider: ReturnType<typeof criarPaymentProvider>;
+  service: PaymentService;
+}
+
+export function montarNucleo(config: AppConfig): NucleoDoServico {
   const prisma = getPrisma();
   const provider = criarPaymentProvider(config);
-
   const orderClient = new OrderClient({
     baseUrl: config.orderServiceUrl,
     timeoutMs: config.orderServiceTimeoutMs,
   });
-
   const service = new PaymentService({
     prisma,
     orderClient,
@@ -35,6 +47,13 @@ export function construirApp(config: AppConfig): Express {
     currency: config.defaultCurrency,
     windowMinutes: config.paymentWindowMinutes,
   });
+  return { provider, service };
+}
+
+/** `nucleo` opcional: quem ja montou o compartilhado passa o MESMO objeto. */
+export function construirApp(config: AppConfig, nucleo?: NucleoDoServico): Express {
+  const prisma = getPrisma();
+  const { provider, service } = nucleo ?? montarNucleo(config);
 
   const router = criarPaymentRouter({
     authMiddleware: criarAuthMiddleware(config.jwtSecret),

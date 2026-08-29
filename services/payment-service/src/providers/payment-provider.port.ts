@@ -72,10 +72,20 @@ export interface CreateChargeInput {
    */
   idempotencyKey: string;
 
-  /** Correlacao para reconciliacao e triagem. Nunca usada como segredo. */
+  /**
+   * Correlacao para reconciliacao e triagem. Nunca usada como segredo.
+   *
+   * `attemptCount` entrou no Bloco 6b: a janela de retentativa faz o MESMO
+   * Payment cobrar varias vezes, uma por tentativa. Sem ele, uma busca por
+   * paymentId devolveria varias cobrancas e o job teria de escolher qual e a
+   * dele — decisao que ninguem quer tomar com dinheiro no meio. Com ele, a
+   * correlacao e unica por construcao, igual a chave derivada
+   * `paymentId:attemptCount` que ja usamos como idempotencyKey.
+   */
   reference: {
     paymentId: string;
     orderId: string;
+    attemptCount: number;
   };
 }
 
@@ -307,6 +317,55 @@ export interface PaymentProvider {
   createCharge(input: CreateChargeInput): Promise<ChargeResult>;
 
   getCharge(providerRef: ProviderRef): Promise<ChargeSnapshot>;
+
+  /**
+   * Consulta por CORRELACAO, para o job de reconciliacao (Bloco 6b).
+   *
+   * Existe porque os dois caminhos que o repositorio documentava sao becos:
+   * `getCharge` exige providerRef, que e NULL justamente no caso travado; e
+   * repetir `createCharge` exige o paymentMethodToken, que nao guardamos por
+   * PCI. O que sobra e a correlacao que ja enviamos em todo createCharge.
+   *
+   * `null` NAO e erro — e a informacao mais valiosa que o job pode receber:
+   * significa que a chamada nunca chegou ao provedor, e a tentativa pode ser
+   * refeita sem risco de segunda cobranca.
+   *
+   * Falha tecnica (provedor fora do ar) LANCA. Confundir "nao existe" com "nao
+   * consegui perguntar" faria o job liberar uma chave cuja cobranca existe —
+   * segunda cobranca pela porta dos fundos.
+   */
+  buscarCobrancaPorTentativa(
+    paymentId: string,
+    attemptCount: number,
+  ): Promise<ChargeSnapshot | null>;
+
+  /**
+   * O `null` de `buscarCobrancaPorTentativa` significa ausencia DEFINITIVA?
+   *
+   * Achado 3.1 do review do PR #57. O job so pode LIBERAR uma tentativa presa
+   * quando a ausencia prova que a cobranca nunca existiu. Num provedor cuja
+   * consulta e eventualmente consistente, `null` tambem significa "cobrou, mas
+   * ainda nao aparece" — e liberar ali produz SEGUNDA COBRANCA, exatamente o
+   * que o job existe para evitar.
+   *
+   * Esta e uma PRE-CONDICAO DE ATIVACAO imposta pelo codigo, no mesmo modelo da
+   * flag do consumer do Bloco 5b: com `false`, a ausencia vira TRIAGEM e o
+   * pagamento continua preso e visivel — que e o estado seguro. Documentar nao
+   * protegeria; a declaracao protege.
+   *
+   * CRITERIO (corrigido na 2a rodada de review do PR #57): consistencia
+   * read-after-write NAO basta. Ela garante visibilidade depois que uma escrita
+   * TERMINOU, e nao diz nada sobre uma cobranca que ainda VAI ser criada — uma
+   * requisicao em voo, ou aceita pelo provedor e ainda nao materializada. Nesse
+   * caso o `null` e verdadeiro no instante da leitura e falso um segundo depois.
+   *
+   * Um adapter so pode declarar `true` se o provedor garantir que "nao
+   * encontrado" e TERMINAL para aquela correlacao: nenhuma operacao com ela
+   * pode mais ser criada nem concluida depois do instante da consulta. A janela
+   * de retentativa e condicao NECESSARIA, nunca suficiente — ela torna o
+   * cenario improvavel, nao impossivel. Na duvida, `false`.
+   */
+  readonly ausenciaEDefinitiva: boolean;
 
   cancelCharge(input: CancelChargeInput): Promise<ChargeSnapshot>;
 

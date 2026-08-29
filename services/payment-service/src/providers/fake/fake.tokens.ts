@@ -17,6 +17,17 @@ export const FAKE_TOKENS = {
   DECLINED_FRAUD: 'tok_fake_declined_fraud',
 
   ERROR_UNAVAILABLE: 'tok_fake_error_unavailable',
+  /**
+   * CRIA a cobranca e SO ENTAO falha, simulando a resposta perdida.
+   *
+   * Os demais tokens de erro NAO criam nada — a decisao esta comentada no
+   * createCharge: "a chave nao e consumida, entao retentar deve poder suceder".
+   * Segura e correta para aquele caso, mas ela tornava o duble incapaz de
+   * representar o cenario AMBIGUO: o dinheiro se moveu e a resposta se perdeu.
+   * Sem este token, qualquer teste do job de reconciliacao seria teatro,
+   * porque nao existiria cobranca original para reconciliar.
+   */
+  TIMEOUT_AFTER_CHARGE: 'tok_fake_timeout_after_charge',
   ERROR_INVALID: 'tok_fake_error_invalid',
   ERROR_AUTHENTICATION: 'tok_fake_error_authentication',
 } as const;
@@ -31,7 +42,9 @@ export type FakeBehavior =
   | { kind: 'succeed' }
   | { kind: 'processing' }
   | { kind: 'decline'; code: string; message: string }
-  | { kind: 'error'; error: 'unavailable' | 'invalid' | 'authentication' };
+  | { kind: 'error'; error: 'unavailable' | 'invalid' | 'authentication' }
+  /** Cobranca criada e resposta perdida: o unico caso ambiguo de verdade. */
+  | { kind: 'timeout_apos_cobranca' };
 
 const COMPORTAMENTOS: Record<FakeToken, FakeBehavior> = {
   [FAKE_TOKENS.SUCCESS]: { kind: 'succeed' },
@@ -54,6 +67,7 @@ const COMPORTAMENTOS: Record<FakeToken, FakeBehavior> = {
   },
 
   [FAKE_TOKENS.ERROR_UNAVAILABLE]: { kind: 'error', error: 'unavailable' },
+  [FAKE_TOKENS.TIMEOUT_AFTER_CHARGE]: { kind: 'timeout_apos_cobranca' },
   [FAKE_TOKENS.ERROR_INVALID]: { kind: 'error', error: 'invalid' },
   [FAKE_TOKENS.ERROR_AUTHENTICATION]: { kind: 'error', error: 'authentication' },
 };
