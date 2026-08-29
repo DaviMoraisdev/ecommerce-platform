@@ -129,6 +129,64 @@ describe('buscarTentativasPresas', () => {
 
     expect(encontradas.map((t) => t.id)).not.toContain(tentativa.id);
   });
+
+  it('CASO J8: paginacao keyset real — desempate por id e continuacao pelo cursor', async () => {
+    // O CASO S8 injeta as paginas por duble: ele prova a LOGICA do laco, nunca
+    // o SQL. Duas linhas com o MESMO createdAt sao o unico jeito de exercitar o
+    // desempate por id — sem ele, duas linhas empatadas podem trocar de posicao
+    // entre paginas e uma delas nunca ser lida.
+    const a = await tentativaPresa(FAKE_TOKENS.TIMEOUT_AFTER_CHARGE);
+    const b = await tentativaPresa(FAKE_TOKENS.TIMEOUT_AFTER_CHARGE);
+
+    const nascimento = new Date(Date.now() - 60 * 60 * 1000);
+    await prisma.paymentTransaction.updateMany({
+      where: { id: { in: [a.tentativa.id, b.tentativa.id] } },
+      data: { createdAt: nascimento },
+    });
+
+    const limite = new Date(Date.now() - 15 * 60 * 1000);
+    const [menor, maior] = [a.tentativa.id, b.tentativa.id].sort();
+
+    const pagina1 = await buscarTentativasPresas(limite, 1);
+    expect(pagina1.map((t) => t.id)).toEqual([menor]);
+
+    const pagina2 = await buscarTentativasPresas(limite, 1, { createdAt: nascimento, id: menor });
+    expect(pagina2.map((t) => t.id)).toEqual([maior]);
+
+    const pagina3 = await buscarTentativasPresas(limite, 1, { createdAt: nascimento, id: maior });
+    expect(pagina3).toEqual([]);
+  });
+
+  it('CASO J9: linha do cursor que deixa de ser candidata NAO perde a pagina seguinte', async () => {
+    // Razao de ter recusado o `cursor` nativo do Prisma: ele localiza a linha do
+    // cursor por id para descobrir a posicao. Se ela deixou de casar o WHERE —
+    // e aqui ela deixa, porque foi resolvida entre uma pagina e outra — a
+    // pagina seguinte fica indefinida. A comparacao por chave depende so de
+    // VALORES, entao a linha nem precisa existir mais.
+    const a = await tentativaPresa(FAKE_TOKENS.TIMEOUT_AFTER_CHARGE);
+    const b = await tentativaPresa(FAKE_TOKENS.TIMEOUT_AFTER_CHARGE);
+
+    const nascimento = new Date(Date.now() - 60 * 60 * 1000);
+    await prisma.paymentTransaction.updateMany({
+      where: { id: { in: [a.tentativa.id, b.tentativa.id] } },
+      data: { createdAt: nascimento },
+    });
+
+    const limite = new Date(Date.now() - 15 * 60 * 1000);
+    const [menor, maior] = [a.tentativa.id, b.tentativa.id].sort();
+    const dona = a.tentativa.id === menor ? a : b;
+
+    const snapshot = await dona.provider.buscarCobrancaPorTentativa(
+      dona.payment.id,
+      dona.payment.attemptCount,
+    );
+    const acao = decidirReconciliacao(snapshot, dona.provider.ausenciaEDefinitiva);
+    if (acao.tipo !== 'aplicar') throw new Error('esperado aplicar');
+    await dona.service.aplicarDesfechoDeReconciliacao(menor, acao.resultado);
+
+    const seguinte = await buscarTentativasPresas(limite, 1, { createdAt: nascimento, id: menor });
+    expect(seguinte.map((t) => t.id)).toEqual([maior]);
+  });
 });
 
 describe('reconciliacao de tentativa presa', () => {
