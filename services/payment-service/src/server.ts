@@ -70,7 +70,11 @@ bootstrap({
             idadeMinutos: config.webhookQuarantineMinutes,
           }),
       },
-    ]);
+    ], {
+      pollIntervalMs: config.jobsPollIntervalMs,
+      stopTimeoutMs: config.jobsStopTimeoutMs,
+      varreduraTimeoutMs: config.jobsVarreduraTimeoutMs,
+    });
   },
 })
   .then((server) => {

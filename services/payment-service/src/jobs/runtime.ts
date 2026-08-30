@@ -1,57 +1,63 @@
-function inteiroNaFaixa(raw: string | undefined, padrao: number, min: number, max: number): number {
-  const n = Number(raw);
-  return Number.isInteger(n) && n >= min && n <= max ? n : padrao;
-}
-
-/**
- * Intervalo MUITO maior que o do relay, de proposito.
- *
- * O relay corre atras de eventos que devem sair rapido. Estas varreduras correm
- * atras de coisas que ja esperaram a janela inteira — varrer a cada segundo so
- * produziria consulta ao banco e chamada ao provedor sem ganho nenhum, e
- * chamada ao provedor tem custo real e limite de taxa.
- *
- * Os NOMES das variaveis continuam RECONCILIACAO_* de proposito: renomear
- * quebraria .env em uso para ganhar so estetica.
- */
-const POLL_INTERVAL_MS = inteiroNaFaixa(process.env.RECONCILIACAO_POLL_INTERVAL_MS, 60_000, 1_000, 3_600_000);
-const STOP_TIMEOUT_MS = inteiroNaFaixa(process.env.RECONCILIACAO_STOP_TIMEOUT_MS, 5_000, 1, 60_000);
-
 /** Uma varredura periodica. O nome existe para o log dizer QUAL delas falhou. */
 export interface Varredura {
   nome: string;
   executar: () => Promise<unknown>;
 }
 
+export interface OpcoesDosJobs {
+  pollIntervalMs: number;
+  stopTimeoutMs: number;
+  /** Prazo de UMA varredura. Ver `comPrazo`. */
+  varreduraTimeoutMs: number;
+}
+
 let timer: NodeJS.Timeout | null = null;
 let cicloAtual: Promise<unknown> | null = null;
 let iniciado = false;
 let parado = false;
+let tetoDeParada = 5_000;
 
 /**
- * Um timer para TODAS as varreduras de manutencao (Bloco 6c).
+ * Prazo para uma promessa.
  *
- * Antes isto rodava so a reconciliacao. A alternativa ao generalizar seria um
- * segundo runtime para o inbox — o que duplicaria start, stop com teto e guarda
- * de parada, codigo que JA e divida por nao ter teste de ciclo de vida.
- * Duplicar codigo nao testado e pior que generaliza-lo.
+ * NAO cancela o trabalho subjacente — uma consulta pendente no driver continua
+ * pendente. O objetivo e outro: devolver o controle ao LACO. Sem isto, uma
+ * varredura que nunca resolve (e por isso nunca rejeita, entao nenhum catch a
+ * pega) segura o `await` do ciclo, o proximo timer jamais e agendado, e TODAS
+ * as varreduras param — inclusive as saudaveis. Achado 4.3 da 2a rodada de
+ * review do PR #58.
  */
+async function comPrazo<T>(promessa: Promise<T>, ms: number, nome: string): Promise<T> {
+  let id: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promessa,
+      new Promise<never>((_, rejeitar) => {
+        id = setTimeout(() => rejeitar(new Error(`excedeu o prazo de ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (id) clearTimeout(id);
+  }
+}
+
 /**
- * Um ciclo: roda cada varredura em ordem, isolando falhas.
+ * Um ciclo: roda cada varredura em ordem, isolando falhas E lentidao.
  *
  * Exportada e sem timer de proposito. O ciclo de vida do job (timers, teto do
  * stop) e divida registrada por nao ter teste; este mecanismo e NOVO e nao
- * precisa herdar essa lacuna — como funcao pura de efeito, ele se testa sem
- * relogio nenhum.
+ * precisa herdar essa lacuna — como funcao de efeito com prazo explicito, ele
+ * se testa sem relogio falso.
  */
 export async function executarCiclo(
   varreduras: Varredura[],
-  parado: () => boolean,
+  parouDeRodar: () => boolean,
+  prazoMs: number,
 ): Promise<void> {
   for (const varredura of varreduras) {
-    if (parado()) return;
+    if (parouDeRodar()) return;
     try {
-      await varredura.executar();
+      await comPrazo(varredura.executar(), prazoMs, varredura.nome);
     } catch (erro) {
       // CATCH POR VARREDURA, nao ao redor do ciclo: com um catch so, uma falha
       // na reconciliacao deixaria o inbox sem varrer ate alguem reiniciar o
@@ -66,21 +72,40 @@ export async function executarCiclo(
   }
 }
 
-export function startJobs(varreduras: Varredura[]): void {
+/**
+ * Um timer para TODAS as varreduras de manutencao (Bloco 6c).
+ *
+ * Antes isto rodava so a reconciliacao. A alternativa ao generalizar seria um
+ * segundo runtime para o inbox — o que duplicaria start, stop com teto e guarda
+ * de parada, codigo que JA e divida por nao ter teste de ciclo de vida.
+ * Duplicar codigo nao testado e pior que generaliza-lo.
+ *
+ * Os intervalos vem do AppConfig, e nao de process.env lido no import: eles
+ * participam do invariante entre janela, quarentena e poll (achado 4.2), e
+ * validacao central exige valor central.
+ */
+export function startJobs(varreduras: Varredura[], opcoes: OpcoesDosJobs): void {
   if (iniciado) return;
   iniciado = true;
   parado = false;
+  tetoDeParada = opcoes.stopTimeoutMs;
 
   const loop = async (): Promise<void> => {
     if (parado) return;
-    cicloAtual = executarCiclo(varreduras, () => parado);
+    cicloAtual = executarCiclo(varreduras, () => parado, opcoes.varreduraTimeoutMs);
     await cicloAtual;
     cicloAtual = null;
-    if (!parado) timer = setTimeout(() => void loop(), POLL_INTERVAL_MS);
+    if (!parado) timer = setTimeout(() => void loop(), opcoes.pollIntervalMs);
   };
 
   console.log(
-    '[jobs] ' + String(varreduras.length) + ' varredura(s), intervalo ' + POLL_INTERVAL_MS + 'ms',
+    '[jobs] ' +
+      String(varreduras.length) +
+      ' varredura(s), intervalo ' +
+      String(opcoes.pollIntervalMs) +
+      'ms, prazo ' +
+      String(opcoes.varreduraTimeoutMs) +
+      'ms',
   );
   void loop();
 }
@@ -100,9 +125,9 @@ export async function stopJobs(): Promise<void> {
     let idDoTeto: NodeJS.Timeout | undefined;
     const teto = new Promise<void>((resolve) => {
       idDoTeto = setTimeout(() => {
-        console.warn('[jobs] ciclo nao terminou em ' + STOP_TIMEOUT_MS + 'ms; seguindo o shutdown');
+        console.warn('[jobs] ciclo nao terminou em ' + tetoDeParada + 'ms; seguindo o shutdown');
         resolve();
-      }, STOP_TIMEOUT_MS);
+      }, tetoDeParada);
     });
     try {
       await Promise.race([cicloAtual.catch(() => undefined), teto]);

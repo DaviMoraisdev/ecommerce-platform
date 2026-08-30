@@ -21,6 +21,7 @@ describe('executarCiclo', () => {
         { nome: 'inbox', executar: inbox },
       ],
       () => false,
+      1_000,
     );
 
     expect(inbox).toHaveBeenCalledTimes(1);
@@ -43,8 +44,28 @@ describe('executarCiclo', () => {
         { nome: 'segunda', executar: segunda },
       ],
       () => parado,
+      1_000,
     );
 
     expect(segunda).not.toHaveBeenCalled();
+  });
+
+  it('CASO N6: varredura PENDURADA nao impede a seguinte nem o proximo ciclo', async () => {
+    // O catch so pega REJEICAO. Uma promessa que nunca resolve nao rejeita:
+    // sem prazo, ela segura o `await` do ciclo para sempre, o proximo timer
+    // nunca e agendado e todas as varreduras param — inclusive as saudaveis.
+    // Achado 4.3 da 2a rodada de review do PR #58.
+    const inbox = jest.fn(async () => undefined);
+    await executarCiclo(
+      [
+        { nome: 'reconciliacao', executar: () => new Promise(() => undefined) },
+        { nome: 'inbox', executar: inbox },
+      ],
+      () => false,
+      20,
+    );
+
+    expect(inbox).toHaveBeenCalledTimes(1);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('excedeu o prazo'));
   });
 });
