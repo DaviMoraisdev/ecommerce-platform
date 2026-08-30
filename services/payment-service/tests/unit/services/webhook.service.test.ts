@@ -271,6 +271,51 @@ describe('WebhookService — teto de tentativas (Bloco 6c)', () => {
   });
 });
 
+describe('WebhookService — quarentena por idade (Bloco 6c)', () => {
+  /** Sem transacao => providerRef ainda desconhecido => desfecho retentavel. */
+  function retentavel(recebidoEm: Date) {
+    return montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
+      [],
+      undefined,
+      null,
+      0,
+      recebidoEm,
+    );
+  }
+
+  it('CASO T3: evento retentavel ha tempo demais vai para QUARANTINED', async () => {
+    // Esta populacao NAO passa pelo catch, entao `attempts` nunca sobe e o teto
+    // nunca a alcanca (achado 4.5 do Bloco 4). Sem limite por idade ela gira ate
+    // o provedor desistir sozinho, e nada do nosso lado registra que desistimos.
+    const { service, inbox } = retentavel(new Date(Date.now() - 120 * 60_000));
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.status).toBe(WebhookStatus.QUARANTINED);
+    expect(resultado.retentavel).toBeUndefined();
+
+    const quarentena = inbox.find((d) => d.status === WebhookStatus.QUARANTINED);
+    expect(String(quarentena?.lastError)).toContain('inaplicavel ha mais de 60 minutos');
+    // O motivo ORIGINAL sobrevive: sem ele, a triagem sabe que desistimos e nao
+    // sabe de que.
+    expect(String(quarentena?.lastError)).toContain('providerRef ainda desconhecido');
+  });
+
+  it('CASO T4: evento retentavel RECENTE continua retentavel', async () => {
+    // Contraparte do T3. O evento chega antes de o providerRef ser gravado —
+    // situacao normal e frequente. Quarentenar aqui descartaria uma captura que
+    // seria aplicada segundos depois, e quarentena e terminal.
+    const { service, inbox } = retentavel(new Date());
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.retentavel).toBe(true);
+    expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+    expect(inbox.find((d) => d.status === WebhookStatus.QUARANTINED)).toBeUndefined();
+  });
+});
+
 describe('WebhookService — falha durante a aplicacao (achado 6.4)', () => {
   it('marca FAILED com mensagem sanitizada, incrementa attempts e propaga o erro', async () => {
     // A rota traduz a excecao em 500, e o provedor retenta. O caminho de falha
