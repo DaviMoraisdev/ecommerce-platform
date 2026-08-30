@@ -483,13 +483,42 @@ describe('loadConfig — WEBHOOK_QUARANTINE_MINUTES (Bloco 6c)', () => {
     ).toThrow(/deve ser MAIOR/);
   });
 
-  it('aceita um minuto acima da janela', () => {
+  it('aceita um minuto acima da janela MAIS o intervalo do job', () => {
+    // Com o poll default de 60_000ms, o minimo e janela + 1. O achado 4.2 da 2a
+    // rodada mostrou que exigir so "acima da janela" deixava passar quarentena
+    // que dispara antes de o job ter qualquer chance de agir.
     const config = loadConfig({
       ...base,
       PAYMENT_WINDOW_MINUTES: '60',
-      WEBHOOK_QUARANTINE_MINUTES: '61',
+      WEBHOOK_QUARANTINE_MINUTES: '62',
     });
-    expect(config.webhookQuarantineMinutes).toBe(61);
+    expect(config.webhookQuarantineMinutes).toBe(62);
+  });
+
+  it('RECUSA quando a folga cobre a janela mas nao o intervalo do job', () => {
+    // Janela 60 + poll de 10 minutos: quarentenar em 65 e quarentenar antes do
+    // proximo ciclo da reconciliacao. Passava no boot antes da correcao.
+    expect(() =>
+      loadConfig({
+        ...base,
+        PAYMENT_WINDOW_MINUTES: '60',
+        WEBHOOK_QUARANTINE_MINUTES: '65',
+        RECONCILIACAO_POLL_INTERVAL_MS: '600000',
+      }),
+    ).toThrow(/intervalo do job/);
+  });
+
+  it('o intervalo do job entra na conta arredondando PARA CIMA', () => {
+    // 90_000ms nao sao "1 minuto e meio" para efeito de garantia: um ciclo pode
+    // demorar os 90s inteiros, entao o minimo seguro usa 2 minutos.
+    expect(() =>
+      loadConfig({
+        ...base,
+        PAYMENT_WINDOW_MINUTES: '10',
+        WEBHOOK_QUARANTINE_MINUTES: '12',
+        RECONCILIACAO_POLL_INTERVAL_MS: '90000',
+      }),
+    ).toThrow(/intervalo do job/);
   });
 
   it('o teto e MAIOR que o da janela — senao uma janela de 1440 travaria o boot', () => {
@@ -501,5 +530,55 @@ describe('loadConfig — WEBHOOK_QUARANTINE_MINUTES (Bloco 6c)', () => {
       WEBHOOK_QUARANTINE_MINUTES: '2880',
     });
     expect(config.webhookQuarantineMinutes).toBe(2880);
+  });
+});
+
+describe('loadConfig — WEBHOOK_MAX_ATTEMPTS (Bloco 6c)', () => {
+  // Achado 6.4 da 2a rodada: `parseTentativas` nasceu sem teste nenhum.
+  it('usa 5 quando ausente', () => {
+    expect(loadConfig(base).webhookMaxAttempts).toBe(5);
+  });
+
+  it('usa 5 quando vazia', () => {
+    expect(loadConfig({ ...base, WEBHOOK_MAX_ATTEMPTS: '   ' }).webhookMaxAttempts).toBe(5);
+  });
+
+  it.each(['1', '5', '100'])('aceita o limite %p', (valor) => {
+    expect(loadConfig({ ...base, WEBHOOK_MAX_ATTEMPTS: valor }).webhookMaxAttempts).toBe(
+      Number(valor),
+    );
+  });
+
+  it.each(['0', '-1', '101', '1.5', 'abc', '5,5'])('recusa %p', (valor) => {
+    expect(() => loadConfig({ ...base, WEBHOOK_MAX_ATTEMPTS: valor })).toThrow(
+      /WEBHOOK_MAX_ATTEMPTS/,
+    );
+  });
+
+  it('TOLERA hexadecimal, como os parsers irmaos', () => {
+    // Documentado, nao desejado — e a mesma tolerancia de parseTimeout e
+    // parseMinutos. A divida diz que os quatro endurecem juntos ou nenhum.
+    expect(loadConfig({ ...base, WEBHOOK_MAX_ATTEMPTS: '0x10' }).webhookMaxAttempts).toBe(16);
+  });
+});
+
+describe('loadConfig — knobs do runtime de jobs (Bloco 6c)', () => {
+  it('usa os defaults quando ausentes', () => {
+    const config = loadConfig(base);
+    expect(config.jobsPollIntervalMs).toBe(60_000);
+    expect(config.jobsStopTimeoutMs).toBe(5_000);
+    expect(config.jobsVarreduraTimeoutMs).toBe(120_000);
+  });
+
+  it('recusa poll fora da faixa', () => {
+    expect(() => loadConfig({ ...base, RECONCILIACAO_POLL_INTERVAL_MS: '999' })).toThrow(
+      /RECONCILIACAO_POLL_INTERVAL_MS/,
+    );
+  });
+
+  it('recusa prazo de varredura fora da faixa', () => {
+    expect(() => loadConfig({ ...base, JOBS_VARREDURA_TIMEOUT_MS: '600001' })).toThrow(
+      /JOBS_VARREDURA_TIMEOUT_MS/,
+    );
   });
 });

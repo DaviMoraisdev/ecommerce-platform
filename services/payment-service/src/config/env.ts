@@ -54,6 +54,22 @@ export interface AppConfig {
    */
   webhookQuarantineMinutes: number;
   /**
+   * Intervalo entre ciclos das varreduras de manutencao (reconciliacao e
+   * inbox). Sai de `process.env` solto e entra aqui porque PARTICIPA de um
+   * invariante entre campos — ver a validacao no `loadConfig`. Achado 4.2 da
+   * 2a rodada de review do PR #58: sem ele, quarentena 2 min + poll 60 min era
+   * configuracao valida e quarentenava antes de o job ter QUALQUER chance.
+   */
+  jobsPollIntervalMs: number;
+  /** Quanto o shutdown espera o ciclo em voo antes de seguir. */
+  jobsStopTimeoutMs: number;
+  /**
+   * Prazo de UMA varredura. Achado 4.3: sem prazo, uma varredura que nunca
+   * resolve (nao rejeita) segura o `await` do ciclo, o proximo timer nunca e
+   * agendado, e TODAS as varreduras param — inclusive as que estao saudaveis.
+   */
+  jobsVarreduraTimeoutMs: number;
+  /**
    * URL do broker. `null` significa relay DESLIGADO — permitido apenas fora de
    * producao, para desenvolver sem RabbitMQ de pe.
    */
@@ -237,6 +253,21 @@ function parseMinutosLongos(raw: string | undefined, nome: string, padrao: numbe
   return minutos;
 }
 
+function parseMs(
+  raw: string | undefined,
+  nome: string,
+  padrao: number,
+  min: number,
+  max: number,
+): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const ms = Number(raw);
+  if (!Number.isInteger(ms) || ms < min || ms > max) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre ${min} e ${max}.`);
+  }
+  return ms;
+}
+
 function parsePort(raw: string): number {
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -387,13 +418,46 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     60,
   );
 
+  // Os NOMES continuam RECONCILIACAO_* de proposito: renomear quebraria .env em
+  // uso para ganhar so estetica.
+  const jobsPollIntervalMs = parseMs(
+    source.RECONCILIACAO_POLL_INTERVAL_MS,
+    'RECONCILIACAO_POLL_INTERVAL_MS',
+    60_000,
+    1_000,
+    3_600_000,
+  );
+  const jobsStopTimeoutMs = parseMs(
+    source.RECONCILIACAO_STOP_TIMEOUT_MS,
+    'RECONCILIACAO_STOP_TIMEOUT_MS',
+    5_000,
+    1,
+    60_000,
+  );
+  const jobsVarreduraTimeoutMs = parseMs(
+    source.JOBS_VARREDURA_TIMEOUT_MS,
+    'JOBS_VARREDURA_TIMEOUT_MS',
+    120_000,
+    1_000,
+    600_000,
+  );
+
   // Invariante ENTRE campos, por isso nao cabe em nenhum parser isolado.
-  if (webhookQuarantineMinutes <= paymentWindowMinutes) {
+  //
+  // CORRIGIDO no achado 4.2 da 2a rodada de review do PR #58: a versao anterior
+  // exigia apenas quarentena > janela, argumentando que o job de reconciliacao
+  // destrava o evento. Mas o job so roda a cada ciclo, e o intervalo era lido
+  // de process.env sem participar de validacao nenhuma — janela 1 min,
+  // quarentena 2 min e poll 60 min passavam no boot e quarentenavam o evento
+  // antes de o job ter QUALQUER chance de agir. A quarentena e terminal.
+  const minutosDePoll = Math.ceil(jobsPollIntervalMs / 60_000);
+  if (webhookQuarantineMinutes <= paymentWindowMinutes + minutosDePoll) {
     throw new ConfigError(
       `WEBHOOK_QUARANTINE_MINUTES (${webhookQuarantineMinutes}) deve ser MAIOR que ` +
-        `PAYMENT_WINDOW_MINUTES (${paymentWindowMinutes}): quem destrava um evento ` +
-        'inaplicavel e o job de reconciliacao, que so age depois da janela. Um ' +
-        'limite menor quarentenaria eventos que seriam resolvidos.',
+        `PAYMENT_WINDOW_MINUTES (${paymentWindowMinutes}) mais o intervalo do job ` +
+        `(${minutosDePoll} min): quem destrava um evento inaplicavel e a reconciliacao, ` +
+        'e ela so age depois da janela E no proximo ciclo. Um limite menor quarentena ' +
+        'eventos que seriam resolvidos, e a quarentena e terminal.',
     );
   }
 
@@ -419,6 +483,9 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     paymentWindowMinutes,
     webhookQuarantineMinutes,
     webhookMaxAttempts: parseTentativas(source.WEBHOOK_MAX_ATTEMPTS, 'WEBHOOK_MAX_ATTEMPTS', 5),
+    jobsPollIntervalMs,
+    jobsStopTimeoutMs,
+    jobsVarreduraTimeoutMs,
     rabbitmqUrl: parseAmqpUrl(
       source.RABBITMQ_URL,
       nodeEnv,
