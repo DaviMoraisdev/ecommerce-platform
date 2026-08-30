@@ -22,7 +22,7 @@ import { fetchPending, markRetry, markSent } from './events/outbox.repository';
 /**
  * O nucleo e montado UMA vez e compartilhado entre o HTTP e o job.
  *
- * Memoizado porque o bootstrap chama iniciarRelay, iniciarReconciliacao e
+ * Memoizado porque o bootstrap chama iniciarRelay, iniciarJobs e
  * createApp em momentos diferentes — todos DEPOIS do connectDatabase, entao o
  * getPrisma() la dentro encontra o cliente conectado. Duas instancias fariam o
  * job nao enxergar as cobrancas do caminho HTTP quando o provedor for o fake.
@@ -53,7 +53,7 @@ bootstrap({
       markRetry,
     });
   },
-  iniciarReconciliacao: (config) => {
+  iniciarJobs: (config) => {
     const { provider, service } = obterNucleo(config);
     startJobs([
       {
@@ -83,7 +83,7 @@ bootstrap({
         new Promise<void>((resolve, reject) => {
           server.close((erro) => (erro ? reject(erro) : resolve()));
         }),
-      pararReconciliacao: stopJobs,
+      pararJobs: stopJobs,
       pararRelay: stopOutboxRelay,
       fecharPublisher: closeEventPublisher,
       desconectarBanco: disconnectDatabase,

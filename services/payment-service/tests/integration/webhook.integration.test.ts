@@ -1176,3 +1176,59 @@ describe('webhook — corrida da varredura (Bloco 6c)', () => {
     expect((await lido(intacta.id)).status).toBe(WebhookStatus.QUARANTINED);
   });
 });
+
+describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
+  it('CASO 24: evento inaplicavel ha tempo demais vira quarentena e responde 200', async () => {
+    // Achado 4.4 da 2a rodada: o CASO 20 comeca com a linha JA em quarentena,
+    // entao provava duplicata terminal, nao a TRANSICAO. O objetivo central do
+    // bloco e responder 200 no momento em que desistimos — sem isso o provedor
+    // continua reentregando um evento que ja abandonamos.
+    const { app, provider } = montarApp();
+    const eventoId = `evt_${randomUUID()}`;
+
+    // Chegou ha duas horas e nunca pode ser aplicado: nao ha transacao com
+    // aquele providerRef, entao o desfecho e `retentavel` a cada reentrega.
+    await prisma.webhookEvent.create({
+      data: {
+        provider: 'fake',
+        providerEventId: eventoId,
+        eventType: 'payment.succeeded',
+        payload: {},
+        providerCreatedAt: new Date(),
+        status: WebhookStatus.RECEIVED,
+        receivedAt: new Date(Date.now() - 120 * 60_000),
+      },
+    });
+
+    const res = await postar(app, provider.assinarCorpo(corpo({ id: eventoId })));
+    expect(res.status).toBe(200);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.QUARANTINED);
+    expect(linha.processedAt).not.toBeNull();
+    expect(String(linha.lastError)).toContain('inaplicavel ha mais de 60 minutos');
+
+    // 200 porque DESISTIMOS, nao porque aplicamos: nenhum efeito financeiro.
+    expect(await prisma.paymentTransaction.count()).toBe(0);
+    expect(await prisma.outboxEvent.count()).toBe(0);
+  });
+
+  it('CASO 25: evento RECENTE e inaplicavel continua devolvendo 503', async () => {
+    // Contraparte do 24, e o caso frequente: o webhook chega antes de o
+    // providerRef ser gravado. Responder 200 aqui encerraria para sempre uma
+    // captura que seria aplicada segundos depois.
+    const { app, provider } = montarApp();
+    const eventoId = `evt_${randomUUID()}`;
+
+    const res = await postar(app, provider.assinarCorpo(corpo({ id: eventoId })));
+    expect(res.status).toBe(503);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.RECEIVED);
+    expect(linha.processedAt).toBeNull();
+  });
+});
