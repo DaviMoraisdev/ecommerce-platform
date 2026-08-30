@@ -1,7 +1,10 @@
 import { bootstrap } from './bootstrap';
 import { construirApp, montarNucleo, type NucleoDoServico } from './composition';
 import { montarDepsDeReconciliacao } from './jobs/reconciliacao.deps';
-import { startReconciliacao, stopReconciliacao } from './jobs/reconciliacao.runtime';
+import { criarVarredura } from './jobs/reconciliacao';
+import { tickInbox } from './jobs/inbox';
+import { quarentenarOrfaos } from './jobs/inbox.repository';
+import { startJobs, stopJobs } from './jobs/runtime';
 import type { AppConfig } from './config/env';
 import { loadConfig } from './config/env';
 import { connectDatabase, disconnectDatabase } from './config/database';
@@ -52,9 +55,22 @@ bootstrap({
   },
   iniciarReconciliacao: (config) => {
     const { provider, service } = obterNucleo(config);
-    startReconciliacao(
-      montarDepsDeReconciliacao(provider, service, config.paymentWindowMinutes),
-    );
+    startJobs([
+      {
+        nome: 'reconciliacao',
+        executar: criarVarredura(
+          montarDepsDeReconciliacao(provider, service, config.paymentWindowMinutes),
+        ),
+      },
+      {
+        nome: 'inbox',
+        executar: () =>
+          tickInbox({
+            quarentenarOrfaos,
+            idadeMinutos: config.webhookQuarantineMinutes,
+          }),
+      },
+    ]);
   },
 })
   .then((server) => {
@@ -63,7 +79,7 @@ bootstrap({
         new Promise<void>((resolve, reject) => {
           server.close((erro) => (erro ? reject(erro) : resolve()));
         }),
-      pararReconciliacao: stopReconciliacao,
+      pararReconciliacao: stopJobs,
       pararRelay: stopOutboxRelay,
       fecharPublisher: closeEventPublisher,
       desconectarBanco: disconnectDatabase,
