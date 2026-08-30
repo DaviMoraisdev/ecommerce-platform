@@ -15,6 +15,7 @@ import { connectDatabase, disconnectDatabase } from '../../src/config/database';
 import { FakeProvider } from '../../src/providers/fake/fake.provider';
 import type { WebhookRequest } from '../../src/providers/payment-provider.port';
 import { criarWebhookRouter } from '../../src/routes/webhook.routes';
+import { quarentenarOrfaos } from '../../src/jobs/inbox.repository';
 import { WebhookService } from '../../src/services/webhook.service';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { assertTestDatabase } from '../helpers/testDbGuard';
@@ -1040,5 +1041,88 @@ describe('webhook — quarentena (Bloco 6c)', () => {
     });
     expect(linha.status).toBe(WebhookStatus.QUARANTINED);
     expect(linha.attempts).toBe(5);
+  });
+});
+
+describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
+  it('CASO 21: quarentena o que ficou sem conclusao e nao toca no recente nem no concluido', async () => {
+    // O caminho sincrono so age quando uma reentrega CHEGA. Se o provedor
+    // desistir, ou se o processo cair entre gravar a linha e aplicar o efeito,
+    // ninguem mais volta nessa linha — e ela some da vista.
+    const comum = {
+      provider: 'fake',
+      eventType: 'payment.succeeded',
+      payload: {},
+      providerCreatedAt: new Date(),
+    };
+    const velho = new Date(Date.now() - 120 * 60_000);
+
+    const orfao = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: velho },
+    });
+    const falhado = await prisma.webhookEvent.create({
+      data: {
+        ...comum,
+        providerEventId: `evt_${randomUUID()}`,
+        status: WebhookStatus.FAILED,
+        attempts: 2,
+        lastError: 'causa real da falha',
+        receivedAt: velho,
+      },
+    });
+    const recente = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: new Date() },
+    });
+    const concluido = await prisma.webhookEvent.create({
+      data: {
+        ...comum,
+        providerEventId: `evt_${randomUUID()}`,
+        status: WebhookStatus.PROCESSED,
+        receivedAt: velho,
+        processedAt: velho,
+      },
+    });
+
+    const total = await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 100);
+    expect(total).toBe(2);
+
+    const lido = (id: string) => prisma.webhookEvent.findUniqueOrThrow({ where: { id } });
+
+    expect((await lido(orfao.id)).status).toBe(WebhookStatus.QUARANTINED);
+
+    const f = await lido(falhado.id);
+    expect(f.status).toBe(WebhookStatus.QUARANTINED);
+    expect(f.processedAt).not.toBeNull();
+    // lastError PRESERVADO: nas linhas FAILED ele guarda a causa real, que e o
+    // que a triagem precisa. Sobrescrever destruiria o unico diagnostico.
+    expect(f.lastError).toBe('causa real da falha');
+
+    // Recente ainda pode ser resolvido por uma reentrega; concluido e terminal.
+    expect((await lido(recente.id)).status).toBe(WebhookStatus.RECEIVED);
+    expect((await lido(concluido.id)).status).toBe(WebhookStatus.PROCESSED);
+  });
+
+  it('CASO 22: o lote limita quantas linhas cada ciclo trata', async () => {
+    // Sem limite, um acumulo de orfaos viraria um UPDATE gigante segurando
+    // linhas do inbox durante o ciclo inteiro.
+    const velho = new Date(Date.now() - 120 * 60_000);
+    for (let i = 0; i < 3; i += 1) {
+      await prisma.webhookEvent.create({
+        data: {
+          provider: 'fake',
+          providerEventId: `evt_${randomUUID()}`,
+          eventType: 'payment.succeeded',
+          payload: {},
+          providerCreatedAt: new Date(),
+          status: WebhookStatus.RECEIVED,
+          receivedAt: velho,
+        },
+      });
+    }
+
+    expect(await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 2)).toBe(2);
+    // O ciclo seguinte pega o resto: a linha tratada SAI do conjunto, entao o
+    // lote limitado progride por construcao — nao ha starvation aqui.
+    expect(await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 2)).toBe(1);
   });
 });

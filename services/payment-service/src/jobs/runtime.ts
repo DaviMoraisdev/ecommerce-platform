@@ -36,33 +36,44 @@ let parado = false;
  * de parada, codigo que JA e divida por nao ter teste de ciclo de vida.
  * Duplicar codigo nao testado e pior que generaliza-lo.
  */
+/**
+ * Um ciclo: roda cada varredura em ordem, isolando falhas.
+ *
+ * Exportada e sem timer de proposito. O ciclo de vida do job (timers, teto do
+ * stop) e divida registrada por nao ter teste; este mecanismo e NOVO e nao
+ * precisa herdar essa lacuna — como funcao pura de efeito, ele se testa sem
+ * relogio nenhum.
+ */
+export async function executarCiclo(
+  varreduras: Varredura[],
+  parado: () => boolean,
+): Promise<void> {
+  for (const varredura of varreduras) {
+    if (parado()) return;
+    try {
+      await varredura.executar();
+    } catch (erro) {
+      // CATCH POR VARREDURA, nao ao redor do ciclo: com um catch so, uma falha
+      // na reconciliacao deixaria o inbox sem varrer ate alguem reiniciar o
+      // servico — e vice-versa. As duas sao independentes.
+      console.error(
+        '[jobs] varredura ' +
+          varredura.nome +
+          ' falhou: ' +
+          (erro instanceof Error ? erro.message : String(erro)),
+      );
+    }
+  }
+}
+
 export function startJobs(varreduras: Varredura[]): void {
   if (iniciado) return;
   iniciado = true;
   parado = false;
 
-  const ciclo = async (): Promise<void> => {
-    for (const varredura of varreduras) {
-      if (parado) return;
-      try {
-        await varredura.executar();
-      } catch (erro) {
-        // CATCH POR VARREDURA, nao ao redor do ciclo: com um catch so, uma
-        // falha na reconciliacao deixaria o inbox sem varrer ate alguem
-        // reiniciar o servico — e vice-versa. Sao independentes.
-        console.error(
-          '[jobs] varredura ' +
-            varredura.nome +
-            ' falhou: ' +
-            (erro instanceof Error ? erro.message : String(erro)),
-        );
-      }
-    }
-  };
-
   const loop = async (): Promise<void> => {
     if (parado) return;
-    cicloAtual = ciclo();
+    cicloAtual = executarCiclo(varreduras, () => parado);
     await cicloAtual;
     cicloAtual = null;
     if (!parado) timer = setTimeout(() => void loop(), POLL_INTERVAL_MS);
