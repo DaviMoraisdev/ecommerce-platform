@@ -1,4 +1,4 @@
-import { WebhookStatus } from '@prisma/client';
+import { WebhookStatus, type PrismaClient } from '@prisma/client';
 import { getPrisma } from '../config/database';
 
 /**
@@ -19,11 +19,20 @@ import { getPrisma } from '../config/database';
  * e exatamente o que a triagem precisa. O que a varredura registra e o par
  * (status QUARANTINED, processedAt). Para distinguir quem quarentenou:
  * `attempts >= teto` veio do teto; abaixo dele, veio da idade ou desta varredura.
+ *
+ * O cliente e PARAMETRO (com o global como default) pelo mesmo motivo que
+ * PaymentService e WebhookService o recebem: injecao, nao gancho de teste. E o
+ * que permite ao CASO 23 entrelacar uma conclusao entre as duas consultas —
+ * exatamente a corrida que a reavaliacao de estado abaixo protege.
  */
-export async function quarentenarOrfaos(limite: Date, lote: number): Promise<number> {
+export async function quarentenarOrfaos(
+  limite: Date,
+  lote: number,
+  prisma: PrismaClient = getPrisma(),
+): Promise<number> {
   const emAberto = { status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] } };
 
-  const orfaos = await getPrisma().webhookEvent.findMany({
+  const orfaos = await prisma.webhookEvent.findMany({
     where: { ...emAberto, receivedAt: { lt: limite } },
     orderBy: { receivedAt: 'asc' },
     take: lote,
@@ -31,7 +40,7 @@ export async function quarentenarOrfaos(limite: Date, lote: number): Promise<num
   });
   if (orfaos.length === 0) return 0;
 
-  const { count } = await getPrisma().webhookEvent.updateMany({
+  const { count } = await prisma.webhookEvent.updateMany({
     where: {
       id: { in: orfaos.map((o) => o.id) },
       // Reavalia o estado: entre a leitura e a escrita uma reentrega pode ter

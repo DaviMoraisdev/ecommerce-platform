@@ -410,20 +410,24 @@ export class WebhookService {
       });
 
       // Colisao NAO e resposta final. PROCESSED/IGNORED foi decidido: duplicata real.
-      // QUARANTINED entra aqui, e NAO no ramo de reprocessamento abaixo, por um
-      // motivo que custa dinheiro se invertido: as guardas do `catch` e do
-      // `encerrar` filtram `status in (RECEIVED, FAILED)`. Se uma reentrega
-      // reprocessasse uma linha em quarentena, o efeito financeiro seria
-      // aplicado e o desfecho NAO conseguiria ser gravado — a linha continuaria
-      // QUARANTINED e a reentrega seguinte aplicaria de novo.
+      // A lista e dos estados ABERTOS, nao dos terminais — e a inversao e a
+      // correcao, nao estilo. Enumerar terminais faz qualquer estado FUTURO
+      // herdar o caminho de REPROCESSAMENTO por omissao, que foi exatamente
+      // como QUARANTINED nasceu perigoso: as guardas do `catch` e do `encerrar`
+      // filtram `status in (RECEIVED, FAILED)`, entao uma reentrega que
+      // reprocessasse uma linha terminal aplicaria o efeito financeiro SEM
+      // conseguir gravar o desfecho — a linha ficaria como estava e a reentrega
+      // seguinte aplicaria DE NOVO. Captura dupla, silenciosa.
       //
-      // Quarentena e TERMINAL para o fluxo automatico. Sair dela e acao humana:
-      // voltar a linha para RECEIVED depois de resolver a causa.
-      if (
-        existente.status === WebhookStatus.PROCESSED ||
-        existente.status === WebhookStatus.IGNORED ||
-        existente.status === WebhookStatus.QUARANTINED
-      ) {
+      // Com a lista invertida, um valor de enum que ESTA versao nao conhece e
+      // tratado como terminal: fail-closed por construcao. Achado 4.1 da 2a
+      // rodada de review do PR #58.
+      //
+      // Sair de um estado terminal e acao humana: voltar a linha para RECEIVED
+      // depois de resolver a causa.
+      const aberto =
+        existente.status === WebhookStatus.RECEIVED || existente.status === WebhookStatus.FAILED;
+      if (!aberto) {
         return { duplicata: existente.status };
       }
 

@@ -1126,3 +1126,53 @@ describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
     expect(await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 2)).toBe(1);
   });
 });
+
+describe('webhook — corrida da varredura (Bloco 6c)', () => {
+  it('CASO 23: linha concluida ENTRE a selecao e a escrita nao e sobrescrita', async () => {
+    // A sabotagem A-8 mostrou que a reavaliacao de estado no updateMany nao
+    // tinha teste: remove-la nao derrubava nada. Ela protege a janela entre o
+    // findMany e o updateMany — uma reentrega pode concluir a linha ali no meio.
+    // Sem a guarda, a varredura sobrescreveria um PROCESSED com QUARANTINED:
+    // trilha mentindo que desistimos de um evento que foi aplicado.
+    const comum = {
+      provider: 'fake',
+      eventType: 'payment.succeeded',
+      payload: {},
+      providerCreatedAt: new Date(),
+    };
+    const velho = new Date(Date.now() - 120 * 60_000);
+
+    const concluidaNoMeio = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: velho },
+    });
+    const intacta = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: velho },
+    });
+
+    // Cliente que conclui uma das linhas DEPOIS do findMany e ANTES do
+    // updateMany. E o entrelacamento real, nao uma simulacao de duble.
+    const entrelacado = {
+      webhookEvent: {
+        findMany: async (args: Parameters<typeof prisma.webhookEvent.findMany>[0]) => {
+          const selecionadas = await prisma.webhookEvent.findMany(args);
+          await prisma.webhookEvent.update({
+            where: { id: concluidaNoMeio.id },
+            data: { status: WebhookStatus.PROCESSED, processedAt: new Date() },
+          });
+          return selecionadas;
+        },
+        updateMany: (args: Parameters<typeof prisma.webhookEvent.updateMany>[0]) =>
+          prisma.webhookEvent.updateMany(args),
+      },
+    } as unknown as PrismaClient;
+
+    const total = await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 100, entrelacado);
+
+    // Apenas a que continuava aberta foi quarentenada.
+    expect(total).toBe(1);
+
+    const lido = (id: string) => prisma.webhookEvent.findUniqueOrThrow({ where: { id } });
+    expect((await lido(concluidaNoMeio.id)).status).toBe(WebhookStatus.PROCESSED);
+    expect((await lido(intacta.id)).status).toBe(WebhookStatus.QUARANTINED);
+  });
+});
