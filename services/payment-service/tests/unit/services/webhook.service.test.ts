@@ -103,6 +103,8 @@ function montar(
   transacao: PaymentTransaction | null = autorizacao(),
   /** Tentativas JA registradas na linha. Serve para posicionar o teto do 6c. */
   tentativasIniciais = 0,
+  /** Quando a linha do inbox foi recebida. Posiciona a quarentena por idade. */
+  recebidoEm: Date = new Date(),
 ) {
   const criadas: Criada[] = [];
   const inbox: Record<string, unknown>[] = [];
@@ -144,6 +146,12 @@ function montar(
           const minimo = (where.attempts as { gte?: number } | undefined)?.gte;
           if (typeof minimo === 'number' && tentativas < minimo) return { count: 0 };
 
+          // Mesma razao do contador acima: sem modelar `receivedAt`, o duble
+          // devolveria count 1 e a quarentena por idade "aconteceria" sempre,
+          // inclusive sobre linha recem-criada.
+          const antesDe = (where.receivedAt as { lt?: Date } | undefined)?.lt;
+          if (antesDe instanceof Date && recebidoEm >= antesDe) return { count: 0 };
+
           const incremento = (data.attempts as { increment?: number } | undefined)?.increment;
           if (typeof incremento === 'number') tentativas += incremento;
 
@@ -166,7 +174,7 @@ function montar(
     }),
   } as unknown as PrismaClient;
 
-  return { service: new WebhookService({ prisma, tetoDeTentativas: 5 }), criadas, inbox, filtros, tx, outboxNoTx, outboxForaDaTx };
+  return { service: new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 }), criadas, inbox, filtros, tx, outboxNoTx, outboxForaDaTx };
 }
 
 describe('WebhookService — CAS perdido no reembolso (achado 4.1)', () => {

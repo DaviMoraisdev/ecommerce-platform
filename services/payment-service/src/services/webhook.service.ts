@@ -17,6 +17,8 @@ export interface WebhookServiceDeps {
   prisma: PrismaClient;
   /** Ver AppConfig.webhookMaxAttempts. Sem default: o teto e decisao, nao detalhe. */
   tetoDeTentativas: number;
+  /** Ver AppConfig.webhookQuarantineMinutes. */
+  idadeMaximaMinutos: number;
 }
 
 export interface ResultadoDeWebhook {
@@ -252,7 +254,13 @@ export class WebhookService {
     if ('duplicata' in registro) return { status: registro.duplicata };
 
     try {
-      return await this.decidirEAplicar(registro.id, evento);
+      const resultado = await this.decidirEAplicar(registro.id, evento);
+      if (resultado.retentavel !== true) return resultado;
+
+      // A populacao `retentavel` nao passa pelo catch, entao `attempts` nunca
+      // sobe e o teto nunca a alcanca. Ela e limitada por IDADE.
+      const porIdade = await this.quarentenarPorIdade(registro.id, resultado.motivo);
+      return porIdade ?? resultado;
     } catch (erro) {
       // GUARDA DE CONCORRENCIA (achado 4.1 da 2a rodada): so marca FAILED se a
       // linha ainda NAO foi concluida. Sem isto, uma execucao que falha
@@ -281,6 +289,44 @@ export class WebhookService {
 
       throw erro;
     }
+  }
+
+  /**
+   * Quarentena por IDADE (Bloco 6c).
+   *
+   * Um desfecho `retentavel` devolve 5xx e o provedor reentrega, mas NAO
+   * incrementa `attempts` (achado 4.5 do Bloco 4: essa coluna conta tentativas
+   * que falharam com excecao, e so o catch a move). Sem limite por idade essa
+   * populacao gira ate o provedor desistir sozinho, e nada do nosso lado
+   * registra que desistimos.
+   *
+   * Mesmo idioma do teto: a condicao vive no WHERE, entao a comparacao de tempo
+   * e feita pelo banco sobre a linha real, e o `count` diz se houve transicao.
+   * Preserva a guarda de estado, que impede sobrescrever linha ja concluida por
+   * execucao concorrente.
+   */
+  private async quarentenarPorIdade(
+    registroId: string,
+    motivoOriginal?: string,
+  ): Promise<ResultadoDeWebhook | null> {
+    const limite = new Date(Date.now() - this.deps.idadeMaximaMinutos * 60_000);
+    const motivo = `inaplicavel ha mais de ${this.deps.idadeMaximaMinutos} minutos`;
+
+    const emQuarentena = await this.deps.prisma.webhookEvent.updateMany({
+      where: {
+        id: registroId,
+        status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+        receivedAt: { lt: limite },
+      },
+      data: {
+        status: WebhookStatus.QUARANTINED,
+        processedAt: new Date(),
+        lastError: (motivoOriginal ? `${motivo} | ${motivoOriginal}` : motivo).slice(0, 500),
+      },
+    });
+    if (emQuarentena.count === 0) return null;
+
+    return { status: WebhookStatus.QUARANTINED, motivo };
   }
 
   /**

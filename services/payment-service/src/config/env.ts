@@ -40,6 +40,20 @@ export interface AppConfig {
    */
   webhookMaxAttempts: number;
   /**
+   * Idade a partir da qual um evento AINDA inaplicavel vai para QUARANTINED
+   * (Bloco 6c). Atende a populacao que o teto NAO alcanca: o desfecho
+   * `retentavel` (hoje, providerRef ainda desconhecido) devolve 5xx sem
+   * incrementar `attempts`, de proposito — para ele a pergunta e "ha quanto
+   * tempo esta inaplicavel", nao "quantas vezes falhou".
+   *
+   * ACOPLAMENTO com paymentWindowMinutes, validado no boot: quem destrava essa
+   * populacao e o job de reconciliacao do Bloco 6b, preenchendo o providerRef
+   * da tentativa presa — e ele so age sobre tentativas mais velhas que a
+   * janela. Um limite menor ou igual a janela quarentenaria eventos que o job
+   * resolveria minutos depois.
+   */
+  webhookQuarantineMinutes: number;
+  /**
    * URL do broker. `null` significa relay DESLIGADO — permitido apenas fora de
    * producao, para desenvolver sem RabbitMQ de pe.
    */
@@ -205,6 +219,24 @@ function parseTentativas(raw: string | undefined, nome: string, padrao: number):
   return n;
 }
 
+/**
+ * Familia de parseMinutos, com teto MAIOR: 7 dias.
+ *
+ * O teto de 1440 da janela de pagamento existe porque ela prende estoque
+ * reservado. A quarentena nao prende nada — ela so decide quando paramos de
+ * tentar aplicar um evento, e dias sao horizonte legitimo. Com o mesmo teto nos
+ * dois, uma janela de 1440 tornaria o boot IMPOSSIVEL: nao existiria valor de
+ * quarentena maior que ela, e a validacao cruzada recusaria qualquer config.
+ */
+function parseMinutosLongos(raw: string | undefined, nome: string, padrao: number): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const minutos = Number(raw);
+  if (!Number.isInteger(minutos) || minutos < 1 || minutos > 10_080) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre 1 e 10080.`);
+  }
+  return minutos;
+}
+
 function parsePort(raw: string): number {
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -344,6 +376,27 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   const jwtSecret = requireEnv('JWT_SECRET', source);
   assertSegredoForte('JWT_SECRET', jwtSecret, nodeEnv);
 
+  const paymentWindowMinutes = parseMinutos(
+    source.PAYMENT_WINDOW_MINUTES,
+    'PAYMENT_WINDOW_MINUTES',
+    15,
+  );
+  const webhookQuarantineMinutes = parseMinutosLongos(
+    source.WEBHOOK_QUARANTINE_MINUTES,
+    'WEBHOOK_QUARANTINE_MINUTES',
+    60,
+  );
+
+  // Invariante ENTRE campos, por isso nao cabe em nenhum parser isolado.
+  if (webhookQuarantineMinutes <= paymentWindowMinutes) {
+    throw new ConfigError(
+      `WEBHOOK_QUARANTINE_MINUTES (${webhookQuarantineMinutes}) deve ser MAIOR que ` +
+        `PAYMENT_WINDOW_MINUTES (${paymentWindowMinutes}): quem destrava um evento ` +
+        'inaplicavel e o job de reconciliacao, que so age depois da janela. Um ' +
+        'limite menor quarentenaria eventos que seriam resolvidos.',
+    );
+  }
+
   return {
     port: parsePort(requireEnv('PAYMENT_PORT', source)),
     databaseUrl: requireEnv('DATABASE_URL', source),
@@ -363,11 +416,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       'ORDER_SERVICE_TIMEOUT_MS',
       5000,
     ),
-    paymentWindowMinutes: parseMinutos(
-      source.PAYMENT_WINDOW_MINUTES,
-      'PAYMENT_WINDOW_MINUTES',
-      15,
-    ),
+    paymentWindowMinutes,
+    webhookQuarantineMinutes,
     webhookMaxAttempts: parseTentativas(source.WEBHOOK_MAX_ATTEMPTS, 'WEBHOOK_MAX_ATTEMPTS', 5),
     rabbitmqUrl: parseAmqpUrl(
       source.RABBITMQ_URL,

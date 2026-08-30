@@ -359,9 +359,15 @@ describe('loadConfig — PAYMENT_WINDOW_MINUTES', () => {
   });
 
   it.each(['1', '15', '30', '1440'])('aceita o limite %p', (valor) => {
-    expect(loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: valor }).paymentWindowMinutes).toBe(
-      Number(valor),
-    );
+    // WEBHOOK_QUARANTINE_MINUTES vai junto por causa da validacao cruzada do
+    // Bloco 6c: a quarentena tem de ser MAIOR que a janela, e o default de 60
+    // nao serve para uma janela de 1440.
+    const config = loadConfig({
+      ...base,
+      PAYMENT_WINDOW_MINUTES: valor,
+      WEBHOOK_QUARANTINE_MINUTES: '10080',
+    });
+    expect(config.paymentWindowMinutes).toBe(Number(valor));
   });
 
   it('tolera espaco ao redor', () => {
@@ -378,9 +384,12 @@ describe('loadConfig — PAYMENT_WINDOW_MINUTES', () => {
     // parseTimeout tem a MESMA tolerancia. Nao vale endurecer: hex num arquivo
     // .env nao e acidente plausivel, e um parser proprio so para isso seria
     // codigo a mais para manter. Se um dia recusarmos, e nos dois juntos.
-    expect(loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: valor }).paymentWindowMinutes).toBe(
-      esperado,
-    );
+    const config = loadConfig({
+      ...base,
+      PAYMENT_WINDOW_MINUTES: valor,
+      WEBHOOK_QUARANTINE_MINUTES: '10080',
+    });
+    expect(config.paymentWindowMinutes).toBe(esperado);
   });
 
   it('o teto de 1440 existe porque a janela prende estoque reservado', () => {
@@ -451,5 +460,46 @@ describe('loadConfig — RABBITMQ_URL', () => {
     // Mesma regra do testDbGuard: a URL contem a senha, entao nunca vai para
     // a mensagem de erro, que acaba em log.
     expect((capturado as Error).message).not.toContain('senha_supersecreta');
+  });
+});
+
+describe('loadConfig — WEBHOOK_QUARANTINE_MINUTES (Bloco 6c)', () => {
+  it('usa 60 quando ausente', () => {
+    expect(loadConfig(base).webhookQuarantineMinutes).toBe(60);
+  });
+
+  it.each(['0', '-1', 'abc', '1.5', '10081'])('recusa %p', (valor) => {
+    expect(() => loadConfig({ ...base, WEBHOOK_QUARANTINE_MINUTES: valor })).toThrow(
+      /WEBHOOK_QUARANTINE_MINUTES/,
+    );
+  });
+
+  it('RECUSA valor menor ou igual a janela de pagamento', () => {
+    // Quem destrava um evento inaplicavel e o job de reconciliacao do Bloco 6b,
+    // que so age sobre tentativas mais velhas que a janela. Quarentenar antes
+    // disso descarta eventos que seriam resolvidos — e a quarentena e terminal.
+    expect(() =>
+      loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: '60', WEBHOOK_QUARANTINE_MINUTES: '60' }),
+    ).toThrow(/deve ser MAIOR/);
+  });
+
+  it('aceita um minuto acima da janela', () => {
+    const config = loadConfig({
+      ...base,
+      PAYMENT_WINDOW_MINUTES: '60',
+      WEBHOOK_QUARANTINE_MINUTES: '61',
+    });
+    expect(config.webhookQuarantineMinutes).toBe(61);
+  });
+
+  it('o teto e MAIOR que o da janela — senao uma janela de 1440 travaria o boot', () => {
+    // Sem teto maior, nao existiria valor de quarentena valido para a janela
+    // maxima, e a validacao cruzada recusaria QUALQUER configuracao.
+    const config = loadConfig({
+      ...base,
+      PAYMENT_WINDOW_MINUTES: '1440',
+      WEBHOOK_QUARANTINE_MINUTES: '2880',
+    });
+    expect(config.webhookQuarantineMinutes).toBe(2880);
   });
 });

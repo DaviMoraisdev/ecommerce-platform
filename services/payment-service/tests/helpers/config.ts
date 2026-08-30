@@ -40,6 +40,7 @@ export function configDeTeste(overrides: Partial<AppConfig> = {}): AppConfig {
     orderServiceTimeoutMs: 5000,
     paymentWindowMinutes: 15,
     webhookMaxAttempts: 5,
+    webhookQuarantineMinutes: 60,
     rabbitmqUrl: URL_BROKER_DE_TESTE,
     ...overrides,
   };
