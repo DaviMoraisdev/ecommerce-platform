@@ -11,8 +11,16 @@ export interface OpcoesDosJobs {
   varreduraTimeoutMs: number;
 }
 
+/** Distingue "estourou o prazo" de "falhou" — o tratamento e diferente. */
+class PrazoExcedido extends Error {}
+
+function motivo(erro: unknown): string {
+  return erro instanceof Error ? erro.message : String(erro);
+}
+
 let timer: NodeJS.Timeout | null = null;
 let cicloAtual: Promise<unknown> | null = null;
+let executorAtual: ExecutorDeCiclo | null = null;
 let iniciado = false;
 let parado = false;
 let tetoDeParada = 5_000;
@@ -20,12 +28,14 @@ let tetoDeParada = 5_000;
 /**
  * Prazo para uma promessa.
  *
- * NAO cancela o trabalho subjacente — uma consulta pendente no driver continua
- * pendente. O objetivo e outro: devolver o controle ao LACO. Sem isto, uma
- * varredura que nunca resolve (e por isso nunca rejeita, entao nenhum catch a
- * pega) segura o `await` do ciclo, o proximo timer jamais e agendado, e TODAS
- * as varreduras param — inclusive as saudaveis. Achado 4.3 da 2a rodada de
- * review do PR #58.
+ * NAO cancela o trabalho subjacente — cancelamento real exigiria AbortSignal
+ * propagado ate o driver do banco e o cliente do provedor. O objetivo aqui e
+ * devolver o controle ao LACO: sem prazo, uma varredura que nunca resolve (e
+ * por isso nunca rejeita, entao nenhum catch a pega) segura o `await` do ciclo,
+ * o proximo timer jamais e agendado, e TODAS as varreduras param.
+ *
+ * Como o trabalho continua vivo, quem chama e obrigado a nao perde-lo de vista.
+ * Ver `criarExecutorDeCiclo`.
  */
 async function comPrazo<T>(promessa: Promise<T>, ms: number, nome: string): Promise<T> {
   let id: NodeJS.Timeout | undefined;
@@ -33,7 +43,7 @@ async function comPrazo<T>(promessa: Promise<T>, ms: number, nome: string): Prom
     return await Promise.race([
       promessa,
       new Promise<never>((_, rejeitar) => {
-        id = setTimeout(() => rejeitar(new Error(`excedeu o prazo de ${ms}ms`)), ms);
+        id = setTimeout(() => rejeitar(new PrazoExcedido(`excedeu o prazo de ${ms}ms`)), ms);
       }),
     ]);
   } finally {
@@ -41,35 +51,78 @@ async function comPrazo<T>(promessa: Promise<T>, ms: number, nome: string): Prom
   }
 }
 
+export interface ExecutorDeCiclo {
+  executar: (parouDeRodar: () => boolean) => Promise<void>;
+  /** Trabalhos que excederam o prazo e continuam vivos. Usado pelo shutdown. */
+  emVoo: () => Promise<unknown>[];
+}
+
 /**
- * Um ciclo: roda cada varredura em ordem, isolando falhas E lentidao.
+ * Executor com SINGLE-FLIGHT por varredura.
  *
- * Exportada e sem timer de proposito. O ciclo de vida do job (timers, teto do
- * stop) e divida registrada por nao ter teste; este mecanismo e NOVO e nao
- * precisa herdar essa lacuna — como funcao de efeito com prazo explicito, ele
- * se testa sem relogio falso.
+ * Corrige uma regressao introduzida pela propria correcao anterior (achado 4.1
+ * da 3a rodada de review do PR #58): o prazo devolvia o laco, mas abandonava a
+ * operacao. A original seguia viva, o ciclo seguinte iniciava OUTRA, e elas se
+ * acumulavam — conexoes, chamadas ao provedor e execucoes concorrentes da mesma
+ * varredura. Trocar travamento por vazamento nao e conserto.
+ *
+ * Agora, enquanto um trabalho nao assentar, a varredura dele e PULADA nos
+ * ciclos seguintes, e a promessa continua rastreada para o shutdown poder
+ * espera-la em vez de encerrar banco e relay por cima dela.
+ *
+ * O estado vive em FECHAMENTO, nao em modulo: dois executores no mesmo processo
+ * nao se contaminam, e o teste nao precisa de `jest.resetModules()`.
  */
-export async function executarCiclo(
-  varreduras: Varredura[],
-  parouDeRodar: () => boolean,
-  prazoMs: number,
-): Promise<void> {
-  for (const varredura of varreduras) {
-    if (parouDeRodar()) return;
-    try {
-      await comPrazo(varredura.executar(), prazoMs, varredura.nome);
-    } catch (erro) {
-      // CATCH POR VARREDURA, nao ao redor do ciclo: com um catch so, uma falha
-      // na reconciliacao deixaria o inbox sem varrer ate alguem reiniciar o
-      // servico — e vice-versa. As duas sao independentes.
-      console.error(
-        '[jobs] varredura ' +
-          varredura.nome +
-          ' falhou: ' +
-          (erro instanceof Error ? erro.message : String(erro)),
-      );
-    }
-  }
+export function criarExecutorDeCiclo(varreduras: Varredura[], prazoMs: number): ExecutorDeCiclo {
+  const emVoo = new Map<string, Promise<unknown>>();
+
+  return {
+    emVoo: () => Array.from(emVoo.values()),
+
+    executar: async (parouDeRodar: () => boolean): Promise<void> => {
+      for (const varredura of varreduras) {
+        if (parouDeRodar()) return;
+
+        if (emVoo.has(varredura.nome)) {
+          console.warn(
+            '[jobs] varredura ' + varredura.nome + ' ainda em voo do ciclo anterior; pulando',
+          );
+          continue;
+        }
+
+        const estado = { expirou: false };
+        const trabalho = varredura.executar();
+        emVoo.set(varredura.nome, trabalho);
+
+        void trabalho.then(
+          () => {
+            emVoo.delete(varredura.nome);
+          },
+          (erro: unknown) => {
+            emVoo.delete(varredura.nome);
+            // Rejeicao que chega DEPOIS do prazo nao tem mais ninguem
+            // esperando: sem este tratador ela viraria unhandled rejection e
+            // sumiria do log — justamente o caso que mais precisa aparecer.
+            if (estado.expirou) {
+              console.error(
+                '[jobs] varredura ' + varredura.nome + ' rejeitou APOS o prazo: ' + motivo(erro),
+              );
+            }
+          },
+        );
+
+        try {
+          await comPrazo(trabalho, prazoMs, varredura.nome);
+        } catch (erro) {
+          if (erro instanceof PrazoExcedido) estado.expirou = true;
+          // CATCH POR VARREDURA, nao ao redor do ciclo: com um catch so, uma
+          // falha na reconciliacao deixaria o inbox sem varrer ate alguem
+          // reiniciar o servico — e vice-versa. As duas sao independentes.
+          console.error('[jobs] varredura ' + varredura.nome + ' falhou: ' + motivo(erro));
+        }
+      }
+    },
+  };
 }
 
 /**
@@ -78,11 +131,9 @@ export async function executarCiclo(
  * Antes isto rodava so a reconciliacao. A alternativa ao generalizar seria um
  * segundo runtime para o inbox — o que duplicaria start, stop com teto e guarda
  * de parada, codigo que JA e divida por nao ter teste de ciclo de vida.
- * Duplicar codigo nao testado e pior que generaliza-lo.
  *
  * Os intervalos vem do AppConfig, e nao de process.env lido no import: eles
- * participam do invariante entre janela, quarentena e poll (achado 4.2), e
- * validacao central exige valor central.
+ * participam do invariante entre janela, quarentena e ciclo (achado 4.2).
  */
 export function startJobs(varreduras: Varredura[], opcoes: OpcoesDosJobs): void {
   if (iniciado) return;
@@ -90,9 +141,12 @@ export function startJobs(varreduras: Varredura[], opcoes: OpcoesDosJobs): void 
   parado = false;
   tetoDeParada = opcoes.stopTimeoutMs;
 
+  const executor = criarExecutorDeCiclo(varreduras, opcoes.varreduraTimeoutMs);
+  executorAtual = executor;
+
   const loop = async (): Promise<void> => {
     if (parado) return;
-    cicloAtual = executarCiclo(varreduras, () => parado, opcoes.varreduraTimeoutMs);
+    cicloAtual = executor.executar(() => parado);
     await cicloAtual;
     cicloAtual = null;
     if (!parado) timer = setTimeout(() => void loop(), opcoes.pollIntervalMs);
@@ -111,9 +165,12 @@ export function startJobs(varreduras: Varredura[], opcoes: OpcoesDosJobs): void 
 }
 
 /**
- * Para e AGUARDA o ciclo em voo, com teto. Cortar no meio de uma aplicacao de
- * desfecho nao perde dinheiro — o CAS garante que so uma execucao aplica —, mas
- * deixaria a tentativa presa por mais um intervalo sem necessidade.
+ * Para e AGUARDA o ciclo em voo, com teto.
+ *
+ * Espera tambem os trabalhos que EXCEDERAM o prazo e continuam vivos: sem isso,
+ * o shutdown fecharia banco e publisher por cima de uma varredura ainda em
+ * execucao (achado 4.1 da 3a rodada). O teto continua valendo — a garantia e
+ * "nao encerra por cima sem esperar", nao "espera para sempre".
  */
 export async function stopJobs(): Promise<void> {
   parado = true;
@@ -121,7 +178,12 @@ export async function stopJobs(): Promise<void> {
     clearTimeout(timer);
     timer = null;
   }
-  if (cicloAtual) {
+
+  const pendentes: Promise<unknown>[] = [];
+  if (cicloAtual) pendentes.push(cicloAtual);
+  if (executorAtual) pendentes.push(...executorAtual.emVoo());
+
+  if (pendentes.length > 0) {
     let idDoTeto: NodeJS.Timeout | undefined;
     const teto = new Promise<void>((resolve) => {
       idDoTeto = setTimeout(() => {
@@ -130,10 +192,15 @@ export async function stopJobs(): Promise<void> {
       }, tetoDeParada);
     });
     try {
-      await Promise.race([cicloAtual.catch(() => undefined), teto]);
+      await Promise.race([
+        Promise.all(pendentes.map((p) => p.catch(() => undefined))).then(() => undefined),
+        teto,
+      ]);
     } finally {
       if (idDoTeto) clearTimeout(idDoTeto);
     }
   }
+
+  executorAtual = null;
   iniciado = false;
 }
