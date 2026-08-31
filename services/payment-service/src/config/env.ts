@@ -76,6 +76,16 @@ export interface AppConfig {
   rabbitmqUrl: string | null;
 }
 
+/**
+ * Quantas varreduras o runtime roda por ciclo. Entra no invariante temporal
+ * porque o proximo ciclo so e agendado DEPOIS de todas elas, e cada uma pode
+ * consumir o prazo inteiro — achado 4.2 da 3a rodada de review do PR #58.
+ *
+ * O `server.ts` verifica que a lista real tem este tamanho: constante que
+ * silenciosamente diverge do codigo e pior que constante nenhuma.
+ */
+export const VARREDURAS_POR_CICLO = 2;
+
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -450,14 +460,24 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   // de process.env sem participar de validacao nenhuma — janela 1 min,
   // quarentena 2 min e poll 60 min passavam no boot e quarentenavam o evento
   // antes de o job ter QUALQUER chance de agir. A quarentena e terminal.
+  // Somar SO o intervalo ainda era otimista (achado 4.2 da 3a rodada): o
+  // proximo ciclo so e agendado depois que TODAS as varreduras terminam, e cada
+  // uma pode consumir o prazo inteiro. Janela 1, poll 1, quarentena 3 e prazo
+  // de 10 min passavam no boot — e a reentrega sincrona quarentenava o evento
+  // muito antes da proxima reconciliacao.
   const minutosDePoll = Math.ceil(jobsPollIntervalMs / 60_000);
-  if (webhookQuarantineMinutes <= paymentWindowMinutes + minutosDePoll) {
+  const minutosDeCiclo = Math.ceil((jobsVarreduraTimeoutMs * VARREDURAS_POR_CICLO) / 60_000);
+  const folgaMinima = paymentWindowMinutes + minutosDePoll + minutosDeCiclo;
+
+  if (webhookQuarantineMinutes <= folgaMinima) {
     throw new ConfigError(
       `WEBHOOK_QUARANTINE_MINUTES (${webhookQuarantineMinutes}) deve ser MAIOR que ` +
-        `PAYMENT_WINDOW_MINUTES (${paymentWindowMinutes}) mais o intervalo do job ` +
-        `(${minutosDePoll} min): quem destrava um evento inaplicavel e a reconciliacao, ` +
-        'e ela so age depois da janela E no proximo ciclo. Um limite menor quarentena ' +
-        'eventos que seriam resolvidos, e a quarentena e terminal.',
+        `${folgaMinima}: PAYMENT_WINDOW_MINUTES (${paymentWindowMinutes}) mais o ` +
+        `intervalo do job (${minutosDePoll} min) mais a duracao maxima de um ciclo ` +
+        `(${minutosDeCiclo} min). Quem destrava um evento inaplicavel e a reconciliacao, ` +
+        'e ela so age depois da janela E no ciclo seguinte, que so comeca quando todas ' +
+        'as varreduras terminarem. Um limite menor quarentena eventos que seriam ' +
+        'resolvidos, e a quarentena e terminal.',
     );
   }
 

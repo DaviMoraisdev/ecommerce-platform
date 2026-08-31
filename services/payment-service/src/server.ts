@@ -6,7 +6,7 @@ import { tickInbox } from './jobs/inbox';
 import { quarentenarOrfaos } from './jobs/inbox.repository';
 import { startJobs, stopJobs } from './jobs/runtime';
 import type { AppConfig } from './config/env';
-import { loadConfig } from './config/env';
+import { loadConfig, VARREDURAS_POR_CICLO } from './config/env';
 import { connectDatabase, disconnectDatabase } from './config/database';
 import { registrarEncerramento } from './shutdown';
 import { startOutboxRelay, stopOutboxRelay } from './events/outbox.relay';
@@ -55,7 +55,7 @@ bootstrap({
   },
   iniciarJobs: (config) => {
     const { provider, service } = obterNucleo(config);
-    startJobs([
+    const varreduras = [
       {
         nome: 'reconciliacao',
         executar: criarVarredura(
@@ -70,7 +70,19 @@ bootstrap({
             idadeMinutos: config.webhookQuarantineMinutes,
           }),
       },
-    ], {
+    ];
+
+    // A constante do invariante temporal (env.ts) precisa refletir a lista
+    // real. Divergencia silenciosa aqui deixaria o boot aceitar configuracao
+    // que quarentena antes de o job ter chance.
+    if (varreduras.length !== VARREDURAS_POR_CICLO) {
+      throw new Error(
+        `VARREDURAS_POR_CICLO (${VARREDURAS_POR_CICLO}) diverge das ${varreduras.length} ` +
+          'varreduras registradas; ajuste a constante em config/env.ts',
+      );
+    }
+
+    startJobs(varreduras, {
       pollIntervalMs: config.jobsPollIntervalMs,
       stopTimeoutMs: config.jobsStopTimeoutMs,
       varreduraTimeoutMs: config.jobsVarreduraTimeoutMs,

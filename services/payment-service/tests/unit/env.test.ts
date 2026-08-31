@@ -483,16 +483,30 @@ describe('loadConfig — WEBHOOK_QUARANTINE_MINUTES (Bloco 6c)', () => {
     ).toThrow(/deve ser MAIOR/);
   });
 
-  it('aceita um minuto acima da janela MAIS o intervalo do job', () => {
-    // Com o poll default de 60_000ms, o minimo e janela + 1. O achado 4.2 da 2a
-    // rodada mostrou que exigir so "acima da janela" deixava passar quarentena
-    // que dispara antes de o job ter qualquer chance de agir.
+  it('aceita acima da janela MAIS o intervalo MAIS a duracao do ciclo', () => {
+    // Defaults: poll 1 min, prazo 2 min por varredura x 2 varreduras = 4 min.
+    // Minimo para janela 60 e, portanto, 65 — o primeiro aceito e 66.
     const config = loadConfig({
       ...base,
       PAYMENT_WINDOW_MINUTES: '60',
-      WEBHOOK_QUARANTINE_MINUTES: '62',
+      WEBHOOK_QUARANTINE_MINUTES: '66',
     });
-    expect(config.webhookQuarantineMinutes).toBe(62);
+    expect(config.webhookQuarantineMinutes).toBe(66);
+  });
+
+  it('RECUSA quando a folga ignora a DURACAO do ciclo', () => {
+    // Achado 4.2 da 3a rodada, exatamente o cenario apontado: o proximo ciclo
+    // so e agendado depois que todas as varreduras terminam, e cada uma pode
+    // consumir o prazo inteiro. Com prazo de 10 min, o ciclo pode levar 20.
+    expect(() =>
+      loadConfig({
+        ...base,
+        PAYMENT_WINDOW_MINUTES: '1',
+        WEBHOOK_QUARANTINE_MINUTES: '3',
+        RECONCILIACAO_POLL_INTERVAL_MS: '60000',
+        JOBS_VARREDURA_TIMEOUT_MS: '600000',
+      }),
+    ).toThrow(/duracao maxima de um ciclo/);
   });
 
   it('RECUSA quando a folga cobre a janela mas nao o intervalo do job', () => {
