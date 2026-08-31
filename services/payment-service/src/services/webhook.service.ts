@@ -15,6 +15,10 @@ import type { WebhookEventPayload } from '../providers/payment-provider.port';
 
 export interface WebhookServiceDeps {
   prisma: PrismaClient;
+  /** Ver AppConfig.webhookMaxAttempts. Sem default: o teto e decisao, nao detalhe. */
+  tetoDeTentativas: number;
+  /** Ver AppConfig.webhookQuarantineMinutes. */
+  idadeMaximaMinutos: number;
 }
 
 export interface ResultadoDeWebhook {
@@ -250,14 +254,21 @@ export class WebhookService {
     if ('duplicata' in registro) return { status: registro.duplicata };
 
     try {
-      return await this.decidirEAplicar(registro.id, evento);
+      const resultado = await this.decidirEAplicar(registro.id, evento);
+      if (resultado.retentavel !== true) return resultado;
+
+      // A populacao `retentavel` nao passa pelo catch, entao `attempts` nunca
+      // sobe e o teto nunca a alcanca. Ela e limitada por IDADE.
+      const porIdade = await this.quarentenarPorIdade(registro.id, resultado.motivo);
+      return porIdade ?? resultado;
     } catch (erro) {
       // GUARDA DE CONCORRENCIA (achado 4.1 da 2a rodada): so marca FAILED se a
       // linha ainda NAO foi concluida. Sem isto, uma execucao que falha
       // sobrescreve como FAILED o PROCESSED que a execucao concorrente acabou de
       // gravar, e a reconciliacao passa a ver como pendente um evento aplicado.
       // Nao substitui o claim exclusivo (Bloco 6); remove o pior sintoma dele.
-      await this.deps.prisma.webhookEvent.updateMany({
+      const mensagem = mensagemSegura(erro);
+      const marcadas = await this.deps.prisma.webhookEvent.updateMany({
         where: {
           id: registro.id,
           status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
@@ -265,11 +276,106 @@ export class WebhookService {
         data: {
           status: WebhookStatus.FAILED,
           attempts: { increment: 1 },
-          lastError: mensagemSegura(erro),
+          lastError: mensagem,
         },
       });
+
+      // Nada marcado = execucao concorrente ja concluiu a linha. Nao ha teto a
+      // avaliar sobre uma contagem que nao foi nossa.
+      if (marcadas.count === 0) throw erro;
+
+      const quarentena = await this.quarentenarPorTeto(registro.id, mensagem);
+      if (quarentena !== null) return quarentena;
+
       throw erro;
     }
+  }
+
+  /**
+   * Quarentena por IDADE (Bloco 6c).
+   *
+   * Um desfecho `retentavel` devolve 5xx e o provedor reentrega, mas NAO
+   * incrementa `attempts` (achado 4.5 do Bloco 4: essa coluna conta tentativas
+   * que falharam com excecao, e so o catch a move). Sem limite por idade essa
+   * populacao gira ate o provedor desistir sozinho, e nada do nosso lado
+   * registra que desistimos.
+   *
+   * Mesmo idioma do teto: a condicao vive no WHERE, entao a comparacao de tempo
+   * e feita pelo banco sobre a linha real, e o `count` diz se houve transicao.
+   * Preserva a guarda de estado, que impede sobrescrever linha ja concluida por
+   * execucao concorrente.
+   */
+  private async quarentenarPorIdade(
+    registroId: string,
+    motivoOriginal?: string,
+  ): Promise<ResultadoDeWebhook | null> {
+    const limite = new Date(Date.now() - this.deps.idadeMaximaMinutos * 60_000);
+    const motivo = `inaplicavel ha mais de ${this.deps.idadeMaximaMinutos} minutos`;
+
+    const emQuarentena = await this.deps.prisma.webhookEvent.updateMany({
+      where: {
+        id: registroId,
+        status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+        receivedAt: { lt: limite },
+      },
+      data: {
+        status: WebhookStatus.QUARANTINED,
+        processedAt: new Date(),
+        lastError: (motivoOriginal ? `${motivo} | ${motivoOriginal}` : motivo).slice(0, 500),
+      },
+    });
+    if (emQuarentena.count === 0) return null;
+
+    return { status: WebhookStatus.QUARANTINED, motivo };
+  }
+
+  /**
+   * Teto de tentativas (Bloco 6c).
+   *
+   * Falha DETERMINISTICA — bug no handler, ou dado que nunca vai validar —
+   * lanca a cada reentrega, a rota responde 5xx, e o provedor reentrega de
+   * novo. Sem teto o laco nao termina, e cada volta reprocessa o evento
+   * inteiro. `attempts` conta exatamente esta populacao (achado 4.5 do Bloco 4:
+   * quem incrementa e este catch, e so ele).
+   *
+   * A CONDICAO do teto vive no WHERE, nao numa leitura previa. O banco avalia
+   * o valor JA incrementado na mesma instrucao que transiciona, e o `count` da
+   * resposta diz se a quarentena aconteceu. Ler antes e decidir em JavaScript
+   * custaria uma consulta a mais por falha e abriria janela entre ler e
+   * escrever — duas execucoes poderiam ler o mesmo valor e ambas transicionar.
+   *
+   * Devolve `null` quando o teto ainda nao foi atingido; ai o chamador relanca
+   * e a rota responde 5xx como antes.
+   */
+  private async quarentenarPorTeto(
+    registroId: string,
+    ultimoErro: string,
+  ): Promise<ResultadoDeWebhook | null> {
+    const motivo = `teto de ${this.deps.tetoDeTentativas} tentativas atingido`;
+
+    const emQuarentena = await this.deps.prisma.webhookEvent.updateMany({
+      where: {
+        id: registroId,
+        // Somente sobre a linha que ACABAMOS de marcar como FAILED.
+        status: WebhookStatus.FAILED,
+        attempts: { gte: this.deps.tetoDeTentativas },
+      },
+      data: {
+        status: WebhookStatus.QUARANTINED,
+        // Nao e "processado": e o instante em que DESISTIMOS. O WebhookEvent
+        // nao tem updatedAt, entao sem isto esse momento se perde. Mesma
+        // imprecisao de nome que o lastError ja carrega ao guardar motivo de
+        // IGNORED — registrada para renomeacao no Bloco 10.
+        processedAt: new Date(),
+        lastError: `${motivo} | ultimo erro: ${ultimoErro}`.slice(0, 500),
+      },
+    });
+    if (emQuarentena.count === 0) return null;
+
+    // SEM relancar: a rota responde 200 e o provedor PARA de reentregar. E o
+    // proposito do teto — seguir respondendo 5xx manteria o laco vivo do lado
+    // de la, com a linha ja marcada como desistida do lado de ca.
+    return { status: WebhookStatus.QUARANTINED, motivo };
   }
 
   private async registrar(
@@ -304,10 +410,24 @@ export class WebhookService {
       });
 
       // Colisao NAO e resposta final. PROCESSED/IGNORED foi decidido: duplicata real.
-      if (
-        existente.status === WebhookStatus.PROCESSED ||
-        existente.status === WebhookStatus.IGNORED
-      ) {
+      // A lista e dos estados ABERTOS, nao dos terminais — e a inversao e a
+      // correcao, nao estilo. Enumerar terminais faz qualquer estado FUTURO
+      // herdar o caminho de REPROCESSAMENTO por omissao, que foi exatamente
+      // como QUARANTINED nasceu perigoso: as guardas do `catch` e do `encerrar`
+      // filtram `status in (RECEIVED, FAILED)`, entao uma reentrega que
+      // reprocessasse uma linha terminal aplicaria o efeito financeiro SEM
+      // conseguir gravar o desfecho — a linha ficaria como estava e a reentrega
+      // seguinte aplicaria DE NOVO. Captura dupla, silenciosa.
+      //
+      // Com a lista invertida, um valor de enum que ESTA versao nao conhece e
+      // tratado como terminal: fail-closed por construcao. Achado 4.1 da 2a
+      // rodada de review do PR #58.
+      //
+      // Sair de um estado terminal e acao humana: voltar a linha para RECEIVED
+      // depois de resolver a causa.
+      const aberto =
+        existente.status === WebhookStatus.RECEIVED || existente.status === WebhookStatus.FAILED;
+      if (!aberto) {
         return { duplicata: existente.status };
       }
 

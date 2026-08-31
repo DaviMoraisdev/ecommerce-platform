@@ -27,11 +27,64 @@ export interface AppConfig {
    */
   paymentWindowMinutes: number;
   /**
+   * Teto de tentativas do inbox de webhook (Bloco 6c). Ao atingi-lo, o evento
+   * vai para QUARANTINED e a rota passa a responder 200 — o que encerra o laco
+   * de reentrega do provedor.
+   *
+   * Vive no AppConfig, e nao em process.env solto como os knobs do relay, pelo
+   * GATILHO registrado no TECH_DEBT ("reavaliar se algum passar a ter efeito
+   * operacional relevante"): este decide quando o servico PARA DE TENTAR
+   * aplicar evento financeiro. Aumentar custa reprocessar mais vezes um evento
+   * que nunca vai passar; reduzir arrisca desistir de falha transitoria que se
+   * resolveria sozinha.
+   */
+  webhookMaxAttempts: number;
+  /**
+   * Idade a partir da qual um evento AINDA inaplicavel vai para QUARANTINED
+   * (Bloco 6c). Atende a populacao que o teto NAO alcanca: o desfecho
+   * `retentavel` (hoje, providerRef ainda desconhecido) devolve 5xx sem
+   * incrementar `attempts`, de proposito — para ele a pergunta e "ha quanto
+   * tempo esta inaplicavel", nao "quantas vezes falhou".
+   *
+   * ACOPLAMENTO com paymentWindowMinutes, validado no boot: quem destrava essa
+   * populacao e o job de reconciliacao do Bloco 6b, preenchendo o providerRef
+   * da tentativa presa — e ele so age sobre tentativas mais velhas que a
+   * janela. Um limite menor ou igual a janela quarentenaria eventos que o job
+   * resolveria minutos depois.
+   */
+  webhookQuarantineMinutes: number;
+  /**
+   * Intervalo entre ciclos das varreduras de manutencao (reconciliacao e
+   * inbox). Sai de `process.env` solto e entra aqui porque PARTICIPA de um
+   * invariante entre campos — ver a validacao no `loadConfig`. Achado 4.2 da
+   * 2a rodada de review do PR #58: sem ele, quarentena 2 min + poll 60 min era
+   * configuracao valida e quarentenava antes de o job ter QUALQUER chance.
+   */
+  jobsPollIntervalMs: number;
+  /** Quanto o shutdown espera o ciclo em voo antes de seguir. */
+  jobsStopTimeoutMs: number;
+  /**
+   * Prazo de UMA varredura. Achado 4.3: sem prazo, uma varredura que nunca
+   * resolve (nao rejeita) segura o `await` do ciclo, o proximo timer nunca e
+   * agendado, e TODAS as varreduras param — inclusive as que estao saudaveis.
+   */
+  jobsVarreduraTimeoutMs: number;
+  /**
    * URL do broker. `null` significa relay DESLIGADO — permitido apenas fora de
    * producao, para desenvolver sem RabbitMQ de pe.
    */
   rabbitmqUrl: string | null;
 }
+
+/**
+ * Quantas varreduras o runtime roda por ciclo. Entra no invariante temporal
+ * porque o proximo ciclo so e agendado DEPOIS de todas elas, e cada uma pode
+ * consumir o prazo inteiro — achado 4.2 da 3a rodada de review do PR #58.
+ *
+ * O `server.ts` verifica que a lista real tem este tamanho: constante que
+ * silenciosamente diverge do codigo e pior que constante nenhuma.
+ */
+export const VARREDURAS_POR_CICLO = 2;
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -177,6 +230,54 @@ function parseMinutos(raw: string | undefined, nome: string, padrao: number): nu
   return minutos;
 }
 
+/**
+ * Mesmo idioma de parseTimeout e parseMinutos, INCLUSIVE na tolerancia do
+ * `Number()` a hexadecimal e exponencial. A divida registrada diz que os
+ * parsers irmaos endurecem juntos ou nenhum: corrigir so um cria divergencia
+ * silenciosa entre eles. Este e o terceiro da familia.
+ */
+function parseTentativas(raw: string | undefined, nome: string, padrao: number): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 100) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre 1 e 100.`);
+  }
+  return n;
+}
+
+/**
+ * Familia de parseMinutos, com teto MAIOR: 7 dias.
+ *
+ * O teto de 1440 da janela de pagamento existe porque ela prende estoque
+ * reservado. A quarentena nao prende nada — ela so decide quando paramos de
+ * tentar aplicar um evento, e dias sao horizonte legitimo. Com o mesmo teto nos
+ * dois, uma janela de 1440 tornaria o boot IMPOSSIVEL: nao existiria valor de
+ * quarentena maior que ela, e a validacao cruzada recusaria qualquer config.
+ */
+function parseMinutosLongos(raw: string | undefined, nome: string, padrao: number): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const minutos = Number(raw);
+  if (!Number.isInteger(minutos) || minutos < 1 || minutos > 10_080) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre 1 e 10080.`);
+  }
+  return minutos;
+}
+
+function parseMs(
+  raw: string | undefined,
+  nome: string,
+  padrao: number,
+  min: number,
+  max: number,
+): number {
+  if (raw === undefined || raw.trim() === '') return padrao;
+  const ms = Number(raw);
+  if (!Number.isInteger(ms) || ms < min || ms > max) {
+    throw new ConfigError(`${nome} invalido: ${raw}. Use inteiro entre ${min} e ${max}.`);
+  }
+  return ms;
+}
+
 function parsePort(raw: string): number {
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -316,6 +417,70 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   const jwtSecret = requireEnv('JWT_SECRET', source);
   assertSegredoForte('JWT_SECRET', jwtSecret, nodeEnv);
 
+  const paymentWindowMinutes = parseMinutos(
+    source.PAYMENT_WINDOW_MINUTES,
+    'PAYMENT_WINDOW_MINUTES',
+    15,
+  );
+  const webhookQuarantineMinutes = parseMinutosLongos(
+    source.WEBHOOK_QUARANTINE_MINUTES,
+    'WEBHOOK_QUARANTINE_MINUTES',
+    60,
+  );
+
+  // Os NOMES continuam RECONCILIACAO_* de proposito: renomear quebraria .env em
+  // uso para ganhar so estetica.
+  const jobsPollIntervalMs = parseMs(
+    source.RECONCILIACAO_POLL_INTERVAL_MS,
+    'RECONCILIACAO_POLL_INTERVAL_MS',
+    60_000,
+    1_000,
+    3_600_000,
+  );
+  const jobsStopTimeoutMs = parseMs(
+    source.RECONCILIACAO_STOP_TIMEOUT_MS,
+    'RECONCILIACAO_STOP_TIMEOUT_MS',
+    5_000,
+    1,
+    60_000,
+  );
+  const jobsVarreduraTimeoutMs = parseMs(
+    source.JOBS_VARREDURA_TIMEOUT_MS,
+    'JOBS_VARREDURA_TIMEOUT_MS',
+    120_000,
+    1_000,
+    600_000,
+  );
+
+  // Invariante ENTRE campos, por isso nao cabe em nenhum parser isolado.
+  //
+  // CORRIGIDO no achado 4.2 da 2a rodada de review do PR #58: a versao anterior
+  // exigia apenas quarentena > janela, argumentando que o job de reconciliacao
+  // destrava o evento. Mas o job so roda a cada ciclo, e o intervalo era lido
+  // de process.env sem participar de validacao nenhuma — janela 1 min,
+  // quarentena 2 min e poll 60 min passavam no boot e quarentenavam o evento
+  // antes de o job ter QUALQUER chance de agir. A quarentena e terminal.
+  // Somar SO o intervalo ainda era otimista (achado 4.2 da 3a rodada): o
+  // proximo ciclo so e agendado depois que TODAS as varreduras terminam, e cada
+  // uma pode consumir o prazo inteiro. Janela 1, poll 1, quarentena 3 e prazo
+  // de 10 min passavam no boot — e a reentrega sincrona quarentenava o evento
+  // muito antes da proxima reconciliacao.
+  const minutosDePoll = Math.ceil(jobsPollIntervalMs / 60_000);
+  const minutosDeCiclo = Math.ceil((jobsVarreduraTimeoutMs * VARREDURAS_POR_CICLO) / 60_000);
+  const folgaMinima = paymentWindowMinutes + minutosDePoll + minutosDeCiclo;
+
+  if (webhookQuarantineMinutes <= folgaMinima) {
+    throw new ConfigError(
+      `WEBHOOK_QUARANTINE_MINUTES (${webhookQuarantineMinutes}) deve ser MAIOR que ` +
+        `${folgaMinima}: PAYMENT_WINDOW_MINUTES (${paymentWindowMinutes}) mais o ` +
+        `intervalo do job (${minutosDePoll} min) mais a duracao maxima de um ciclo ` +
+        `(${minutosDeCiclo} min). Quem destrava um evento inaplicavel e a reconciliacao, ` +
+        'e ela so age depois da janela E no ciclo seguinte, que so comeca quando todas ' +
+        'as varreduras terminarem. Um limite menor quarentena eventos que seriam ' +
+        'resolvidos, e a quarentena e terminal.',
+    );
+  }
+
   return {
     port: parsePort(requireEnv('PAYMENT_PORT', source)),
     databaseUrl: requireEnv('DATABASE_URL', source),
@@ -335,11 +500,12 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       'ORDER_SERVICE_TIMEOUT_MS',
       5000,
     ),
-    paymentWindowMinutes: parseMinutos(
-      source.PAYMENT_WINDOW_MINUTES,
-      'PAYMENT_WINDOW_MINUTES',
-      15,
-    ),
+    paymentWindowMinutes,
+    webhookQuarantineMinutes,
+    webhookMaxAttempts: parseTentativas(source.WEBHOOK_MAX_ATTEMPTS, 'WEBHOOK_MAX_ATTEMPTS', 5),
+    jobsPollIntervalMs,
+    jobsStopTimeoutMs,
+    jobsVarreduraTimeoutMs,
     rabbitmqUrl: parseAmqpUrl(
       source.RABBITMQ_URL,
       nodeEnv,

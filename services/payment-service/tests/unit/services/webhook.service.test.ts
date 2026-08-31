@@ -101,6 +101,10 @@ function montar(
   contagens: number[],
   erroNaTransacao?: Error,
   transacao: PaymentTransaction | null = autorizacao(),
+  /** Tentativas JA registradas na linha. Serve para posicionar o teto do 6c. */
+  tentativasIniciais = 0,
+  /** Quando a linha do inbox foi recebida. Posiciona a quarentena por idade. */
+  recebidoEm: Date = new Date(),
 ) {
   const criadas: Criada[] = [];
   const inbox: Record<string, unknown>[] = [];
@@ -124,6 +128,8 @@ function montar(
     outboxEvent: { create: outboxNoTx },
   };
 
+  let tentativas = tentativasIniciais;
+
   const prisma = {
     webhookEvent: {
       create: jest.fn(async () => ({ id: 'inbox_1' })),
@@ -131,6 +137,24 @@ function montar(
       updateMany: jest.fn(
         async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
           filtros.push(where);
+
+          // Modela o MINIMO do banco que o teto do Bloco 6c exige: `attempts` e
+          // um contador real e o filtro `gte` e avaliado sobre ele. Sem isto o
+          // duble devolveria count 1 para qualquer WHERE, a quarentena
+          // "aconteceria" sempre, e qualquer teste dos dois lados do teto
+          // provaria o duble em vez do servico.
+          const minimo = (where.attempts as { gte?: number } | undefined)?.gte;
+          if (typeof minimo === 'number' && tentativas < minimo) return { count: 0 };
+
+          // Mesma razao do contador acima: sem modelar `receivedAt`, o duble
+          // devolveria count 1 e a quarentena por idade "aconteceria" sempre,
+          // inclusive sobre linha recem-criada.
+          const antesDe = (where.receivedAt as { lt?: Date } | undefined)?.lt;
+          if (antesDe instanceof Date && recebidoEm >= antesDe) return { count: 0 };
+
+          const incremento = (data.attempts as { increment?: number } | undefined)?.increment;
+          if (typeof incremento === 'number') tentativas += incremento;
+
           inbox.push(data);
           return { count: 1 };
         },
@@ -150,7 +174,7 @@ function montar(
     }),
   } as unknown as PrismaClient;
 
-  return { service: new WebhookService({ prisma }), criadas, inbox, filtros, tx, outboxNoTx, outboxForaDaTx };
+  return { service: new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 }), criadas, inbox, filtros, tx, outboxNoTx, outboxForaDaTx };
 }
 
 describe('WebhookService — CAS perdido no reembolso (achado 4.1)', () => {
@@ -198,6 +222,97 @@ describe('WebhookService — CAS perdido na transicao de status (achado 4.2)', (
 
     expect(resultado.retentavel).toBe(true);
     expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+  });
+});
+
+describe('WebhookService — teto de tentativas (Bloco 6c)', () => {
+  it('CASO T1: ao atingir o teto, a linha vai para QUARANTINED e o erro NAO propaga', async () => {
+    // Falha DETERMINISTICA lanca a cada reentrega, a rota responde 5xx e o
+    // provedor reentrega — laco sem fim, reprocessando o evento inteiro a cada
+    // volta. Ao atingir o teto a rota precisa responder 200 para o provedor
+    // parar, e para isso o erro NAO pode propagar. E a unica diferenca
+    // observavel entre "ainda tentando" e "desistimos".
+    const falha = new Error('relation "payments" does not exist at character 42');
+    const { service, inbox } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
+      [],
+      falha,
+      autorizacao(),
+      4, // quatro tentativas ja registradas: esta falha fecha o teto de 5
+    );
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.status).toBe(WebhookStatus.QUARANTINED);
+    expect(resultado.retentavel).toBeUndefined();
+
+    const quarentena = inbox.find((d) => d.status === WebhookStatus.QUARANTINED);
+    expect(quarentena).toBeDefined();
+    expect(String(quarentena?.lastError)).toContain('teto de 5 tentativas atingido');
+    // A mensagem original do banco nao pode vazar nem por este caminho: o
+    // lastError da quarentena carrega o ultimo erro JA sanitizado.
+    expect(JSON.stringify(quarentena)).not.toContain('relation');
+  });
+
+  it('CASO T2: uma tentativa abaixo do teto continua propagando o erro', async () => {
+    // Contraparte do T1. Sem este caso, trocar o `gte` por `gt` (ou o teto por
+    // zero) passaria despercebido em uma das duas direcoes.
+    const falha = new Error('falha transitoria');
+    const { service, inbox } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
+      [],
+      falha,
+      autorizacao(),
+      3, // esta falha leva a 4, ainda abaixo do teto de 5
+    );
+
+    await expect(service.processar('fake', eventoDeCaptura())).rejects.toThrow(falha);
+    expect(inbox.find((d) => d.status === WebhookStatus.QUARANTINED)).toBeUndefined();
+  });
+});
+
+describe('WebhookService — quarentena por idade (Bloco 6c)', () => {
+  /** Sem transacao => providerRef ainda desconhecido => desfecho retentavel. */
+  function retentavel(recebidoEm: Date) {
+    return montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0 })],
+      [],
+      undefined,
+      null,
+      0,
+      recebidoEm,
+    );
+  }
+
+  it('CASO T3: evento retentavel ha tempo demais vai para QUARANTINED', async () => {
+    // Esta populacao NAO passa pelo catch, entao `attempts` nunca sobe e o teto
+    // nunca a alcanca (achado 4.5 do Bloco 4). Sem limite por idade ela gira ate
+    // o provedor desistir sozinho, e nada do nosso lado registra que desistimos.
+    const { service, inbox } = retentavel(new Date(Date.now() - 120 * 60_000));
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.status).toBe(WebhookStatus.QUARANTINED);
+    expect(resultado.retentavel).toBeUndefined();
+
+    const quarentena = inbox.find((d) => d.status === WebhookStatus.QUARANTINED);
+    expect(String(quarentena?.lastError)).toContain('inaplicavel ha mais de 60 minutos');
+    // O motivo ORIGINAL sobrevive: sem ele, a triagem sabe que desistimos e nao
+    // sabe de que.
+    expect(String(quarentena?.lastError)).toContain('providerRef ainda desconhecido');
+  });
+
+  it('CASO T4: evento retentavel RECENTE continua retentavel', async () => {
+    // Contraparte do T3. O evento chega antes de o providerRef ser gravado —
+    // situacao normal e frequente. Quarentenar aqui descartaria uma captura que
+    // seria aplicada segundos depois, e quarentena e terminal.
+    const { service, inbox } = retentavel(new Date());
+
+    const resultado = await service.processar('fake', eventoDeCaptura());
+
+    expect(resultado.retentavel).toBe(true);
+    expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+    expect(inbox.find((d) => d.status === WebhookStatus.QUARANTINED)).toBeUndefined();
   });
 });
 

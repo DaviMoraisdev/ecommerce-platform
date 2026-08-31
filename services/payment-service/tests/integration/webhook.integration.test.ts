@@ -15,6 +15,7 @@ import { connectDatabase, disconnectDatabase } from '../../src/config/database';
 import { FakeProvider } from '../../src/providers/fake/fake.provider';
 import type { WebhookRequest } from '../../src/providers/payment-provider.port';
 import { criarWebhookRouter } from '../../src/routes/webhook.routes';
+import { quarentenarOrfaos } from '../../src/jobs/inbox.repository';
 import { WebhookService } from '../../src/services/webhook.service';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { assertTestDatabase } from '../helpers/testDbGuard';
@@ -55,7 +56,7 @@ afterAll(async () => {
 
 function montarApp() {
   const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
-  const service = new WebhookService({ prisma });
+  const service = new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 });
   const app = createApp({
     // A rota de pagamento nao participa destes testes; um Router vazio evita
     // arrastar PaymentService, orderClient e config para ca.
@@ -986,5 +987,248 @@ describe('webhook — gravacao na outbox', () => {
     expect((await postar(app, req)).status).toBe(200);
 
     expect(await prisma.outboxEvent.count()).toBe(1);
+  });
+});
+
+
+// ==========================================================
+// Bloco 6c — quarentena terminal
+// ==========================================================
+describe('webhook — quarentena (Bloco 6c)', () => {
+  it('CASO 20: reentrega sobre linha em QUARENTENA nao reprocessa nem aplica efeito', async () => {
+    // O caso que justifica `registrar` tratar QUARANTINED como duplicata.
+    // As guardas do catch e do encerrar filtram status in (RECEIVED, FAILED):
+    // se uma reentrega reprocessasse a linha em quarentena, o efeito financeiro
+    // seria aplicado e o desfecho NAO conseguiria ser gravado — a linha
+    // continuaria QUARANTINED e a reentrega seguinte aplicaria DE NOVO.
+    // Captura dupla, silenciosa, sem nada no rastro dizendo que aconteceu.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const eventoId = `evt_${randomUUID()}`;
+    const assinado = provider.assinarCorpo(corpo({ id: eventoId }, { charge_ref: chargeRef }));
+
+    await prisma.webhookEvent.create({
+      data: {
+        provider: 'fake',
+        providerEventId: eventoId,
+        eventType: 'payment.succeeded',
+        payload: {},
+        providerCreatedAt: new Date(),
+        status: WebhookStatus.QUARANTINED,
+        attempts: 5,
+        lastError: 'teto de 5 tentativas atingido',
+      },
+    });
+
+    const res = await postar(app, assinado);
+    // 200, nao 5xx: o proposito da quarentena e o provedor PARAR de reentregar.
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.PROCESSING);
+    expect(atual.capturedAmountCents).toBe(0);
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(0);
+    expect(await prisma.outboxEvent.count()).toBe(0);
+
+    // A linha nao foi tocada — nem contador, nem estado. Se tivesse
+    // reprocessado e falhado, `attempts` subiria; se tivesse aplicado,
+    // `status` mudaria.
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.QUARANTINED);
+    expect(linha.attempts).toBe(5);
+  });
+});
+
+describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
+  it('CASO 21: quarentena o que ficou sem conclusao e nao toca no recente nem no concluido', async () => {
+    // O caminho sincrono so age quando uma reentrega CHEGA. Se o provedor
+    // desistir, ou se o processo cair entre gravar a linha e aplicar o efeito,
+    // ninguem mais volta nessa linha — e ela some da vista.
+    const comum = {
+      provider: 'fake',
+      eventType: 'payment.succeeded',
+      payload: {},
+      providerCreatedAt: new Date(),
+    };
+    const velho = new Date(Date.now() - 120 * 60_000);
+
+    const orfao = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: velho },
+    });
+    const falhado = await prisma.webhookEvent.create({
+      data: {
+        ...comum,
+        providerEventId: `evt_${randomUUID()}`,
+        status: WebhookStatus.FAILED,
+        attempts: 2,
+        lastError: 'causa real da falha',
+        receivedAt: velho,
+      },
+    });
+    const recente = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: new Date() },
+    });
+    const concluido = await prisma.webhookEvent.create({
+      data: {
+        ...comum,
+        providerEventId: `evt_${randomUUID()}`,
+        status: WebhookStatus.PROCESSED,
+        receivedAt: velho,
+        processedAt: velho,
+      },
+    });
+
+    const total = await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 100);
+    expect(total).toBe(2);
+
+    const lido = (id: string) => prisma.webhookEvent.findUniqueOrThrow({ where: { id } });
+
+    expect((await lido(orfao.id)).status).toBe(WebhookStatus.QUARANTINED);
+
+    const f = await lido(falhado.id);
+    expect(f.status).toBe(WebhookStatus.QUARANTINED);
+    expect(f.processedAt).not.toBeNull();
+    // lastError PRESERVADO: nas linhas FAILED ele guarda a causa real, que e o
+    // que a triagem precisa. Sobrescrever destruiria o unico diagnostico.
+    expect(f.lastError).toBe('causa real da falha');
+
+    // Recente ainda pode ser resolvido por uma reentrega; concluido e terminal.
+    expect((await lido(recente.id)).status).toBe(WebhookStatus.RECEIVED);
+    expect((await lido(concluido.id)).status).toBe(WebhookStatus.PROCESSED);
+  });
+
+  it('CASO 22: o lote limita quantas linhas cada ciclo trata', async () => {
+    // Sem limite, um acumulo de orfaos viraria um UPDATE gigante segurando
+    // linhas do inbox durante o ciclo inteiro.
+    const velho = new Date(Date.now() - 120 * 60_000);
+    for (let i = 0; i < 3; i += 1) {
+      await prisma.webhookEvent.create({
+        data: {
+          provider: 'fake',
+          providerEventId: `evt_${randomUUID()}`,
+          eventType: 'payment.succeeded',
+          payload: {},
+          providerCreatedAt: new Date(),
+          status: WebhookStatus.RECEIVED,
+          receivedAt: velho,
+        },
+      });
+    }
+
+    expect(await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 2)).toBe(2);
+    // O ciclo seguinte pega o resto: a linha tratada SAI do conjunto, entao o
+    // lote limitado progride por construcao — nao ha starvation aqui.
+    expect(await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 2)).toBe(1);
+  });
+});
+
+describe('webhook — corrida da varredura (Bloco 6c)', () => {
+  it('CASO 23: linha concluida ENTRE a selecao e a escrita nao e sobrescrita', async () => {
+    // A sabotagem A-8 mostrou que a reavaliacao de estado no updateMany nao
+    // tinha teste: remove-la nao derrubava nada. Ela protege a janela entre o
+    // findMany e o updateMany — uma reentrega pode concluir a linha ali no meio.
+    // Sem a guarda, a varredura sobrescreveria um PROCESSED com QUARANTINED:
+    // trilha mentindo que desistimos de um evento que foi aplicado.
+    const comum = {
+      provider: 'fake',
+      eventType: 'payment.succeeded',
+      payload: {},
+      providerCreatedAt: new Date(),
+    };
+    const velho = new Date(Date.now() - 120 * 60_000);
+
+    const concluidaNoMeio = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: velho },
+    });
+    const intacta = await prisma.webhookEvent.create({
+      data: { ...comum, providerEventId: `evt_${randomUUID()}`, status: WebhookStatus.RECEIVED, receivedAt: velho },
+    });
+
+    // Cliente que conclui uma das linhas DEPOIS do findMany e ANTES do
+    // updateMany. E o entrelacamento real, nao uma simulacao de duble.
+    const entrelacado = {
+      webhookEvent: {
+        findMany: async (args: Parameters<typeof prisma.webhookEvent.findMany>[0]) => {
+          const selecionadas = await prisma.webhookEvent.findMany(args);
+          await prisma.webhookEvent.update({
+            where: { id: concluidaNoMeio.id },
+            data: { status: WebhookStatus.PROCESSED, processedAt: new Date() },
+          });
+          return selecionadas;
+        },
+        updateMany: (args: Parameters<typeof prisma.webhookEvent.updateMany>[0]) =>
+          prisma.webhookEvent.updateMany(args),
+      },
+    } as unknown as PrismaClient;
+
+    const total = await quarentenarOrfaos(new Date(Date.now() - 60 * 60_000), 100, entrelacado);
+
+    // Apenas a que continuava aberta foi quarentenada.
+    expect(total).toBe(1);
+
+    const lido = (id: string) => prisma.webhookEvent.findUniqueOrThrow({ where: { id } });
+    expect((await lido(concluidaNoMeio.id)).status).toBe(WebhookStatus.PROCESSED);
+    expect((await lido(intacta.id)).status).toBe(WebhookStatus.QUARANTINED);
+  });
+});
+
+describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
+  it('CASO 24: evento inaplicavel ha tempo demais vira quarentena e responde 200', async () => {
+    // Achado 4.4 da 2a rodada: o CASO 20 comeca com a linha JA em quarentena,
+    // entao provava duplicata terminal, nao a TRANSICAO. O objetivo central do
+    // bloco e responder 200 no momento em que desistimos — sem isso o provedor
+    // continua reentregando um evento que ja abandonamos.
+    const { app, provider } = montarApp();
+    const eventoId = `evt_${randomUUID()}`;
+
+    // Chegou ha duas horas e nunca pode ser aplicado: nao ha transacao com
+    // aquele providerRef, entao o desfecho e `retentavel` a cada reentrega.
+    await prisma.webhookEvent.create({
+      data: {
+        provider: 'fake',
+        providerEventId: eventoId,
+        eventType: 'payment.succeeded',
+        payload: {},
+        providerCreatedAt: new Date(),
+        status: WebhookStatus.RECEIVED,
+        receivedAt: new Date(Date.now() - 120 * 60_000),
+      },
+    });
+
+    const res = await postar(app, provider.assinarCorpo(corpo({ id: eventoId })));
+    expect(res.status).toBe(200);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.QUARANTINED);
+    expect(linha.processedAt).not.toBeNull();
+    expect(String(linha.lastError)).toContain('inaplicavel ha mais de 60 minutos');
+
+    // 200 porque DESISTIMOS, nao porque aplicamos: nenhum efeito financeiro.
+    expect(await prisma.paymentTransaction.count()).toBe(0);
+    expect(await prisma.outboxEvent.count()).toBe(0);
+  });
+
+  it('CASO 25: evento RECENTE e inaplicavel continua devolvendo 503', async () => {
+    // Contraparte do 24, e o caso frequente: o webhook chega antes de o
+    // providerRef ser gravado. Responder 200 aqui encerraria para sempre uma
+    // captura que seria aplicada segundos depois.
+    const { app, provider } = montarApp();
+    const eventoId = `evt_${randomUUID()}`;
+
+    const res = await postar(app, provider.assinarCorpo(corpo({ id: eventoId })));
+    expect(res.status).toBe(503);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.RECEIVED);
+    expect(linha.processedAt).toBeNull();
   });
 });

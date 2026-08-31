@@ -66,7 +66,11 @@ export function construirApp(config: AppConfig, nucleo?: NucleoDoServico): Expre
     payments: router,
     webhooks: criarWebhookRouter({
       provider,
-      service: new WebhookService({ prisma }),
+      service: new WebhookService({
+        prisma,
+        tetoDeTentativas: config.webhookMaxAttempts,
+        idadeMaximaMinutos: config.webhookQuarantineMinutes,
+      }),
     }),
   });
 }

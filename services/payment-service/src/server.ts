@@ -1,9 +1,12 @@
 import { bootstrap } from './bootstrap';
 import { construirApp, montarNucleo, type NucleoDoServico } from './composition';
 import { montarDepsDeReconciliacao } from './jobs/reconciliacao.deps';
-import { startReconciliacao, stopReconciliacao } from './jobs/reconciliacao.runtime';
+import { criarVarredura } from './jobs/reconciliacao';
+import { tickInbox } from './jobs/inbox';
+import { quarentenarOrfaos } from './jobs/inbox.repository';
+import { startJobs, stopJobs } from './jobs/runtime';
 import type { AppConfig } from './config/env';
-import { loadConfig } from './config/env';
+import { loadConfig, VARREDURAS_POR_CICLO } from './config/env';
 import { connectDatabase, disconnectDatabase } from './config/database';
 import { registrarEncerramento } from './shutdown';
 import { startOutboxRelay, stopOutboxRelay } from './events/outbox.relay';
@@ -19,7 +22,7 @@ import { fetchPending, markRetry, markSent } from './events/outbox.repository';
 /**
  * O nucleo e montado UMA vez e compartilhado entre o HTTP e o job.
  *
- * Memoizado porque o bootstrap chama iniciarRelay, iniciarReconciliacao e
+ * Memoizado porque o bootstrap chama iniciarRelay, iniciarJobs e
  * createApp em momentos diferentes — todos DEPOIS do connectDatabase, entao o
  * getPrisma() la dentro encontra o cliente conectado. Duas instancias fariam o
  * job nao enxergar as cobrancas do caminho HTTP quando o provedor for o fake.
@@ -50,11 +53,40 @@ bootstrap({
       markRetry,
     });
   },
-  iniciarReconciliacao: (config) => {
+  iniciarJobs: (config) => {
     const { provider, service } = obterNucleo(config);
-    startReconciliacao(
-      montarDepsDeReconciliacao(provider, service, config.paymentWindowMinutes),
-    );
+    const varreduras = [
+      {
+        nome: 'reconciliacao',
+        executar: criarVarredura(
+          montarDepsDeReconciliacao(provider, service, config.paymentWindowMinutes),
+        ),
+      },
+      {
+        nome: 'inbox',
+        executar: () =>
+          tickInbox({
+            quarentenarOrfaos,
+            idadeMinutos: config.webhookQuarantineMinutes,
+          }),
+      },
+    ];
+
+    // A constante do invariante temporal (env.ts) precisa refletir a lista
+    // real. Divergencia silenciosa aqui deixaria o boot aceitar configuracao
+    // que quarentena antes de o job ter chance.
+    if (varreduras.length !== VARREDURAS_POR_CICLO) {
+      throw new Error(
+        `VARREDURAS_POR_CICLO (${VARREDURAS_POR_CICLO}) diverge das ${varreduras.length} ` +
+          'varreduras registradas; ajuste a constante em config/env.ts',
+      );
+    }
+
+    startJobs(varreduras, {
+      pollIntervalMs: config.jobsPollIntervalMs,
+      stopTimeoutMs: config.jobsStopTimeoutMs,
+      varreduraTimeoutMs: config.jobsVarreduraTimeoutMs,
+    });
   },
 })
   .then((server) => {
@@ -63,7 +95,7 @@ bootstrap({
         new Promise<void>((resolve, reject) => {
           server.close((erro) => (erro ? reject(erro) : resolve()));
         }),
-      pararReconciliacao: stopReconciliacao,
+      pararJobs: stopJobs,
       pararRelay: stopOutboxRelay,
       fecharPublisher: closeEventPublisher,
       desconectarBanco: disconnectDatabase,

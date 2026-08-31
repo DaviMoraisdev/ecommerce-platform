@@ -20,7 +20,7 @@ export interface BootstrapDeps {
    * sem reconciliacao, uma tentativa presa fica presa PARA SEMPRE — o cliente
    * nao consegue pagar aquele pedido e nao ha caminho de recuperacao.
    */
-  iniciarReconciliacao: (config: AppConfig) => void;
+  iniciarJobs: (config: AppConfig) => void;
 }
 
 /**
@@ -35,7 +35,7 @@ export async function bootstrap(deps: BootstrapDeps): Promise<Server> {
   // DEPOIS do banco: o ciclo do relay le a outbox. ANTES da porta: o relay nao
   // depende de HTTP, e atrasar a saida de eventos nao traz beneficio nenhum.
   deps.iniciarRelay(config);
-  deps.iniciarReconciliacao(config);
+  deps.iniciarJobs(config);
 
   // A config e passada adiante: o composition root precisa dela para montar
   // provedor, cliente do order e servico.

@@ -19,7 +19,7 @@ export interface EncerramentoDeps {
    * descoberta vira payment.captured). Parar o produtor primeiro deixa o relay
    * drenar o que acabou de ser gravado, em vez de empurrar para o proximo boot.
    */
-  pararReconciliacao: () => Promise<void>;
+  pararJobs: () => Promise<void>;
   /** Aguarda o ciclo em voo do relay: cortar no meio deixaria evento a caminho. */
   pararRelay: () => Promise<void>;
   /** So depois do relay parado, senao a conexao cai no meio de uma publicacao. */
@@ -69,7 +69,7 @@ export async function encerrar(deps: EncerramentoDeps): Promise<number> {
     try {
       // ANTES do relay: a reconciliacao PRODUZ eventos na outbox. Parar o
       // produtor primeiro deixa o relay drenar o que acabou de ser gravado.
-      await deps.pararReconciliacao();
+      await deps.pararJobs();
       await deps.pararRelay();
       log('[payment-service] relay da outbox parado');
     } catch (erro) {

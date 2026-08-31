@@ -24,8 +24,8 @@ function montarDeps(ordem: string[], overrides: Partial<BootstrapDeps> = {}) {
     iniciarRelay: jest.fn(() => {
       ordem.push('relay');
     }),
-    iniciarReconciliacao: jest.fn(() => {
-      ordem.push('reconciliacao');
+    iniciarJobs: jest.fn(() => {
+      ordem.push('jobs');
     }),
     ...overrides,
   };
@@ -56,7 +56,7 @@ describe('bootstrap', () => {
       // relay para que o relay ja esteja de pe quando o job comecar a produzir
       // eventos de captura descoberta.
       'relay',
-      'reconciliacao',
+      'jobs',
       'listen',
     ]);
   });
