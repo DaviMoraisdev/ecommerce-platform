@@ -995,7 +995,7 @@ describe('webhook — gravacao na outbox', () => {
 // Bloco 6c — quarentena terminal
 // ==========================================================
 describe('webhook — quarentena (Bloco 6c)', () => {
-  it('CASO 20: reentrega sobre linha em QUARENTENA nao reprocessa nem aplica efeito', async () => {
+  it('CASO 34: reentrega sobre linha em QUARENTENA nao reprocessa nem aplica efeito', async () => {
     // O caso que justifica `registrar` tratar QUARANTINED como duplicata.
     // As guardas do catch e do encerrar filtram status in (RECEIVED, FAILED):
     // se uma reentrega reprocessasse a linha em quarentena, o efeito financeiro
@@ -1045,7 +1045,7 @@ describe('webhook — quarentena (Bloco 6c)', () => {
 });
 
 describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
-  it('CASO 21: quarentena o que ficou sem conclusao e nao toca no recente nem no concluido', async () => {
+  it('CASO 35: quarentena o que ficou sem conclusao e nao toca no recente nem no concluido', async () => {
     // O caminho sincrono so age quando uma reentrega CHEGA. Se o provedor
     // desistir, ou se o processo cair entre gravar a linha e aplicar o efeito,
     // ninguem mais volta nessa linha — e ela some da vista.
@@ -1102,7 +1102,7 @@ describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
     expect((await lido(concluido.id)).status).toBe(WebhookStatus.PROCESSED);
   });
 
-  it('CASO 22: o lote limita quantas linhas cada ciclo trata', async () => {
+  it('CASO 36: o lote limita quantas linhas cada ciclo trata', async () => {
     // Sem limite, um acumulo de orfaos viraria um UPDATE gigante segurando
     // linhas do inbox durante o ciclo inteiro.
     const velho = new Date(Date.now() - 120 * 60_000);
@@ -1128,7 +1128,7 @@ describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
 });
 
 describe('webhook — corrida da varredura (Bloco 6c)', () => {
-  it('CASO 23: linha concluida ENTRE a selecao e a escrita nao e sobrescrita', async () => {
+  it('CASO 37: linha concluida ENTRE a selecao e a escrita nao e sobrescrita', async () => {
     // A sabotagem A-8 mostrou que a reavaliacao de estado no updateMany nao
     // tinha teste: remove-la nao derrubava nada. Ela protege a janela entre o
     // findMany e o updateMany — uma reentrega pode concluir a linha ali no meio.
@@ -1178,7 +1178,7 @@ describe('webhook — corrida da varredura (Bloco 6c)', () => {
 });
 
 describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
-  it('CASO 24: evento inaplicavel ha tempo demais vira quarentena e responde 200', async () => {
+  it('CASO 38: evento inaplicavel ha tempo demais vira quarentena e responde 200', async () => {
     // Achado 4.4 da 2a rodada: o CASO 20 comeca com a linha JA em quarentena,
     // entao provava duplicata terminal, nao a TRANSICAO. O objetivo central do
     // bloco e responder 200 no momento em que desistimos — sem isso o provedor
@@ -1215,7 +1215,7 @@ describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
     expect(await prisma.outboxEvent.count()).toBe(0);
   });
 
-  it('CASO 25: evento RECENTE e inaplicavel continua devolvendo 503', async () => {
+  it('CASO 39: evento RECENTE e inaplicavel continua devolvendo 503', async () => {
     // Contraparte do 24, e o caso frequente: o webhook chega antes de o
     // providerRef ser gravado. Responder 200 aqui encerraria para sempre uma
     // captura que seria aplicada segundos depois.
@@ -1234,7 +1234,7 @@ describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
 });
 
 describe('webhook — ordenacao fina por providerCreatedAt (Bloco 6d)', () => {
-  it('CASO 26: evento ANTERIOR ao ultimo aplicado nao altera nada', async () => {
+  it('CASO 40: evento ANTERIOR ao ultimo aplicado nao altera nada', async () => {
     // A maquina de estados nao pega este caso: PROCESSING -> CAPTURED continua
     // permitida. O que distingue os dois eventos e o instante em que o PROVEDOR
     // os gerou — e sem isso o mais antigo, chegando depois, venceria.
@@ -1270,7 +1270,7 @@ describe('webhook — ordenacao fina por providerCreatedAt (Bloco 6d)', () => {
     expect(String(linha.lastError)).toContain('anterior ao ultimo');
   });
 
-  it('CASO 27: evento MAIS NOVO aplica e avanca o marcador', async () => {
+  it('CASO 41: evento MAIS NOVO aplica e avanca o marcador', async () => {
     // Contraparte do 26. Sem ele, um filtro invertido bloquearia TODOS os
     // eventos e a suite continuaria verde pelo lado errado.
     const { app, provider } = montarApp();
@@ -1300,7 +1300,7 @@ describe('webhook — ordenacao fina por providerCreatedAt (Bloco 6d)', () => {
 });
 
 describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
-  it('CASO 28: timestamp muito no futuro e recusado e nao envenena o marcador', async () => {
+  it('CASO 42: timestamp muito no futuro e recusado e nao envenena o marcador', async () => {
     const { app, provider } = montarApp();
     const { payment, chargeRef } = await cenario();
 
@@ -1322,61 +1322,7 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
     expect(String(linha.lastError)).toContain('tolerancia de futuro');
   });
 
-  it('CASO 29: duas entregas SIMULTANEAS produzem uma unica captura', async () => {
-    // Achado 4.2: os demais casos pre-carregam o marcador e simulam o estado.
-    // Aqui a disputa e real — duas requisicoes concorrentes sobre o mesmo
-    // pagamento, com timestamps diferentes, contra o Postgres.
-    const { app, provider } = montarApp();
-    const { payment, chargeRef } = await cenario();
-
-    const antigo = new Date(Date.now() - 60_000);
-    const novo = new Date();
-
-    const [a, b] = await Promise.all([
-      postar(app, provider.assinarCorpo(corpo({ created_at: antigo.toISOString() }, { charge_ref: chargeRef }))),
-      postar(app, provider.assinarCorpo(corpo({ created_at: novo.toISOString() }, { charge_ref: chargeRef }))),
-    ]);
-
-    // Nenhuma das duas pede reentrega: uma aplicou, a outra e desfecho definitivo.
-    expect(a.status).toBe(200);
-    expect(b.status).toBe(200);
-
-    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
-    expect(atual.status).toBe(PaymentStatus.CAPTURED);
-    expect(atual.capturedAmountCents).toBe(VALOR);
-    expect(atual.lastProviderEventAt).not.toBeNull();
-
-    // O invariante que importa, e que independe de quem venceu a corrida.
-    const trilha = await transacoesDe(payment.id);
-    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(1);
-    expect(await prisma.outboxEvent.count()).toBe(1);
-  });
-});
-
-describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
-  it('CASO 28: timestamp muito no futuro e recusado e nao envenena o marcador', async () => {
-    const { app, provider } = montarApp();
-    const { payment, chargeRef } = await cenario();
-
-    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
-    const res = await postar(
-      app,
-      provider.assinarCorpo(corpo({ created_at: futuro.toISOString() }, { charge_ref: chargeRef })),
-    );
-    expect(res.status).toBe(200);
-
-    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
-    expect(atual.status).toBe(PaymentStatus.PROCESSING);
-    // O marcador continua NULO: um valor absurdo aqui travaria o pagamento para
-    // sempre, porque toda transicao seguinte seria "anterior" a ele.
-    expect(atual.lastProviderEventAt).toBeNull();
-
-    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
-    expect(linha.status).toBe(WebhookStatus.IGNORED);
-    expect(String(linha.lastError)).toContain('tolerancia de futuro');
-  });
-
-  it('CASO 29: duas entregas SIMULTANEAS produzem uma unica captura', async () => {
+  it('CASO 43: duas entregas SIMULTANEAS produzem uma unica captura', async () => {
     // Achado 4.2: os demais casos pre-carregam o marcador e simulam o estado.
     // Aqui a disputa e real — duas requisicoes concorrentes sobre o mesmo
     // pagamento, com timestamps diferentes, contra o Postgres.
@@ -1408,7 +1354,7 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
 });
 
 describe('webhook — reembolso fora da ordenacao (Bloco 6d)', () => {
-  it('CASO 30: reembolso aplica o delta e NAO move o marcador', async () => {
+  it('CASO 44: reembolso aplica o delta e NAO move o marcador', async () => {
     // Decisao declarada no schema e no TECH_DEBT: a ordenacao por timestamp nao
     // vale para reembolso. La a defesa e o delta sobre refundedAmountCents, que
     // compara VALOR — rejeitar reembolso por timestamp arriscaria nao registrar
