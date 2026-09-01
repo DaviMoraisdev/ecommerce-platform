@@ -41,6 +41,27 @@ model Payment {
   attemptCount Int      @default(0)
   expiresAt    DateTime
 
+  // Quando o PROVEDOR gerou o ultimo evento que TRANSICIONOU este pagamento.
+  //
+  // Bloco 6d. A defesa contra evento fora de ordem ate aqui era a maquina de
+  // estados: transicao nao permitida vira IGNORED. Isso basta enquanto cada
+  // estado e alcancado UMA vez, e nao distingue dois eventos do MESMO tipo com
+  // providerCreatedAt diferentes — o mais antigo poderia sobrescrever o efeito
+  // do mais novo.
+  //
+  // A comparacao vive no WHERE do compare-and-swap, nunca em JavaScript antes
+  // da escrita: comparar e depois gravar abre janela entre decidir e aplicar.
+  //
+  // NULL = nenhum evento de transicao aplicado ainda. Linhas anteriores a esta
+  // migration ficam NULL e por isso aceitam o primeiro evento que chegar, que
+  // e o comportamento de hoje.
+  //
+  // NAO e atualizado pelo caminho de REEMBOLSO, de proposito: la a defesa de
+  // ordenacao e o delta sobre refundedAmountCents, que compara VALOR. Rejeitar
+  // reembolso por timestamp arriscaria nao registrar dinheiro que se moveu, se
+  // o relogio do provedor nao refletir a ordem causal.
+  lastProviderEventAt DateTime?
+
   // Qual adapter originou este pagamento: 'fake' (Bloco 2) ou 'stripe' (Bloco 9).
   provider String
 

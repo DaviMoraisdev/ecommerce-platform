@@ -31,6 +31,7 @@ export function paymentDeTeste(overrides: Partial<Payment> = {}): Payment {
     provider: 'fake',
     attemptCount: 1,
     expiresAt: new Date(AGORA.getTime() + 15 * 60_000),
+    lastProviderEventAt: null,
     createdAt: AGORA,
     updatedAt: AGORA,
     ...overrides,
