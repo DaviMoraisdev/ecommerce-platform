@@ -1505,4 +1505,79 @@ describe('webhook — o portao de plausibilidade guarda SO o marcador (Bloco 6d)
     expect(linha.status).toBe(WebhookStatus.IGNORED);
     expect(String(linha.lastError)).toContain('tipo nao tratado');
   });
+
+  it('CASO 48: linha concluida ENTRE a decisao e a escrita do motivo nao pede reentrega', async () => {
+    // A sabotagem H-2 mostrou que a verificacao do `count` em `comoRetentavel`
+    // (achado 4.3 da 5a rodada) nao tinha teste: remove-la nao derrubava nada.
+    // Ela protege a janela entre DECIDIR retentavel e GRAVAR o motivo. Uma
+    // execucao concorrente pode concluir a linha ali no meio; sem a guarda
+    // responderiamos 503 pedindo reentrega de um evento JA aplicado.
+    const { payment, chargeRef } = await cenario();
+
+    // Transacao apagada = ramo `providerRef ainda desconhecido`, o mais curto
+    // dos dois retentaveis. E um estado real, nao artificial: o webhook pode
+    // chegar antes do commit que persiste a transacao.
+    await prisma.paymentTransaction.deleteMany({ where: { paymentId: payment.id } });
+
+    let interceptou = false;
+
+    // Proxy APENAS no delegate. Embrulhar o PrismaClient inteiro esbarra em
+    // invariantes de Proxy e em campos privados quando `this` deixa de ser o
+    // objeto real; os demais modelos vao por referencia, com `this` intacto.
+    const webhookEvent = new Proxy(prisma.webhookEvent, {
+      get(alvo, prop) {
+        const valor = Reflect.get(alvo, prop) as unknown;
+        if (prop !== 'updateMany') {
+          return typeof valor === 'function' ? valor.bind(alvo) : valor;
+        }
+        return async (args: Parameters<typeof prisma.webhookEvent.updateMany>[0]) => {
+          // A escrita do `comoRetentavel` e a UNICA cujo `data` tem so
+          // `lastError`. A do catch traz `status` e `attempts` junto.
+          const chaves = Object.keys((args?.data ?? {}) as object);
+          if (!interceptou && chaves.length === 1 && chaves[0] === 'lastError') {
+            interceptou = true;
+            const { id } = args?.where as { id: string };
+            await prisma.webhookEvent.update({
+              where: { id },
+              data: { status: WebhookStatus.PROCESSED, processedAt: new Date() },
+            });
+          }
+          return prisma.webhookEvent.updateMany(args);
+        };
+      },
+    });
+
+    const entrelacado = {
+      webhookEvent,
+      payment: prisma.payment,
+      paymentTransaction: prisma.paymentTransaction,
+      outboxEvent: prisma.outboxEvent,
+      idempotencyRecord: prisma.idempotencyRecord,
+      $transaction: prisma.$transaction.bind(prisma),
+    } as unknown as PrismaClient;
+
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const service = new WebhookService({
+      prisma: entrelacado,
+      tetoDeTentativas: 5,
+      idadeMaximaMinutos: 60,
+    });
+    const app = createApp({
+      payments: express.Router(),
+      webhooks: criarWebhookRouter({ provider, service }),
+    });
+
+    const res = await postar(app, provider.assinarCorpo(corpo({}, { charge_ref: chargeRef })));
+
+    // Sem `interceptou` o teste poderia passar verde sem exercitar nada: se o
+    // discriminador deixar de casar, e isto que denuncia.
+    expect(interceptou).toBe(true);
+    // Com a guarda: estado REAL, terminal, 200. Sem ela: retentavel, 503.
+    expect(res.status).toBe(200);
+
+    // O desfecho da execucao concorrente sobrevive; nada foi sobrescrito.
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.PROCESSED);
+    expect(linha.lastError).toBeNull();
+  });
 });
