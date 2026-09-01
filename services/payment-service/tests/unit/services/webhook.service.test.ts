@@ -37,6 +37,10 @@ function pagamento(overrides: Partial<Payment> = {}): Payment {
     provider: 'fake',
     attemptCount: 1,
     expiresAt: new Date(AGORA.getTime() + 900_000),
+    // O `as Payment` abaixo aceita objeto INCOMPLETO, e foi assim que o campo
+    // novo chegou como `undefined` a um caminho que esperava `null`. Duble que
+    // mente sobre a forma esconde defeito ate ele virar 500 em producao.
+    lastProviderEventAt: null,
     createdAt: AGORA,
     updatedAt: AGORA,
     ...overrides,
@@ -241,7 +245,9 @@ describe('WebhookService — ordenacao fina por providerCreatedAt (Bloco 6d)', (
     const resultado = await service.processar('fake', eventoDeCaptura({ providerCreatedAt: AGORA }));
 
     expect(resultado.status).toBe(WebhookStatus.IGNORED);
-    expect(String(resultado.motivo)).toContain('anterior ao ultimo ja aplicado');
+    // Motivo PROPRIO do empate: dizer "anterior" sobre dois eventos do mesmo
+    // instante grava informacao errada no campo que a triagem le.
+    expect(String(resultado.motivo)).toContain('mesmo instante do ultimo evento aplicado');
     expect(inbox.find((d) => d.status === WebhookStatus.IGNORED)).toBeDefined();
   });
 
@@ -262,6 +268,44 @@ describe('WebhookService — ordenacao fina por providerCreatedAt (Bloco 6d)', (
     const resultado = await service.processar('fake', eventoDeCaptura({ providerCreatedAt: AGORA }));
 
     expect(resultado.status).toBe(WebhookStatus.IGNORED);
+  });
+
+  it('CASO U5: providerCreatedAt muito no futuro nao vira marcador', async () => {
+    // Achado 3.1 do review do PR #59. A assinatura prova a ORIGEM dos bytes,
+    // nao a PLAUSIBILIDADE do valor. Como o campo vira marcador PERSISTENTE, um
+    // unico evento com timestamp absurdo bloquearia todas as transicoes
+    // seguintes daquele pagamento — negacao de servico por pagamento, terminal.
+    const { service, tx } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
+      [],
+    );
+
+    const resultado = await service.processar(
+      'fake',
+      eventoDeCaptura({ providerCreatedAt: new Date(Date.now() + 60 * 60_000) }),
+    );
+
+    expect(resultado.status).toBe(WebhookStatus.IGNORED);
+    expect(String(resultado.motivo)).toContain('alem da tolerancia de futuro');
+    // Nem chega a abrir a transacao: o marcador NAO avanca.
+    expect(tx.payment.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('CASO U6: dentro da tolerancia, desvio de relogio nao impede a aplicacao', async () => {
+    // Contraparte do U5. Sem ela, uma tolerancia zerada (ou invertida) recusaria
+    // todo evento e a suite continuaria verde pelo lado errado — relogio de
+    // provedor adiantado em segundos e normal, nao anomalia.
+    const { service } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
+      [1],
+    );
+
+    const resultado = await service.processar(
+      'fake',
+      eventoDeCaptura({ providerCreatedAt: new Date(Date.now() + 60_000) }),
+    );
+
+    expect(resultado.status).toBe(WebhookStatus.PROCESSED);
   });
 
   it('CASO U4: perder o CAS e reler um marcador MAIS NOVO encerra como obsoleto', async () => {

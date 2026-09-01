@@ -13,6 +13,22 @@ import { enqueue } from '../events/outbox.repository';
 import { montarEventoDeCaptura } from '../events/payment.events';
 import type { WebhookEventPayload } from '../providers/payment-provider.port';
 
+/**
+ * Quanto o `providerCreatedAt` pode estar a FRENTE do nosso relogio.
+ *
+ * Achado 3.1 do review do PR #59. O campo vem do payload do provedor, e a
+ * assinatura prova a ORIGEM dos bytes, nao a PLAUSIBILIDADE do valor — a mesma
+ * licao que o Bloco 4 registrou ao criar a checagem de coerencia monetaria.
+ * Como o valor vira MARCADOR PERSISTENTE, um unico evento com timestamp muito
+ * futuro bloquearia todas as transicoes seguintes daquele pagamento, para
+ * sempre: negacao de servico por pagamento, e terminal.
+ *
+ * Constante, e nao configuracao: e tolerancia a desvio de relogio, grandeza
+ * tecnica sem decisao de negocio. Vai para o AppConfig no dia em que alguem
+ * precisar ajusta-la por ambiente.
+ */
+const TOLERANCIA_DE_FUTURO_MS = 5 * 60_000;
+
 export interface WebhookServiceDeps {
   prisma: PrismaClient;
   /** Ver AppConfig.webhookMaxAttempts. Sem default: o teto e decisao, nao detalhe. */
@@ -457,6 +473,18 @@ export class WebhookService {
     // depender de estreitamento sobre propriedade ao longo de todo o metodo.
     const ocorridoEm = evento.providerCreatedAt;
 
+    // FAIL-CLOSED de plausibilidade, irmao do gate de nulidade acima: um valor
+    // absurdo no futuro nao pode virar marcador. Ver TOLERANCIA_DE_FUTURO_MS.
+    // IGNORED (nao retentavel): reentregar nao muda o timestamp do payload, e o
+    // que resta e triagem humana. O marcador NAO avanca.
+    if (ocorridoEm.getTime() > Date.now() + TOLERANCIA_DE_FUTURO_MS) {
+      return this.encerrar(
+        registroId,
+        WebhookStatus.IGNORED,
+        'providerCreatedAt alem da tolerancia de futuro',
+      );
+    }
+
     if (evento.eventType === 'unsupported') {
       return this.encerrar(
         registroId,
@@ -610,6 +638,14 @@ export class WebhookService {
       });
 
       // Outro evento ja aplicou o MESMO desfecho: nao houve recusa.
+      //
+      // PRECEDENCIA DECLARADA (achado 4.2 do review do PR #59): esta checagem
+      // vem ANTES da temporal de proposito. Se o estado ja e o que este evento
+      // produziria, o desfecho e o mesmo e PROCESSED e a verdade — mesmo que
+      // este evento seja mais antigo. Consequencia aceita: quando o evento
+      // ANTIGO vence a corrida, o marcador fica no instante dele, e nao no do
+      // mais novo. Nao ha dano (o estado e identico), e a monotonicidade do
+      // marcador vale para eventos APLICADOS, nao para eventos recebidos.
       if (novoStatus === atual.status) {
         return this.encerrar(registroId, WebhookStatus.PROCESSED);
       }
@@ -624,12 +660,31 @@ export class WebhookService {
       // apenas impede a escrita, sem dizer por que. `<=` e nao `<`: dois
       // eventos com o mesmo instante nao tem ordem entre si, e o primeiro ja
       // aplicou — escolher o segundo seria decidir no escuro.
-      if (atual.lastProviderEventAt !== null && ocorridoEm <= atual.lastProviderEventAt) {
-        return this.encerrar(
-          registroId,
-          WebhookStatus.IGNORED,
-          'evento anterior ao ultimo ja aplicado neste pagamento',
-        );
+      // Capturado numa const e testado por VERACIDADE, nao por `!== null`: um
+      // Date presente e sempre truthy, e a forma dispensa saber se a origem
+      // devolve `null` ou `undefined`. Um TypeError aqui viraria 500, o
+      // provedor reentregaria, `attempts` subiria e o evento acabaria em
+      // quarentena por um defeito nosso.
+      const ultimoAplicado = atual.lastProviderEventAt;
+      if (ultimoAplicado) {
+        // EMPATE tem motivo proprio: dizer "anterior" sobre dois eventos do
+        // mesmo instante e gravar informacao errada na trilha, e a triagem le
+        // exatamente esse campo. Sem ordem entre eles, o primeiro que aplicou
+        // vence — escolher o segundo seria decidir no escuro.
+        if (ocorridoEm.getTime() === ultimoAplicado.getTime()) {
+          return this.encerrar(
+            registroId,
+            WebhookStatus.IGNORED,
+            'mesmo instante do ultimo evento aplicado; sem ordem entre eles',
+          );
+        }
+        if (ocorridoEm < ultimoAplicado) {
+          return this.encerrar(
+            registroId,
+            WebhookStatus.IGNORED,
+            'evento anterior ao ultimo ja aplicado neste pagamento',
+          );
+        }
       }
 
       // O estado avancou para algo que nao aceita mais esta transicao: obsoleto.
