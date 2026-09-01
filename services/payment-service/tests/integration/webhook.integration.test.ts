@@ -1352,3 +1352,96 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
     expect(await prisma.outboxEvent.count()).toBe(1);
   });
 });
+
+describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
+  it('CASO 28: timestamp muito no futuro e recusado e nao envenena o marcador', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ created_at: futuro.toISOString() }, { charge_ref: chargeRef })),
+    );
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.PROCESSING);
+    // O marcador continua NULO: um valor absurdo aqui travaria o pagamento para
+    // sempre, porque toda transicao seguinte seria "anterior" a ele.
+    expect(atual.lastProviderEventAt).toBeNull();
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.IGNORED);
+    expect(String(linha.lastError)).toContain('tolerancia de futuro');
+  });
+
+  it('CASO 29: duas entregas SIMULTANEAS produzem uma unica captura', async () => {
+    // Achado 4.2: os demais casos pre-carregam o marcador e simulam o estado.
+    // Aqui a disputa e real — duas requisicoes concorrentes sobre o mesmo
+    // pagamento, com timestamps diferentes, contra o Postgres.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const antigo = new Date(Date.now() - 60_000);
+    const novo = new Date();
+
+    const [a, b] = await Promise.all([
+      postar(app, provider.assinarCorpo(corpo({ created_at: antigo.toISOString() }, { charge_ref: chargeRef }))),
+      postar(app, provider.assinarCorpo(corpo({ created_at: novo.toISOString() }, { charge_ref: chargeRef }))),
+    ]);
+
+    // Nenhuma das duas pede reentrega: uma aplicou, a outra e desfecho definitivo.
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+    expect(atual.capturedAmountCents).toBe(VALOR);
+    expect(atual.lastProviderEventAt).not.toBeNull();
+
+    // O invariante que importa, e que independe de quem venceu a corrida.
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(1);
+    expect(await prisma.outboxEvent.count()).toBe(1);
+  });
+});
+
+describe('webhook — reembolso fora da ordenacao (Bloco 6d)', () => {
+  it('CASO 30: reembolso aplica o delta e NAO move o marcador', async () => {
+    // Decisao declarada no schema e no TECH_DEBT: a ordenacao por timestamp nao
+    // vale para reembolso. La a defesa e o delta sobre refundedAmountCents, que
+    // compara VALOR — rejeitar reembolso por timestamp arriscaria nao registrar
+    // dinheiro que JA se moveu, se o relogio do provedor nao refletir a ordem
+    // causal. Este caso trava a decisao: sem ele, uniformizar o codigo passaria
+    // despercebido.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+
+    const marcador = new Date();
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { capturedAmountCents: VALOR, lastProviderEventAt: marcador },
+    });
+
+    // created_at ANTERIOR ao marcador: se a ordenacao valesse aqui, seria
+    // descartado como obsoleto e o reembolso sumiria da trilha.
+    const antigo = new Date(marcador.getTime() - 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo(
+          { type: 'refund.succeeded', created_at: antigo.toISOString() },
+          { charge_ref: chargeRef, refunded_amount_cents: 5000 },
+        ),
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(5000);
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+    // O marcador registra eventos de TRANSICAO, e reembolso nao e transicao.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(marcador.getTime());
+  });
+});
