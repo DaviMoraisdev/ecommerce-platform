@@ -13,6 +13,22 @@ import { enqueue } from '../events/outbox.repository';
 import { montarEventoDeCaptura } from '../events/payment.events';
 import type { WebhookEventPayload } from '../providers/payment-provider.port';
 
+/**
+ * Quanto o `providerCreatedAt` pode estar a FRENTE do nosso relogio.
+ *
+ * Achado 3.1 do review do PR #59. O campo vem do payload do provedor, e a
+ * assinatura prova a ORIGEM dos bytes, nao a PLAUSIBILIDADE do valor — a mesma
+ * licao que o Bloco 4 registrou ao criar a checagem de coerencia monetaria.
+ * Como o valor vira MARCADOR PERSISTENTE, um unico evento com timestamp muito
+ * futuro bloquearia todas as transicoes seguintes daquele pagamento, para
+ * sempre: negacao de servico por pagamento, e terminal.
+ *
+ * Constante, e nao configuracao: e tolerancia a desvio de relogio, grandeza
+ * tecnica sem decisao de negocio. Vai para o AppConfig no dia em que alguem
+ * precisar ajusta-la por ambiente.
+ */
+const TOLERANCIA_DE_FUTURO_MS = 5 * 60_000;
+
 export interface WebhookServiceDeps {
   prisma: PrismaClient;
   /** Ver AppConfig.webhookMaxAttempts. Sem default: o teto e decisao, nao detalhe. */
@@ -292,6 +308,39 @@ export class WebhookService {
   }
 
   /**
+   * Desfecho RETENTAVEL: registra o motivo na linha e devolve 5xx para o
+   * provedor reentregar.
+   *
+   * A guarda de estado impede escrever sobre linha ja concluida por execucao
+   * concorrente. E o `count` IMPORTA (achado 4.3): se outra execucao concluiu ou
+   * quarentenou a linha entre a decisao e esta escrita, responder retentavel
+   * pediria reentrega de algo ja terminal. Nesse caso devolvemos o estado REAL,
+   * que a rota traduz em 200.
+   *
+   * Compartilhado pelos DOIS ramos retentaveis: os dois ignoravam o `count`, e
+   * corrigir so o novo criaria assimetria entre caminhos que fazem o mesmo.
+   */
+  private async comoRetentavel(registroId: string, motivo: string): Promise<ResultadoDeWebhook> {
+    const { count } = await this.deps.prisma.webhookEvent.updateMany({
+      where: {
+        id: registroId,
+        status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+      },
+      data: { lastError: motivo },
+    });
+
+    if (count === 0) {
+      const linha = await this.deps.prisma.webhookEvent.findUnique({
+        where: { id: registroId },
+        select: { status: true },
+      });
+      if (linha !== null) return { status: linha.status, motivo };
+    }
+
+    return { status: WebhookStatus.RECEIVED, motivo, retentavel: true };
+  }
+
+  /**
    * Quarentena por IDADE (Bloco 6c).
    *
    * Um desfecho `retentavel` devolve 5xx e o provedor reentrega, mas NAO
@@ -453,6 +502,20 @@ export class WebhookService {
       return this.encerrar(registroId, WebhookStatus.IGNORED, 'evento sem providerCreatedAt');
     }
 
+    // Nao-nulo daqui para baixo. Capturado numa const para o compilador nao
+    // depender de estreitamento sobre propriedade ao longo de todo o metodo.
+    const ocorridoEm = evento.providerCreatedAt;
+
+    const ocorridoEmMs = ocorridoEm.getTime();
+
+    // TIMESTAMP MALFORMADO (achado 3.2). `Invalid Date` faz `getTime()` devolver
+    // NaN, e TODA comparacao com NaN e falsa — o valor atravessaria o portao
+    // abaixo e chegaria ao banco. Terminal, e nao retentavel: reentregar nao
+    // conserta um timestamp que veio quebrado.
+    if (!Number.isFinite(ocorridoEmMs)) {
+      return this.encerrar(registroId, WebhookStatus.IGNORED, 'providerCreatedAt invalido');
+    }
+
     if (evento.eventType === 'unsupported') {
       return this.encerrar(
         registroId,
@@ -474,18 +537,7 @@ export class WebhookService {
       // quarentena sao do Bloco 6.
       // Mesma guarda do catch e do encerrar: nao escreve sobre linha ja
       // concluida por execucao concorrente (achado 4.1 da 3a rodada).
-      await this.deps.prisma.webhookEvent.updateMany({
-        where: {
-          id: registroId,
-          status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
-        },
-        data: { lastError: 'providerRef ainda desconhecido' },
-      });
-      return {
-        status: WebhookStatus.RECEIVED,
-        motivo: 'providerRef ainda desconhecido',
-        retentavel: true,
-      };
+      return this.comoRetentavel(registroId, 'providerRef ainda desconhecido');
     }
 
     const payment = await this.deps.prisma.payment.findUniqueOrThrow({
@@ -497,6 +549,24 @@ export class WebhookService {
     // reembolso seria descartado como "estado ja aplicado".
     if (evento.eventType === 'refund.succeeded') {
       return this.aplicarReembolso(registroId, evento, payment);
+    }
+
+    // PLAUSIBILIDADE DO TIMESTAMP — guarda APENAS o caminho que escreve
+    // `lastProviderEventAt`.
+    //
+    // Estava tres passos acima, antes do roteamento de reembolso e da
+    // classificacao de `unsupported`, e por isso retinha os dois (achados 4.1 e
+    // 4.2 da 5a rodada). No reembolso o dano e financeiro e contradiz a decisao
+    // declarada no schema e provada pelo CASO 44: um `refund.succeeded` seis
+    // minutos a frente ficava retentavel, nunca aplicava o delta e terminava em
+    // quarentena — dinheiro devolvido pelo provedor sem registro nosso. La a
+    // defesa de ordenacao e o delta sobre `refundedAmountCents`, que compara
+    // VALOR e nao depende de relogio nenhum.
+    //
+    // RETENTAVEL, e nao terminal: o outro lado da comparacao, `Date.now()`,
+    // muda. O caminho terminal e a quarentena por IDADE do Bloco 6c.
+    if (ocorridoEmMs > Date.now() + TOLERANCIA_DE_FUTURO_MS) {
+      return this.comoRetentavel(registroId, 'providerCreatedAt alem da tolerancia de futuro');
     }
 
     const novoStatus = mapearEstadoDoProvedor(evento.state);
@@ -537,9 +607,27 @@ export class WebhookService {
       // COMPARE-AND-SWAP: o status lido entra no WHERE. Se outro processo mudou
       // o pagamento entre a leitura e a escrita, count = 0 e nada e aplicado.
       const { count } = await tx.payment.updateMany({
-        where: { id: payment.id, status: payment.status },
+        where: {
+          id: payment.id,
+          status: payment.status,
+          // ORDENACAO FINA (Bloco 6d). `podeTransicionar` cuida da ordem entre
+          // ESTADOS; isto cuida da ordem entre EVENTOS. O marcador e GLOBAL
+          // entre eventos de TRANSICAO — nao ha um por tipo: dois eventos com
+          // providerCreatedAt diferentes passam pelas mesmas checagens, e o
+          // mais ANTIGO chegando depois sobrescreveria o efeito do mais novo.
+          //
+          // A condicao vive AQUI, atomica com a escrita, e nao num ramo em
+          // JavaScript antes da transacao. Existiu um ramo assim, e a bateria
+          // mostrou que ele nao mudava NADA: o evento obsoleto perde o CAS, cai
+          // na releitura abaixo, e e encerrado la com o mesmo motivo. A mesma
+          // condicao em tres lugares so cria chance de divergirem.
+          OR: [{ lastProviderEventAt: null }, { lastProviderEventAt: { lt: ocorridoEm } }],
+        },
         data: {
           status: novoStatus,
+          // O marcador avanca na MESMA instrucao do efeito: gravar depois
+          // deixaria uma janela em que o proximo evento antigo ainda passaria.
+          lastProviderEventAt: ocorridoEm,
           ...(evento.eventType === 'payment.succeeded'
             ? { capturedAmountCents: evento.capturedAmountCents }
             : {}),
@@ -568,6 +656,11 @@ export class WebhookService {
         );
       }
 
+      // SEM guarda de estado, ao contrario do `encerrar`, do `catch` e do ramo
+      // retentavel — e a assimetria e deliberada. So se chega aqui tendo GANHO o
+      // compare-and-swap acima, ou seja, tendo aplicado o efeito financeiro.
+      // Marcar PROCESSED por cima de IGNORED ou QUARANTINED e dizer a verdade.
+      // Com guarda, o dinheiro teria se movido e a linha NAO registraria isso.
       await tx.webhookEvent.update({
         where: { id: registroId },
         data: { status: WebhookStatus.PROCESSED, processedAt: new Date(), lastError: null },
@@ -583,8 +676,53 @@ export class WebhookService {
       });
 
       // Outro evento ja aplicou o MESMO desfecho: nao houve recusa.
+      //
+      // PRECEDENCIA DECLARADA (achado 4.2 do review do PR #59): esta checagem
+      // vem ANTES da temporal de proposito. Se o estado ja e o que este evento
+      // produziria, o desfecho e o mesmo e PROCESSED e a verdade — mesmo que
+      // este evento seja mais antigo. Consequencia aceita: quando o evento
+      // ANTIGO vence a corrida, o marcador fica no instante dele, e nao no do
+      // mais novo. Nao ha dano (o estado e identico), e a monotonicidade do
+      // marcador vale para eventos APLICADOS, nao para eventos recebidos.
       if (novoStatus === atual.status) {
         return this.encerrar(registroId, WebhookStatus.PROCESSED);
+      }
+
+      // Perdemos para um evento MAIS NOVO: este e obsoleto por tempo, mesmo que
+      // a transicao continue permitida. Sem esta checagem, o ramo abaixo
+      // devolveria "retentavel" e o provedor reentregaria um evento que nunca
+      // vai poder ser aplicado — laco que so pararia no teto do 6c, e como
+      // quarentena, nao como decisao.
+      //
+      // E AQUI que a ordenacao vira MOTIVO para a triagem: o WHERE do CAS
+      // apenas impede a escrita, sem dizer por que. `<=` e nao `<`: dois
+      // eventos com o mesmo instante nao tem ordem entre si, e o primeiro ja
+      // aplicou — escolher o segundo seria decidir no escuro.
+      // Capturado numa const e testado por VERACIDADE, nao por `!== null`: um
+      // Date presente e sempre truthy, e a forma dispensa saber se a origem
+      // devolve `null` ou `undefined`. Um TypeError aqui viraria 500, o
+      // provedor reentregaria, `attempts` subiria e o evento acabaria em
+      // quarentena por um defeito nosso.
+      const ultimoAplicado = atual.lastProviderEventAt;
+      if (ultimoAplicado) {
+        // EMPATE tem motivo proprio: dizer "anterior" sobre dois eventos do
+        // mesmo instante e gravar informacao errada na trilha, e a triagem le
+        // exatamente esse campo. Sem ordem entre eles, o primeiro que aplicou
+        // vence — escolher o segundo seria decidir no escuro.
+        if (ocorridoEm.getTime() === ultimoAplicado.getTime()) {
+          return this.encerrar(
+            registroId,
+            WebhookStatus.IGNORED,
+            'mesmo instante do ultimo evento aplicado; sem ordem entre eles',
+          );
+        }
+        if (ocorridoEm < ultimoAplicado) {
+          return this.encerrar(
+            registroId,
+            WebhookStatus.IGNORED,
+            'evento anterior ao ultimo ja aplicado neste pagamento',
+          );
+        }
       }
 
       // O estado avancou para algo que nao aceita mais esta transicao: obsoleto.
@@ -736,6 +874,8 @@ export class WebhookService {
             providerRef: evento.providerRef,
           },
         });
+        // Mesma assimetria deliberada do caminho de captura: so se chega aqui
+        // tendo ganho o CAS do valor, entao o reembolso foi aplicado.
         await tx.webhookEvent.update({
           where: { id: registroId },
           data: { status: WebhookStatus.PROCESSED, processedAt: new Date(), lastError: null },

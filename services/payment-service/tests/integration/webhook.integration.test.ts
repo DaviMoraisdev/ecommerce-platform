@@ -995,7 +995,7 @@ describe('webhook — gravacao na outbox', () => {
 // Bloco 6c — quarentena terminal
 // ==========================================================
 describe('webhook — quarentena (Bloco 6c)', () => {
-  it('CASO 20: reentrega sobre linha em QUARENTENA nao reprocessa nem aplica efeito', async () => {
+  it('CASO 34: reentrega sobre linha em QUARENTENA nao reprocessa nem aplica efeito', async () => {
     // O caso que justifica `registrar` tratar QUARANTINED como duplicata.
     // As guardas do catch e do encerrar filtram status in (RECEIVED, FAILED):
     // se uma reentrega reprocessasse a linha em quarentena, o efeito financeiro
@@ -1045,7 +1045,7 @@ describe('webhook — quarentena (Bloco 6c)', () => {
 });
 
 describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
-  it('CASO 21: quarentena o que ficou sem conclusao e nao toca no recente nem no concluido', async () => {
+  it('CASO 35: quarentena o que ficou sem conclusao e nao toca no recente nem no concluido', async () => {
     // O caminho sincrono so age quando uma reentrega CHEGA. Se o provedor
     // desistir, ou se o processo cair entre gravar a linha e aplicar o efeito,
     // ninguem mais volta nessa linha — e ela some da vista.
@@ -1102,7 +1102,7 @@ describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
     expect((await lido(concluido.id)).status).toBe(WebhookStatus.PROCESSED);
   });
 
-  it('CASO 22: o lote limita quantas linhas cada ciclo trata', async () => {
+  it('CASO 36: o lote limita quantas linhas cada ciclo trata', async () => {
     // Sem limite, um acumulo de orfaos viraria um UPDATE gigante segurando
     // linhas do inbox durante o ciclo inteiro.
     const velho = new Date(Date.now() - 120 * 60_000);
@@ -1128,7 +1128,7 @@ describe('webhook — varredura do inbox orfao (Bloco 6c)', () => {
 });
 
 describe('webhook — corrida da varredura (Bloco 6c)', () => {
-  it('CASO 23: linha concluida ENTRE a selecao e a escrita nao e sobrescrita', async () => {
+  it('CASO 37: linha concluida ENTRE a selecao e a escrita nao e sobrescrita', async () => {
     // A sabotagem A-8 mostrou que a reavaliacao de estado no updateMany nao
     // tinha teste: remove-la nao derrubava nada. Ela protege a janela entre o
     // findMany e o updateMany — uma reentrega pode concluir a linha ali no meio.
@@ -1178,8 +1178,8 @@ describe('webhook — corrida da varredura (Bloco 6c)', () => {
 });
 
 describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
-  it('CASO 24: evento inaplicavel ha tempo demais vira quarentena e responde 200', async () => {
-    // Achado 4.4 da 2a rodada: o CASO 20 comeca com a linha JA em quarentena,
+  it('CASO 38: evento inaplicavel ha tempo demais vira quarentena e responde 200', async () => {
+    // Achado 4.4 da 2a rodada: o caso da reentrega sobre linha JA em quarentena
     // entao provava duplicata terminal, nao a TRANSICAO. O objetivo central do
     // bloco e responder 200 no momento em que desistimos — sem isso o provedor
     // continua reentregando um evento que ja abandonamos.
@@ -1215,8 +1215,8 @@ describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
     expect(await prisma.outboxEvent.count()).toBe(0);
   });
 
-  it('CASO 25: evento RECENTE e inaplicavel continua devolvendo 503', async () => {
-    // Contraparte do 24, e o caso frequente: o webhook chega antes de o
+  it('CASO 39: evento RECENTE e inaplicavel continua devolvendo 503', async () => {
+    // Contraparte do caso anterior, e o mais frequente: o webhook chega antes de o
     // providerRef ser gravado. Responder 200 aqui encerraria para sempre uma
     // captura que seria aplicada segundos depois.
     const { app, provider } = montarApp();
@@ -1230,5 +1230,354 @@ describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
     });
     expect(linha.status).toBe(WebhookStatus.RECEIVED);
     expect(linha.processedAt).toBeNull();
+  });
+});
+
+describe('webhook — ordenacao fina por providerCreatedAt (Bloco 6d)', () => {
+  it('CASO 40: evento ANTERIOR ao ultimo aplicado nao altera nada', async () => {
+    // A maquina de estados nao pega este caso: PROCESSING -> CAPTURED continua
+    // permitida. O que distingue os dois eventos e o instante em que o PROVEDOR
+    // os gerou — e sem isso o mais antigo, chegando depois, venceria.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const marcador = new Date();
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { lastProviderEventAt: marcador },
+    });
+
+    const antigo = new Date(marcador.getTime() - 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ created_at: antigo.toISOString() }, { charge_ref: chargeRef })),
+    );
+    // IGNORED e desfecho DEFINITIVO: 200, para o provedor nao reentregar.
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.PROCESSING);
+    expect(atual.capturedAmountCents).toBe(0);
+    // O marcador NAO retrocede.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(marcador.getTime());
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(0);
+    expect(await prisma.outboxEvent.count()).toBe(0);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.IGNORED);
+    expect(String(linha.lastError)).toContain('anterior ao ultimo');
+  });
+
+  it('CASO 41: evento MAIS NOVO aplica e avanca o marcador', async () => {
+    // Contraparte do caso anterior. Sem ela, um filtro invertido bloquearia TODOS os
+    // eventos e a suite continuaria verde pelo lado errado.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { lastProviderEventAt: new Date(Date.now() - 60 * 60_000) },
+    });
+
+    const agora = new Date();
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ created_at: agora.toISOString() }, { charge_ref: chargeRef })),
+    );
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+    expect(atual.capturedAmountCents).toBe(VALOR);
+    // O marcador avanca na MESMA instrucao do efeito.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(agora.getTime());
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(1);
+  });
+});
+
+describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
+  it('CASO 42: timestamp muito no futuro e recusado e nao envenena o marcador', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ created_at: futuro.toISOString() }, { charge_ref: chargeRef })),
+    );
+    // 503, e nao 200: o relogio ainda pode alcancar o timestamp, e confirmar
+    // definitivamente perderia um evento financeiro legitimo.
+    expect(res.status).toBe(503);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.PROCESSING);
+    // O marcador continua NULO: um valor absurdo aqui travaria o pagamento para
+    // sempre, porque toda transicao seguinte seria "anterior" a ele.
+    expect(atual.lastProviderEventAt).toBeNull();
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    // Continua ABERTA para a proxima reentrega, com o motivo registrado.
+    expect(linha.status).toBe(WebhookStatus.RECEIVED);
+    expect(String(linha.lastError)).toContain('tolerancia de futuro');
+  });
+
+  it('CASO 43: futuro que nunca se resolve termina em QUARENTENA por idade', async () => {
+    // Fecha o argumento do caso do timestamp futuro: torna-lo retentavel so e seguro
+    // porque EXISTE caminho terminal. Ele nao precisa de segundo limiar — e a
+    // quarentena por idade do Bloco 6c, e este caso prova que os dois compoem.
+    const { app, provider } = montarApp();
+    const { chargeRef } = await cenario();
+
+    const eventoId = `evt_${randomUUID()}`;
+    await prisma.webhookEvent.create({
+      data: {
+        provider: 'fake',
+        providerEventId: eventoId,
+        eventType: 'payment.succeeded',
+        payload: {},
+        providerCreatedAt: new Date(),
+        status: WebhookStatus.RECEIVED,
+        receivedAt: new Date(Date.now() - 120 * 60_000),
+      },
+    });
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo({ id: eventoId, created_at: futuro.toISOString() }, { charge_ref: chargeRef }),
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.QUARANTINED);
+    expect(String(linha.lastError)).toContain('inaplicavel ha mais de');
+    expect(String(linha.lastError)).toContain('tolerancia de futuro');
+  });
+
+  it('CASO 44: duas entregas SIMULTANEAS produzem uma unica captura', async () => {
+    // Achado 4.2: os demais casos pre-carregam o marcador e simulam o estado.
+    // Aqui a disputa e real — duas requisicoes concorrentes sobre o mesmo
+    // pagamento, com timestamps diferentes, contra o Postgres.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const antigo = new Date(Date.now() - 60_000);
+    const novo = new Date();
+    // Ids EXPLICITAMENTE distintos: sao dois eventos diferentes disputando o
+    // mesmo pagamento, nao duas entregas do mesmo evento.
+    const idAntigo = `evt_${randomUUID()}`;
+    const idNovo = `evt_${randomUUID()}`;
+
+    const [a, b] = await Promise.all([
+      postar(app, provider.assinarCorpo(corpo({ id: idAntigo, created_at: antigo.toISOString() }, { charge_ref: chargeRef }))),
+      postar(app, provider.assinarCorpo(corpo({ id: idNovo, created_at: novo.toISOString() }, { charge_ref: chargeRef }))),
+    ]);
+
+    // Nenhuma das duas pede reentrega: uma aplicou, a outra e desfecho definitivo.
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+    expect(atual.capturedAmountCents).toBe(VALOR);
+    expect(atual.lastProviderEventAt).not.toBeNull();
+
+    // O invariante que importa, e que independe de quem venceu a corrida.
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(1);
+    expect(await prisma.outboxEvent.count()).toBe(1);
+
+    // As DUAS linhas do inbox existem e nenhuma ficou aberta pedindo reentrega.
+    const linhas = await prisma.webhookEvent.findMany({ orderBy: { receivedAt: 'asc' } });
+    expect(linhas).toHaveLength(2);
+    expect(linhas.every((l) => l.status !== WebhookStatus.RECEIVED)).toBe(true);
+
+    // POLITICA DECLARADA: se o evento ANTIGO vence a corrida, o marcador fica no
+    // instante DELE — a monotonicidade vale para eventos aplicados, nao para
+    // eventos recebidos. Por isso a assercao aceita os dois desfechos.
+    expect([antigo.getTime(), novo.getTime()]).toContain(atual.lastProviderEventAt?.getTime());
+  });
+});
+
+describe('webhook — reembolso fora da ordenacao (Bloco 6d)', () => {
+  it('CASO 45: reembolso aplica o delta e NAO move o marcador', async () => {
+    // Decisao declarada no schema e no TECH_DEBT: a ordenacao por timestamp nao
+    // vale para reembolso. La a defesa e o delta sobre refundedAmountCents, que
+    // compara VALOR — rejeitar reembolso por timestamp arriscaria nao registrar
+    // dinheiro que JA se moveu, se o relogio do provedor nao refletir a ordem
+    // causal. Este caso trava a decisao: sem ele, uniformizar o codigo passaria
+    // despercebido.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+
+    const marcador = new Date();
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { capturedAmountCents: VALOR, lastProviderEventAt: marcador },
+    });
+
+    // created_at ANTERIOR ao marcador: se a ordenacao valesse aqui, seria
+    // descartado como obsoleto e o reembolso sumiria da trilha.
+    const antigo = new Date(marcador.getTime() - 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo(
+          { type: 'refund.succeeded', created_at: antigo.toISOString() },
+          { charge_ref: chargeRef, refunded_amount_cents: 5000 },
+        ),
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(5000);
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+    // O marcador registra eventos de TRANSICAO, e reembolso nao e transicao.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(marcador.getTime());
+  });
+});
+
+describe('webhook — o portao de plausibilidade guarda SO o marcador (Bloco 6d)', () => {
+  it('CASO 46: reembolso com timestamp FUTURO aplica o delta mesmo assim', async () => {
+    // Achado 4.1 da 5a rodada. O portao estava antes do roteamento de reembolso
+    // e retinha um caminho que, por decisao declarada no schema e provado pelo
+    // caso do reembolso antigo, NAO depende de relogio: la a defesa e o delta
+    // sobre refundedAmountCents, que compara VALOR.
+    //
+    // Com o portao no lugar errado, um refund seis minutos a frente ficava
+    // retentavel, nunca aplicava o delta e terminava em quarentena — dinheiro
+    // devolvido pelo provedor sem registro nosso.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+
+    const marcador = new Date();
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { capturedAmountCents: VALOR, lastProviderEventAt: marcador },
+    });
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo(
+          { type: 'refund.succeeded', created_at: futuro.toISOString() },
+          { charge_ref: chargeRef, refunded_amount_cents: 5000 },
+        ),
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(5000);
+    // O marcador continua intocado: reembolso nao e transicao.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(marcador.getTime());
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.REFUND)).toHaveLength(1);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.PROCESSED);
+  });
+
+  it('CASO 47: evento NAO SUPORTADO com timestamp futuro e terminal, nao 503', async () => {
+    // Achado 4.2: reter com 503 um evento que nunca sera processado so produz
+    // reentrega e ruido de quarentena, sem beneficio nenhum.
+    const { app, provider } = montarApp();
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ type: 'payment.disputed', created_at: futuro.toISOString() })),
+    );
+    expect(res.status).toBe(200);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.IGNORED);
+    expect(String(linha.lastError)).toContain('tipo nao tratado');
+  });
+
+  it('CASO 48: linha concluida ENTRE a decisao e a escrita do motivo nao pede reentrega', async () => {
+    // A sabotagem H-2 mostrou que a verificacao do `count` em `comoRetentavel`
+    // (achado 4.3 da 5a rodada) nao tinha teste: remove-la nao derrubava nada.
+    // Ela protege a janela entre DECIDIR retentavel e GRAVAR o motivo. Uma
+    // execucao concorrente pode concluir a linha ali no meio; sem a guarda
+    // responderiamos 503 pedindo reentrega de um evento JA aplicado.
+    const { payment, chargeRef } = await cenario();
+
+    // Transacao apagada = ramo `providerRef ainda desconhecido`, o mais curto
+    // dos dois retentaveis. E um estado real, nao artificial: o webhook pode
+    // chegar antes do commit que persiste a transacao.
+    await prisma.paymentTransaction.deleteMany({ where: { paymentId: payment.id } });
+
+    let interceptou = false;
+
+    // Proxy APENAS no delegate. Embrulhar o PrismaClient inteiro esbarra em
+    // invariantes de Proxy e em campos privados quando `this` deixa de ser o
+    // objeto real; os demais modelos vao por referencia, com `this` intacto.
+    const webhookEvent = new Proxy(prisma.webhookEvent, {
+      get(alvo, prop) {
+        const valor = Reflect.get(alvo, prop) as unknown;
+        if (prop !== 'updateMany') {
+          return typeof valor === 'function' ? valor.bind(alvo) : valor;
+        }
+        return async (args: Parameters<typeof prisma.webhookEvent.updateMany>[0]) => {
+          // A escrita do `comoRetentavel` e a UNICA cujo `data` tem so
+          // `lastError`. A do catch traz `status` e `attempts` junto.
+          const chaves = Object.keys((args?.data ?? {}) as object);
+          if (!interceptou && chaves.length === 1 && chaves[0] === 'lastError') {
+            interceptou = true;
+            const { id } = args?.where as { id: string };
+            await prisma.webhookEvent.update({
+              where: { id },
+              data: { status: WebhookStatus.PROCESSED, processedAt: new Date() },
+            });
+          }
+          return prisma.webhookEvent.updateMany(args);
+        };
+      },
+    });
+
+    const entrelacado = {
+      webhookEvent,
+      payment: prisma.payment,
+      paymentTransaction: prisma.paymentTransaction,
+      outboxEvent: prisma.outboxEvent,
+      idempotencyRecord: prisma.idempotencyRecord,
+      $transaction: prisma.$transaction.bind(prisma),
+    } as unknown as PrismaClient;
+
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const service = new WebhookService({
+      prisma: entrelacado,
+      tetoDeTentativas: 5,
+      idadeMaximaMinutos: 60,
+    });
+    const app = createApp({
+      payments: express.Router(),
+      webhooks: criarWebhookRouter({ provider, service }),
+    });
+
+    const res = await postar(app, provider.assinarCorpo(corpo({}, { charge_ref: chargeRef })));
+
+    // Sem `interceptou` o teste poderia passar verde sem exercitar nada: se o
+    // discriminador deixar de casar, e isto que denuncia.
+    expect(interceptou).toBe(true);
+    // Com a guarda: estado REAL, terminal, 200. Sem ela: retentavel, 503.
+    expect(res.status).toBe(200);
+
+    // O desfecho da execucao concorrente sobrevive; nada foi sobrescrito.
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.PROCESSED);
+    expect(linha.lastError).toBeNull();
   });
 });

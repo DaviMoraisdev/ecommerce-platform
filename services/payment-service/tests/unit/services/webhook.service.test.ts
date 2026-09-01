@@ -37,6 +37,10 @@ function pagamento(overrides: Partial<Payment> = {}): Payment {
     provider: 'fake',
     attemptCount: 1,
     expiresAt: new Date(AGORA.getTime() + 900_000),
+    // O `as Payment` abaixo aceita objeto INCOMPLETO, e foi assim que o campo
+    // novo chegou como `undefined` a um caminho que esperava `null`. Duble que
+    // mente sobre a forma esconde defeito ate ele virar 500 em producao.
+    lastProviderEventAt: null,
     createdAt: AGORA,
     updatedAt: AGORA,
     ...overrides,
@@ -72,7 +76,7 @@ function eventoDeReembolso(total: number): WebhookEventPayload {
   } as unknown as WebhookEventPayload;
 }
 
-function eventoDeCaptura(): WebhookEventPayload {
+function eventoDeCaptura(overrides: Partial<WebhookEventPayload> = {}): WebhookEventPayload {
   return {
     providerEventId: 'evt_2',
     providerEventTypeBruto: 'payment.succeeded',
@@ -83,6 +87,7 @@ function eventoDeCaptura(): WebhookEventPayload {
     state: 'SUCCEEDED',
     capturedAmountCents: VALOR,
     refundedAmountCents: 0,
+    ...overrides,
   } as unknown as WebhookEventPayload;
 }
 
@@ -160,6 +165,9 @@ function montar(
         },
       ),
       findUniqueOrThrow: jest.fn(),
+      // `comoRetentavel` le a linha quando o updateMany casa zero. Sem isto o
+      // duble mentiria sobre a forma — o padrao que ja custou um TypeError.
+      findUnique: jest.fn(async () => ({ status: WebhookStatus.RECEIVED })),
     },
     paymentTransaction: { findFirst: jest.fn(async () => transacao) },
     outboxEvent: { create: outboxForaDaTx },
@@ -222,6 +230,157 @@ describe('WebhookService — CAS perdido na transicao de status (achado 4.2)', (
 
     expect(resultado.retentavel).toBe(true);
     expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+  });
+});
+
+describe('WebhookService — ordenacao fina por providerCreatedAt (Bloco 6d)', () => {
+  const UMA_HORA = 3_600_000;
+
+  it('CASO U1: evento com o MESMO instante do marcador e obsoleto', async () => {
+    // A comparacao e `<=`, nao `<`. Dois eventos com o mesmo providerCreatedAt
+    // nao tem ordem entre si — aplicar o segundo seria escolher no escuro, e o
+    // primeiro ja aplicou. Com `<`, o segundo passaria.
+    const { service, inbox } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: AGORA })],
+      [],
+    );
+
+    const resultado = await service.processar('fake', eventoDeCaptura({ providerCreatedAt: AGORA }));
+
+    expect(resultado.status).toBe(WebhookStatus.IGNORED);
+    // Motivo PROPRIO do empate: dizer "anterior" sobre dois eventos do mesmo
+    // instante grava informacao errada no campo que a triagem le.
+    expect(String(resultado.motivo)).toContain('mesmo instante do ultimo evento aplicado');
+    expect(inbox.find((d) => d.status === WebhookStatus.IGNORED)).toBeDefined();
+  });
+
+  it('CASO U2: evento ANTERIOR ao marcador nao e aplicado', async () => {
+    // A maquina de estados nao pega este caso: a transicao continua permitida.
+    // Quem distingue os dois eventos e o instante em que o PROVEDOR os gerou.
+    const { service } = montar(
+      [
+        pagamento({
+          status: PaymentStatus.PROCESSING,
+          capturedAmountCents: 0,
+          lastProviderEventAt: new Date(AGORA.getTime() + UMA_HORA),
+        }),
+      ],
+      [],
+    );
+
+    const resultado = await service.processar('fake', eventoDeCaptura({ providerCreatedAt: AGORA }));
+
+    expect(resultado.status).toBe(WebhookStatus.IGNORED);
+  });
+
+  it('CASO U5: providerCreatedAt no futuro e RETENTAVEL, nao terminal', async () => {
+    // A assinatura prova a ORIGEM dos bytes, nao a PLAUSIBILIDADE do valor, e o
+    // campo vira marcador PERSISTENTE: um timestamp absurdo bloquearia todas as
+    // transicoes seguintes daquele pagamento.
+    //
+    // Mas encerrar com IGNORED estava errado (achado 3.1 da 2a rodada): alegava
+    // que reentregar nao muda o timestamp do payload — verdade e IRRELEVANTE,
+    // porque o outro lado da comparacao, Date.now(), muda. Responder 200 faria o
+    // provedor parar de reentregar e um evento legitimo se perderia por desvio
+    // de relogio. O caminho terminal e a quarentena por IDADE do Bloco 6c.
+    const { service, tx } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
+      [],
+    );
+
+    const resultado = await service.processar(
+      'fake',
+      eventoDeCaptura({ providerCreatedAt: new Date(Date.now() + 60 * 60_000) }),
+    );
+
+    expect(resultado.retentavel).toBe(true);
+    expect(resultado.status).toBe(WebhookStatus.RECEIVED);
+    expect(String(resultado.motivo)).toContain('alem da tolerancia de futuro');
+    // O marcador NAO avanca: a transacao nem chega a ser aberta.
+    expect(tx.payment.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('CASO U7: providerCreatedAt INVALIDO e terminal e nao chega ao banco', async () => {
+    // `Invalid Date` faz getTime() devolver NaN, e TODA comparacao com NaN e
+    // falsa: sem checagem explicita o valor atravessaria o portao de
+    // plausibilidade e chegaria ao Prisma. Terminal, ao contrario do futuro:
+    // reentregar nao conserta timestamp quebrado. Achado 3.2.
+    const { service, tx } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
+      [],
+    );
+
+    const resultado = await service.processar(
+      'fake',
+      eventoDeCaptura({ providerCreatedAt: new Date('nao-e-uma-data') }),
+    );
+
+    expect(resultado.status).toBe(WebhookStatus.IGNORED);
+    expect(resultado.retentavel).toBeUndefined();
+    expect(String(resultado.motivo)).toContain('invalido');
+    expect(tx.payment.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('CASO U6: dentro da tolerancia, desvio de relogio nao impede a aplicacao', async () => {
+    // Contraparte do U5. Sem ela, uma tolerancia zerada (ou invertida) recusaria
+    // todo evento e a suite continuaria verde pelo lado errado — relogio de
+    // provedor adiantado em segundos e normal, nao anomalia.
+    const { service } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
+      [1],
+    );
+
+    const resultado = await service.processar(
+      'fake',
+      eventoDeCaptura({ providerCreatedAt: new Date(Date.now() + 60_000) }),
+    );
+
+    expect(resultado.status).toBe(WebhookStatus.PROCESSED);
+  });
+
+  it('CASO U4: perder o CAS e reler um marcador MAIS NOVO encerra como obsoleto', async () => {
+    // Perder o CAS nao prova obsolescencia (achado 4.2 do Bloco 4), por isso ha
+    // releitura. Mas se a releitura mostra um marcador mais novo, o evento E
+    // obsoleto: sem esta checagem o fluxo devolveria "retentavel" e o provedor
+    // reentregaria para sempre um evento que nunca podera ser aplicado — laco
+    // que so pararia no teto do 6c, e como quarentena, nao como decisao.
+    const { service } = montar(
+      [
+        pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null }),
+        pagamento({
+          status: PaymentStatus.PROCESSING,
+          capturedAmountCents: 0,
+          lastProviderEventAt: new Date(AGORA.getTime() + UMA_HORA),
+        }),
+      ],
+      [0],
+    );
+
+    const resultado = await service.processar('fake', eventoDeCaptura({ providerCreatedAt: AGORA }));
+
+    expect(resultado.status).toBe(WebhookStatus.IGNORED);
+    expect(String(resultado.motivo)).toContain('anterior ao ultimo ja aplicado');
+  });
+
+  it('CASO U3: sem marcador, aplica — e o CAS carrega a condicao e o novo marcador', async () => {
+    // Assercao ESTRUTURAL sobre a consulta: a condicao tem de viver no WHERE,
+    // nao so no ramo em JavaScript. Sem ela, entre a leitura e a escrita outro
+    // evento pode avancar o marcador e este sobrescreveria o efeito dele.
+    const { service, tx } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
+      [1],
+    );
+
+    const resultado = await service.processar('fake', eventoDeCaptura({ providerCreatedAt: AGORA }));
+    expect(resultado.status).toBe(WebhookStatus.PROCESSED);
+
+    const [argumentos] = (tx.payment.updateMany as jest.Mock).mock.calls[0];
+    expect(argumentos.where.OR).toEqual([
+      { lastProviderEventAt: null },
+      { lastProviderEventAt: { lt: AGORA } },
+    ]);
+    // O marcador avanca na MESMA instrucao do efeito.
+    expect(argumentos.data.lastProviderEventAt).toEqual(AGORA);
   });
 });
 
