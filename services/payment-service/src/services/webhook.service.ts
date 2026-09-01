@@ -537,22 +537,6 @@ export class WebhookService {
       );
     }
 
-    // ORDENACAO FINA (Bloco 6d). `podeTransicionar` cuida da ordem entre
-    // ESTADOS; isto cuida da ordem entre EVENTOS. Dois eventos do MESMO tipo
-    // com providerCreatedAt diferentes passam pelas mesmas checagens, e o mais
-    // ANTIGO chegando depois sobrescreveria o efeito do mais novo.
-    //
-    // Este ramo existe para dar MOTIVO a triagem; a garantia atomica esta no
-    // WHERE do compare-and-swap abaixo, porque entre esta leitura e a escrita
-    // outro evento pode avancar o marcador.
-    if (payment.lastProviderEventAt !== null && ocorridoEm <= payment.lastProviderEventAt) {
-      return this.encerrar(
-        registroId,
-        WebhookStatus.IGNORED,
-        'evento anterior ao ultimo ja aplicado neste pagamento',
-      );
-    }
-
     const aplicado = await this.deps.prisma.$transaction(async (tx) => {
       // COMPARE-AND-SWAP: o status lido entra no WHERE. Se outro processo mudou
       // o pagamento entre a leitura e a escrita, count = 0 e nada e aplicado.
@@ -560,7 +544,17 @@ export class WebhookService {
         where: {
           id: payment.id,
           status: payment.status,
-          // Mesma condicao do ramo acima, agora ATOMICA com a escrita.
+          // ORDENACAO FINA (Bloco 6d). `podeTransicionar` cuida da ordem entre
+          // ESTADOS; isto cuida da ordem entre EVENTOS: dois eventos do MESMO
+          // tipo com providerCreatedAt diferentes passam pelas mesmas
+          // checagens, e o mais ANTIGO chegando depois sobrescreveria o efeito
+          // do mais novo.
+          //
+          // A condicao vive AQUI, atomica com a escrita, e nao num ramo em
+          // JavaScript antes da transacao. Existiu um ramo assim, e a bateria
+          // mostrou que ele nao mudava NADA: o evento obsoleto perde o CAS, cai
+          // na releitura abaixo, e e encerrado la com o mesmo motivo. A mesma
+          // condicao em tres lugares so cria chance de divergirem.
           OR: [{ lastProviderEventAt: null }, { lastProviderEventAt: { lt: ocorridoEm } }],
         },
         data: {
@@ -623,7 +617,13 @@ export class WebhookService {
       // Perdemos para um evento MAIS NOVO: este e obsoleto por tempo, mesmo que
       // a transicao continue permitida. Sem esta checagem, o ramo abaixo
       // devolveria "retentavel" e o provedor reentregaria um evento que nunca
-      // vai poder ser aplicado — laco que so pararia no teto do 6c.
+      // vai poder ser aplicado — laco que so pararia no teto do 6c, e como
+      // quarentena, nao como decisao.
+      //
+      // E AQUI que a ordenacao vira MOTIVO para a triagem: o WHERE do CAS
+      // apenas impede a escrita, sem dizer por que. `<=` e nao `<`: dois
+      // eventos com o mesmo instante nao tem ordem entre si, e o primeiro ja
+      // aplicou — escolher o segundo seria decidir no escuro.
       if (atual.lastProviderEventAt !== null && ocorridoEm <= atual.lastProviderEventAt) {
         return this.encerrar(
           registroId,
