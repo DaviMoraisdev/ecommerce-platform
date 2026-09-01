@@ -308,6 +308,39 @@ export class WebhookService {
   }
 
   /**
+   * Desfecho RETENTAVEL: registra o motivo na linha e devolve 5xx para o
+   * provedor reentregar.
+   *
+   * A guarda de estado impede escrever sobre linha ja concluida por execucao
+   * concorrente. E o `count` IMPORTA (achado 4.3): se outra execucao concluiu ou
+   * quarentenou a linha entre a decisao e esta escrita, responder retentavel
+   * pediria reentrega de algo ja terminal. Nesse caso devolvemos o estado REAL,
+   * que a rota traduz em 200.
+   *
+   * Compartilhado pelos DOIS ramos retentaveis: os dois ignoravam o `count`, e
+   * corrigir so o novo criaria assimetria entre caminhos que fazem o mesmo.
+   */
+  private async comoRetentavel(registroId: string, motivo: string): Promise<ResultadoDeWebhook> {
+    const { count } = await this.deps.prisma.webhookEvent.updateMany({
+      where: {
+        id: registroId,
+        status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+      },
+      data: { lastError: motivo },
+    });
+
+    if (count === 0) {
+      const linha = await this.deps.prisma.webhookEvent.findUnique({
+        where: { id: registroId },
+        select: { status: true },
+      });
+      if (linha !== null) return { status: linha.status, motivo };
+    }
+
+    return { status: WebhookStatus.RECEIVED, motivo, retentavel: true };
+  }
+
+  /**
    * Quarentena por IDADE (Bloco 6c).
    *
    * Um desfecho `retentavel` devolve 5xx e o provedor reentrega, mas NAO
@@ -483,37 +516,6 @@ export class WebhookService {
       return this.encerrar(registroId, WebhookStatus.IGNORED, 'providerCreatedAt invalido');
     }
 
-    // PLAUSIBILIDADE. Um valor no futuro nao pode virar marcador, porque o
-    // marcador e PERSISTENTE e bloquearia toda transicao seguinte daquele
-    // pagamento.
-    //
-    // RETENTAVEL, e nao terminal (achado 3.1). A versao anterior encerrava com
-    // IGNORED, alegando que reentregar nao muda o timestamp do payload — o que e
-    // verdade e IRRELEVANTE: o outro lado da comparacao, `Date.now()`, muda. Um
-    // evento seis minutos a frente e implausivel agora e legitimo daqui a pouco,
-    // e responder 200 faria o provedor parar de reentregar — evento financeiro
-    // perdido para sempre por desvio de relogio.
-    //
-    // O caminho TERMINAL ja existe e dispensa segundo limiar: se o relogio nunca
-    // alcancar, a QUARENTENA POR IDADE do Bloco 6c encerra a linha, com motivo e
-    // visivel para triagem.
-    if (ocorridoEmMs > Date.now() + TOLERANCIA_DE_FUTURO_MS) {
-      // Mesma guarda de estado do ramo retentavel do providerRef: nao escreve
-      // sobre linha ja concluida por execucao concorrente.
-      await this.deps.prisma.webhookEvent.updateMany({
-        where: {
-          id: registroId,
-          status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
-        },
-        data: { lastError: 'providerCreatedAt alem da tolerancia de futuro' },
-      });
-      return {
-        status: WebhookStatus.RECEIVED,
-        motivo: 'providerCreatedAt alem da tolerancia de futuro',
-        retentavel: true,
-      };
-    }
-
     if (evento.eventType === 'unsupported') {
       return this.encerrar(
         registroId,
@@ -535,18 +537,7 @@ export class WebhookService {
       // quarentena sao do Bloco 6.
       // Mesma guarda do catch e do encerrar: nao escreve sobre linha ja
       // concluida por execucao concorrente (achado 4.1 da 3a rodada).
-      await this.deps.prisma.webhookEvent.updateMany({
-        where: {
-          id: registroId,
-          status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
-        },
-        data: { lastError: 'providerRef ainda desconhecido' },
-      });
-      return {
-        status: WebhookStatus.RECEIVED,
-        motivo: 'providerRef ainda desconhecido',
-        retentavel: true,
-      };
+      return this.comoRetentavel(registroId, 'providerRef ainda desconhecido');
     }
 
     const payment = await this.deps.prisma.payment.findUniqueOrThrow({
@@ -558,6 +549,24 @@ export class WebhookService {
     // reembolso seria descartado como "estado ja aplicado".
     if (evento.eventType === 'refund.succeeded') {
       return this.aplicarReembolso(registroId, evento, payment);
+    }
+
+    // PLAUSIBILIDADE DO TIMESTAMP — guarda APENAS o caminho que escreve
+    // `lastProviderEventAt`.
+    //
+    // Estava tres passos acima, antes do roteamento de reembolso e da
+    // classificacao de `unsupported`, e por isso retinha os dois (achados 4.1 e
+    // 4.2 da 5a rodada). No reembolso o dano e financeiro e contradiz a decisao
+    // declarada no schema e provada pelo CASO 44: um `refund.succeeded` seis
+    // minutos a frente ficava retentavel, nunca aplicava o delta e terminava em
+    // quarentena — dinheiro devolvido pelo provedor sem registro nosso. La a
+    // defesa de ordenacao e o delta sobre `refundedAmountCents`, que compara
+    // VALOR e nao depende de relogio nenhum.
+    //
+    // RETENTAVEL, e nao terminal: o outro lado da comparacao, `Date.now()`,
+    // muda. O caminho terminal e a quarentena por IDADE do Bloco 6c.
+    if (ocorridoEmMs > Date.now() + TOLERANCIA_DE_FUTURO_MS) {
+      return this.comoRetentavel(registroId, 'providerCreatedAt alem da tolerancia de futuro');
     }
 
     const novoStatus = mapearEstadoDoProvedor(evento.state);

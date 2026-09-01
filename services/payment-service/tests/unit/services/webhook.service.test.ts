@@ -165,6 +165,9 @@ function montar(
         },
       ),
       findUniqueOrThrow: jest.fn(),
+      // `comoRetentavel` le a linha quando o updateMany casa zero. Sem isto o
+      // duble mentiria sobre a forma — o padrao que ja custou um TypeError.
+      findUnique: jest.fn(async () => ({ status: WebhookStatus.RECEIVED })),
     },
     paymentTransaction: { findFirst: jest.fn(async () => transacao) },
     outboxEvent: { create: outboxForaDaTx },

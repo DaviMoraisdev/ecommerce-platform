@@ -1179,7 +1179,7 @@ describe('webhook — corrida da varredura (Bloco 6c)', () => {
 
 describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
   it('CASO 38: evento inaplicavel ha tempo demais vira quarentena e responde 200', async () => {
-    // Achado 4.4 da 2a rodada: o CASO 20 comeca com a linha JA em quarentena,
+    // Achado 4.4 da 2a rodada: o caso da reentrega sobre linha JA em quarentena
     // entao provava duplicata terminal, nao a TRANSICAO. O objetivo central do
     // bloco e responder 200 no momento em que desistimos — sem isso o provedor
     // continua reentregando um evento que ja abandonamos.
@@ -1216,7 +1216,7 @@ describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
   });
 
   it('CASO 39: evento RECENTE e inaplicavel continua devolvendo 503', async () => {
-    // Contraparte do 24, e o caso frequente: o webhook chega antes de o
+    // Contraparte do caso anterior, e o mais frequente: o webhook chega antes de o
     // providerRef ser gravado. Responder 200 aqui encerraria para sempre uma
     // captura que seria aplicada segundos depois.
     const { app, provider } = montarApp();
@@ -1271,7 +1271,7 @@ describe('webhook — ordenacao fina por providerCreatedAt (Bloco 6d)', () => {
   });
 
   it('CASO 41: evento MAIS NOVO aplica e avanca o marcador', async () => {
-    // Contraparte do 26. Sem ele, um filtro invertido bloquearia TODOS os
+    // Contraparte do caso anterior. Sem ela, um filtro invertido bloquearia TODOS os
     // eventos e a suite continuaria verde pelo lado errado.
     const { app, provider } = montarApp();
     const { payment, chargeRef } = await cenario();
@@ -1325,8 +1325,8 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
     expect(String(linha.lastError)).toContain('tolerancia de futuro');
   });
 
-  it('CASO 45: futuro que nunca se resolve termina em QUARENTENA por idade', async () => {
-    // Fecha o argumento do CASO 42: tornar o futuro retentavel so e seguro
+  it('CASO 43: futuro que nunca se resolve termina em QUARENTENA por idade', async () => {
+    // Fecha o argumento do caso do timestamp futuro: torna-lo retentavel so e seguro
     // porque EXISTE caminho terminal. Ele nao precisa de segundo limiar — e a
     // quarentena por idade do Bloco 6c, e este caso prova que os dois compoem.
     const { app, provider } = montarApp();
@@ -1362,7 +1362,7 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
     expect(String(linha.lastError)).toContain('tolerancia de futuro');
   });
 
-  it('CASO 43: duas entregas SIMULTANEAS produzem uma unica captura', async () => {
+  it('CASO 44: duas entregas SIMULTANEAS produzem uma unica captura', async () => {
     // Achado 4.2: os demais casos pre-carregam o marcador e simulam o estado.
     // Aqui a disputa e real — duas requisicoes concorrentes sobre o mesmo
     // pagamento, com timestamps diferentes, contra o Postgres.
@@ -1408,7 +1408,7 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
 });
 
 describe('webhook — reembolso fora da ordenacao (Bloco 6d)', () => {
-  it('CASO 44: reembolso aplica o delta e NAO move o marcador', async () => {
+  it('CASO 45: reembolso aplica o delta e NAO move o marcador', async () => {
     // Decisao declarada no schema e no TECH_DEBT: a ordenacao por timestamp nao
     // vale para reembolso. La a defesa e o delta sobre refundedAmountCents, que
     // compara VALOR — rejeitar reembolso por timestamp arriscaria nao registrar
@@ -1443,5 +1443,66 @@ describe('webhook — reembolso fora da ordenacao (Bloco 6d)', () => {
     expect(atual.status).toBe(PaymentStatus.CAPTURED);
     // O marcador registra eventos de TRANSICAO, e reembolso nao e transicao.
     expect(atual.lastProviderEventAt?.getTime()).toBe(marcador.getTime());
+  });
+});
+
+describe('webhook — o portao de plausibilidade guarda SO o marcador (Bloco 6d)', () => {
+  it('CASO 46: reembolso com timestamp FUTURO aplica o delta mesmo assim', async () => {
+    // Achado 4.1 da 5a rodada. O portao estava antes do roteamento de reembolso
+    // e retinha um caminho que, por decisao declarada no schema e provado pelo
+    // caso do reembolso antigo, NAO depende de relogio: la a defesa e o delta
+    // sobre refundedAmountCents, que compara VALOR.
+    //
+    // Com o portao no lugar errado, um refund seis minutos a frente ficava
+    // retentavel, nunca aplicava o delta e terminava em quarentena — dinheiro
+    // devolvido pelo provedor sem registro nosso.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+
+    const marcador = new Date();
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { capturedAmountCents: VALOR, lastProviderEventAt: marcador },
+    });
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo(
+          { type: 'refund.succeeded', created_at: futuro.toISOString() },
+          { charge_ref: chargeRef, refunded_amount_cents: 5000 },
+        ),
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(5000);
+    // O marcador continua intocado: reembolso nao e transicao.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(marcador.getTime());
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.REFUND)).toHaveLength(1);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.PROCESSED);
+  });
+
+  it('CASO 47: evento NAO SUPORTADO com timestamp futuro e terminal, nao 503', async () => {
+    // Achado 4.2: reter com 503 um evento que nunca sera processado so produz
+    // reentrega e ruido de quarentena, sem beneficio nenhum.
+    const { app, provider } = montarApp();
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ type: 'payment.disputed', created_at: futuro.toISOString() })),
+    );
+    expect(res.status).toBe(200);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.IGNORED);
+    expect(String(linha.lastError)).toContain('tipo nao tratado');
   });
 });
