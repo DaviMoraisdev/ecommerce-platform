@@ -453,6 +453,10 @@ export class WebhookService {
       return this.encerrar(registroId, WebhookStatus.IGNORED, 'evento sem providerCreatedAt');
     }
 
+    // Nao-nulo daqui para baixo. Capturado numa const para o compilador nao
+    // depender de estreitamento sobre propriedade ao longo de todo o metodo.
+    const ocorridoEm = evento.providerCreatedAt;
+
     if (evento.eventType === 'unsupported') {
       return this.encerrar(
         registroId,
@@ -533,13 +537,37 @@ export class WebhookService {
       );
     }
 
+    // ORDENACAO FINA (Bloco 6d). `podeTransicionar` cuida da ordem entre
+    // ESTADOS; isto cuida da ordem entre EVENTOS. Dois eventos do MESMO tipo
+    // com providerCreatedAt diferentes passam pelas mesmas checagens, e o mais
+    // ANTIGO chegando depois sobrescreveria o efeito do mais novo.
+    //
+    // Este ramo existe para dar MOTIVO a triagem; a garantia atomica esta no
+    // WHERE do compare-and-swap abaixo, porque entre esta leitura e a escrita
+    // outro evento pode avancar o marcador.
+    if (payment.lastProviderEventAt !== null && ocorridoEm <= payment.lastProviderEventAt) {
+      return this.encerrar(
+        registroId,
+        WebhookStatus.IGNORED,
+        'evento anterior ao ultimo ja aplicado neste pagamento',
+      );
+    }
+
     const aplicado = await this.deps.prisma.$transaction(async (tx) => {
       // COMPARE-AND-SWAP: o status lido entra no WHERE. Se outro processo mudou
       // o pagamento entre a leitura e a escrita, count = 0 e nada e aplicado.
       const { count } = await tx.payment.updateMany({
-        where: { id: payment.id, status: payment.status },
+        where: {
+          id: payment.id,
+          status: payment.status,
+          // Mesma condicao do ramo acima, agora ATOMICA com a escrita.
+          OR: [{ lastProviderEventAt: null }, { lastProviderEventAt: { lt: ocorridoEm } }],
+        },
         data: {
           status: novoStatus,
+          // O marcador avanca na MESMA instrucao do efeito: gravar depois
+          // deixaria uma janela em que o proximo evento antigo ainda passaria.
+          lastProviderEventAt: ocorridoEm,
           ...(evento.eventType === 'payment.succeeded'
             ? { capturedAmountCents: evento.capturedAmountCents }
             : {}),
@@ -568,6 +596,11 @@ export class WebhookService {
         );
       }
 
+      // SEM guarda de estado, ao contrario do `encerrar`, do `catch` e do ramo
+      // retentavel — e a assimetria e deliberada. So se chega aqui tendo GANHO o
+      // compare-and-swap acima, ou seja, tendo aplicado o efeito financeiro.
+      // Marcar PROCESSED por cima de IGNORED ou QUARANTINED e dizer a verdade.
+      // Com guarda, o dinheiro teria se movido e a linha NAO registraria isso.
       await tx.webhookEvent.update({
         where: { id: registroId },
         data: { status: WebhookStatus.PROCESSED, processedAt: new Date(), lastError: null },
@@ -585,6 +618,18 @@ export class WebhookService {
       // Outro evento ja aplicou o MESMO desfecho: nao houve recusa.
       if (novoStatus === atual.status) {
         return this.encerrar(registroId, WebhookStatus.PROCESSED);
+      }
+
+      // Perdemos para um evento MAIS NOVO: este e obsoleto por tempo, mesmo que
+      // a transicao continue permitida. Sem esta checagem, o ramo abaixo
+      // devolveria "retentavel" e o provedor reentregaria um evento que nunca
+      // vai poder ser aplicado — laco que so pararia no teto do 6c.
+      if (atual.lastProviderEventAt !== null && ocorridoEm <= atual.lastProviderEventAt) {
+        return this.encerrar(
+          registroId,
+          WebhookStatus.IGNORED,
+          'evento anterior ao ultimo ja aplicado neste pagamento',
+        );
       }
 
       // O estado avancou para algo que nao aceita mais esta transicao: obsoleto.
@@ -736,6 +781,8 @@ export class WebhookService {
             providerRef: evento.providerRef,
           },
         });
+        // Mesma assimetria deliberada do caminho de captura: so se chega aqui
+        // tendo ganho o CAS do valor, entao o reembolso foi aplicado.
         await tx.webhookEvent.update({
           where: { id: registroId },
           data: { status: WebhookStatus.PROCESSED, processedAt: new Date(), lastError: null },
