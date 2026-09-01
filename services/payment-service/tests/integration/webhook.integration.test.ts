@@ -1232,3 +1232,69 @@ describe('webhook — transicao para quarentena PELA ROTA (Bloco 6c)', () => {
     expect(linha.processedAt).toBeNull();
   });
 });
+
+describe('webhook — ordenacao fina por providerCreatedAt (Bloco 6d)', () => {
+  it('CASO 26: evento ANTERIOR ao ultimo aplicado nao altera nada', async () => {
+    // A maquina de estados nao pega este caso: PROCESSING -> CAPTURED continua
+    // permitida. O que distingue os dois eventos e o instante em que o PROVEDOR
+    // os gerou — e sem isso o mais antigo, chegando depois, venceria.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    const marcador = new Date();
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { lastProviderEventAt: marcador },
+    });
+
+    const antigo = new Date(marcador.getTime() - 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ created_at: antigo.toISOString() }, { charge_ref: chargeRef })),
+    );
+    // IGNORED e desfecho DEFINITIVO: 200, para o provedor nao reentregar.
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.PROCESSING);
+    expect(atual.capturedAmountCents).toBe(0);
+    // O marcador NAO retrocede.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(marcador.getTime());
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(0);
+    expect(await prisma.outboxEvent.count()).toBe(0);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
+    expect(linha.status).toBe(WebhookStatus.IGNORED);
+    expect(String(linha.lastError)).toContain('anterior ao ultimo');
+  });
+
+  it('CASO 27: evento MAIS NOVO aplica e avanca o marcador', async () => {
+    // Contraparte do 26. Sem ele, um filtro invertido bloquearia TODOS os
+    // eventos e a suite continuaria verde pelo lado errado.
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario();
+
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { lastProviderEventAt: new Date(Date.now() - 60 * 60_000) },
+    });
+
+    const agora = new Date();
+    const res = await postar(
+      app,
+      provider.assinarCorpo(corpo({ created_at: agora.toISOString() }, { charge_ref: chargeRef })),
+    );
+    expect(res.status).toBe(200);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+    expect(atual.capturedAmountCents).toBe(VALOR);
+    // O marcador avanca na MESMA instrucao do efeito.
+    expect(atual.lastProviderEventAt?.getTime()).toBe(agora.getTime());
+
+    const trilha = await transacoesDe(payment.id);
+    expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(1);
+  });
+});
