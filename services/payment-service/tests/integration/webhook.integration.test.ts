@@ -1309,7 +1309,9 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
       app,
       provider.assinarCorpo(corpo({ created_at: futuro.toISOString() }, { charge_ref: chargeRef })),
     );
-    expect(res.status).toBe(200);
+    // 503, e nao 200: o relogio ainda pode alcancar o timestamp, e confirmar
+    // definitivamente perderia um evento financeiro legitimo.
+    expect(res.status).toBe(503);
 
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.status).toBe(PaymentStatus.PROCESSING);
@@ -1318,7 +1320,45 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
     expect(atual.lastProviderEventAt).toBeNull();
 
     const linha = await prisma.webhookEvent.findFirstOrThrow({ where: { provider: 'fake' } });
-    expect(linha.status).toBe(WebhookStatus.IGNORED);
+    // Continua ABERTA para a proxima reentrega, com o motivo registrado.
+    expect(linha.status).toBe(WebhookStatus.RECEIVED);
+    expect(String(linha.lastError)).toContain('tolerancia de futuro');
+  });
+
+  it('CASO 45: futuro que nunca se resolve termina em QUARENTENA por idade', async () => {
+    // Fecha o argumento do CASO 42: tornar o futuro retentavel so e seguro
+    // porque EXISTE caminho terminal. Ele nao precisa de segundo limiar — e a
+    // quarentena por idade do Bloco 6c, e este caso prova que os dois compoem.
+    const { app, provider } = montarApp();
+    const { chargeRef } = await cenario();
+
+    const eventoId = `evt_${randomUUID()}`;
+    await prisma.webhookEvent.create({
+      data: {
+        provider: 'fake',
+        providerEventId: eventoId,
+        eventType: 'payment.succeeded',
+        payload: {},
+        providerCreatedAt: new Date(),
+        status: WebhookStatus.RECEIVED,
+        receivedAt: new Date(Date.now() - 120 * 60_000),
+      },
+    });
+
+    const futuro = new Date(Date.now() + 24 * 60 * 60_000);
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo({ id: eventoId, created_at: futuro.toISOString() }, { charge_ref: chargeRef }),
+      ),
+    );
+    expect(res.status).toBe(200);
+
+    const linha = await prisma.webhookEvent.findFirstOrThrow({
+      where: { provider: 'fake', providerEventId: eventoId },
+    });
+    expect(linha.status).toBe(WebhookStatus.QUARANTINED);
+    expect(String(linha.lastError)).toContain('inaplicavel ha mais de');
     expect(String(linha.lastError)).toContain('tolerancia de futuro');
   });
 
@@ -1331,10 +1371,14 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
 
     const antigo = new Date(Date.now() - 60_000);
     const novo = new Date();
+    // Ids EXPLICITAMENTE distintos: sao dois eventos diferentes disputando o
+    // mesmo pagamento, nao duas entregas do mesmo evento.
+    const idAntigo = `evt_${randomUUID()}`;
+    const idNovo = `evt_${randomUUID()}`;
 
     const [a, b] = await Promise.all([
-      postar(app, provider.assinarCorpo(corpo({ created_at: antigo.toISOString() }, { charge_ref: chargeRef }))),
-      postar(app, provider.assinarCorpo(corpo({ created_at: novo.toISOString() }, { charge_ref: chargeRef }))),
+      postar(app, provider.assinarCorpo(corpo({ id: idAntigo, created_at: antigo.toISOString() }, { charge_ref: chargeRef }))),
+      postar(app, provider.assinarCorpo(corpo({ id: idNovo, created_at: novo.toISOString() }, { charge_ref: chargeRef }))),
     ]);
 
     // Nenhuma das duas pede reentrega: uma aplicou, a outra e desfecho definitivo.
@@ -1350,6 +1394,16 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
     const trilha = await transacoesDe(payment.id);
     expect(trilha.filter((t) => t.type === TransactionType.CAPTURE)).toHaveLength(1);
     expect(await prisma.outboxEvent.count()).toBe(1);
+
+    // As DUAS linhas do inbox existem e nenhuma ficou aberta pedindo reentrega.
+    const linhas = await prisma.webhookEvent.findMany({ orderBy: { receivedAt: 'asc' } });
+    expect(linhas).toHaveLength(2);
+    expect(linhas.every((l) => l.status !== WebhookStatus.RECEIVED)).toBe(true);
+
+    // POLITICA DECLARADA: se o evento ANTIGO vence a corrida, o marcador fica no
+    // instante DELE — a monotonicidade vale para eventos aplicados, nao para
+    // eventos recebidos. Por isso a assercao aceita os dois desfechos.
+    expect([antigo.getTime(), novo.getTime()]).toContain(atual.lastProviderEventAt?.getTime());
   });
 });
 

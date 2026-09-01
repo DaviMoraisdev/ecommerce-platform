@@ -270,11 +270,16 @@ describe('WebhookService — ordenacao fina por providerCreatedAt (Bloco 6d)', (
     expect(resultado.status).toBe(WebhookStatus.IGNORED);
   });
 
-  it('CASO U5: providerCreatedAt muito no futuro nao vira marcador', async () => {
-    // Achado 3.1 do review do PR #59. A assinatura prova a ORIGEM dos bytes,
-    // nao a PLAUSIBILIDADE do valor. Como o campo vira marcador PERSISTENTE, um
-    // unico evento com timestamp absurdo bloquearia todas as transicoes
-    // seguintes daquele pagamento — negacao de servico por pagamento, terminal.
+  it('CASO U5: providerCreatedAt no futuro e RETENTAVEL, nao terminal', async () => {
+    // A assinatura prova a ORIGEM dos bytes, nao a PLAUSIBILIDADE do valor, e o
+    // campo vira marcador PERSISTENTE: um timestamp absurdo bloquearia todas as
+    // transicoes seguintes daquele pagamento.
+    //
+    // Mas encerrar com IGNORED estava errado (achado 3.1 da 2a rodada): alegava
+    // que reentregar nao muda o timestamp do payload — verdade e IRRELEVANTE,
+    // porque o outro lado da comparacao, Date.now(), muda. Responder 200 faria o
+    // provedor parar de reentregar e um evento legitimo se perderia por desvio
+    // de relogio. O caminho terminal e a quarentena por IDADE do Bloco 6c.
     const { service, tx } = montar(
       [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
       [],
@@ -285,9 +290,31 @@ describe('WebhookService — ordenacao fina por providerCreatedAt (Bloco 6d)', (
       eventoDeCaptura({ providerCreatedAt: new Date(Date.now() + 60 * 60_000) }),
     );
 
-    expect(resultado.status).toBe(WebhookStatus.IGNORED);
+    expect(resultado.retentavel).toBe(true);
+    expect(resultado.status).toBe(WebhookStatus.RECEIVED);
     expect(String(resultado.motivo)).toContain('alem da tolerancia de futuro');
-    // Nem chega a abrir a transacao: o marcador NAO avanca.
+    // O marcador NAO avanca: a transacao nem chega a ser aberta.
+    expect(tx.payment.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('CASO U7: providerCreatedAt INVALIDO e terminal e nao chega ao banco', async () => {
+    // `Invalid Date` faz getTime() devolver NaN, e TODA comparacao com NaN e
+    // falsa: sem checagem explicita o valor atravessaria o portao de
+    // plausibilidade e chegaria ao Prisma. Terminal, ao contrario do futuro:
+    // reentregar nao conserta timestamp quebrado. Achado 3.2.
+    const { service, tx } = montar(
+      [pagamento({ status: PaymentStatus.PROCESSING, capturedAmountCents: 0, lastProviderEventAt: null })],
+      [],
+    );
+
+    const resultado = await service.processar(
+      'fake',
+      eventoDeCaptura({ providerCreatedAt: new Date('nao-e-uma-data') }),
+    );
+
+    expect(resultado.status).toBe(WebhookStatus.IGNORED);
+    expect(resultado.retentavel).toBeUndefined();
+    expect(String(resultado.motivo)).toContain('invalido');
     expect(tx.payment.updateMany).not.toHaveBeenCalled();
   });
 

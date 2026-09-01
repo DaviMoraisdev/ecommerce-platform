@@ -473,16 +473,45 @@ export class WebhookService {
     // depender de estreitamento sobre propriedade ao longo de todo o metodo.
     const ocorridoEm = evento.providerCreatedAt;
 
-    // FAIL-CLOSED de plausibilidade, irmao do gate de nulidade acima: um valor
-    // absurdo no futuro nao pode virar marcador. Ver TOLERANCIA_DE_FUTURO_MS.
-    // IGNORED (nao retentavel): reentregar nao muda o timestamp do payload, e o
-    // que resta e triagem humana. O marcador NAO avanca.
-    if (ocorridoEm.getTime() > Date.now() + TOLERANCIA_DE_FUTURO_MS) {
-      return this.encerrar(
-        registroId,
-        WebhookStatus.IGNORED,
-        'providerCreatedAt alem da tolerancia de futuro',
-      );
+    const ocorridoEmMs = ocorridoEm.getTime();
+
+    // TIMESTAMP MALFORMADO (achado 3.2). `Invalid Date` faz `getTime()` devolver
+    // NaN, e TODA comparacao com NaN e falsa — o valor atravessaria o portao
+    // abaixo e chegaria ao banco. Terminal, e nao retentavel: reentregar nao
+    // conserta um timestamp que veio quebrado.
+    if (!Number.isFinite(ocorridoEmMs)) {
+      return this.encerrar(registroId, WebhookStatus.IGNORED, 'providerCreatedAt invalido');
+    }
+
+    // PLAUSIBILIDADE. Um valor no futuro nao pode virar marcador, porque o
+    // marcador e PERSISTENTE e bloquearia toda transicao seguinte daquele
+    // pagamento.
+    //
+    // RETENTAVEL, e nao terminal (achado 3.1). A versao anterior encerrava com
+    // IGNORED, alegando que reentregar nao muda o timestamp do payload — o que e
+    // verdade e IRRELEVANTE: o outro lado da comparacao, `Date.now()`, muda. Um
+    // evento seis minutos a frente e implausivel agora e legitimo daqui a pouco,
+    // e responder 200 faria o provedor parar de reentregar — evento financeiro
+    // perdido para sempre por desvio de relogio.
+    //
+    // O caminho TERMINAL ja existe e dispensa segundo limiar: se o relogio nunca
+    // alcancar, a QUARENTENA POR IDADE do Bloco 6c encerra a linha, com motivo e
+    // visivel para triagem.
+    if (ocorridoEmMs > Date.now() + TOLERANCIA_DE_FUTURO_MS) {
+      // Mesma guarda de estado do ramo retentavel do providerRef: nao escreve
+      // sobre linha ja concluida por execucao concorrente.
+      await this.deps.prisma.webhookEvent.updateMany({
+        where: {
+          id: registroId,
+          status: { in: [WebhookStatus.RECEIVED, WebhookStatus.FAILED] },
+        },
+        data: { lastError: 'providerCreatedAt alem da tolerancia de futuro' },
+      });
+      return {
+        status: WebhookStatus.RECEIVED,
+        motivo: 'providerCreatedAt alem da tolerancia de futuro',
+        retentavel: true,
+      };
     }
 
     if (evento.eventType === 'unsupported') {
@@ -573,10 +602,10 @@ export class WebhookService {
           id: payment.id,
           status: payment.status,
           // ORDENACAO FINA (Bloco 6d). `podeTransicionar` cuida da ordem entre
-          // ESTADOS; isto cuida da ordem entre EVENTOS: dois eventos do MESMO
-          // tipo com providerCreatedAt diferentes passam pelas mesmas
-          // checagens, e o mais ANTIGO chegando depois sobrescreveria o efeito
-          // do mais novo.
+          // ESTADOS; isto cuida da ordem entre EVENTOS. O marcador e GLOBAL
+          // entre eventos de TRANSICAO — nao ha um por tipo: dois eventos com
+          // providerCreatedAt diferentes passam pelas mesmas checagens, e o
+          // mais ANTIGO chegando depois sobrescreveria o efeito do mais novo.
           //
           // A condicao vive AQUI, atomica com a escrita, e nao num ramo em
           // JavaScript antes da transacao. Existiu um ramo assim, e a bateria

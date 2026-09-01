@@ -45,9 +45,13 @@ model Payment {
   //
   // Bloco 6d. A defesa contra evento fora de ordem ate aqui era a maquina de
   // estados: transicao nao permitida vira IGNORED. Isso basta enquanto cada
-  // estado e alcancado UMA vez, e nao distingue dois eventos do MESMO tipo com
+  // estado e alcancado UMA vez, e nao distingue dois eventos com
   // providerCreatedAt diferentes — o mais antigo poderia sobrescrever o efeito
   // do mais novo.
+  //
+  // O marcador e GLOBAL entre eventos de TRANSICAO, nao um por tipo. Modelar
+  // por tipo seria especular sobre um provedor que ainda nao existe; se a
+  // Stripe do Bloco 9 exigir, a mudanca e aditiva.
   //
   // A comparacao vive no WHERE do compare-and-swap, nunca em JavaScript antes
   // da escrita: comparar e depois gravar abre janela entre decidir e aplicar.
