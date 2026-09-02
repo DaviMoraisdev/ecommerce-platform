@@ -14,6 +14,9 @@ import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { orderClientFalso, pedidoDeTeste } from '../helpers/prisma-fake';
 import { buscarTentativasExpirando } from '../../src/jobs/expiracao.repository';
 import { buscarTentativasPresas } from '../../src/jobs/reconciliacao.repository';
+import { criarVarreduraDeExpiracao, type ExpiracaoDeps } from '../../src/jobs/expiracao';
+import { montarDepsDeExpiracao } from '../../src/jobs/expiracao.deps';
+import { ChargeNotCancelableError } from '../../src/providers/payment-provider.port';
 
 /**
  * POPULACAO DA EXPIRACAO (Bloco 6e), montada de PONTA A PONTA.
@@ -49,15 +52,17 @@ function cenario(token: string) {
   const userId = randomUUID();
   const orderId = randomUUID();
   const pedido = pedidoDeTeste({ id: orderId, userId });
+  const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
   const service = new PaymentService({
     prisma,
     orderClient: orderClientFalso(jest.fn(async () => pedido)),
-    provider: new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK }),
+    provider,
     currency: 'BRL',
     windowMinutes: 15,
   });
 
   return {
+    provider,
     service,
     orderId,
     input: {
@@ -347,4 +352,61 @@ describe('buscarTentativasExpirando', () => {
       'PROCESSING',
     );
   });
+
+  it('CASO E9: varredura completa expira o pagamento e MATA a cobranca no provedor', async () => {
+    // Ponta a ponta com o provedor real do teste: repositorio, decisao, comando
+    // e persistencia. Os casos anteriores provam pecas; este prova a fiacao.
+    const { service, provider, payment, tentativa } = await tentativaAceita();
+    await envelhecer([tentativa.id], new Date(Date.now() - 60 * 60 * 1000));
+
+    const varrer = criarVarreduraDeExpiracao(montarDepsDeExpiracao(provider, service, 15));
+    const resumo = await varrer();
+
+    expect(resumo).toMatchObject({ examinadas: 1, expiradas: 1, aplicadas: 0, falhas: 0 });
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.EXPIRED);
+
+    const linha = await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: tentativa.id } });
+    expect(linha.failureCode).toBe('EXPIRADO_JANELA');
+
+    // O ponto do bloco: a cobranca esta MORTA no provedor. Sem isto, o dinheiro
+    // segue reservado no cartao do cliente e so o nosso banco sabe da expiracao.
+    const cobranca = await provider.getCharge(tentativa.providerRef as never);
+    expect(cobranca.state).toBe('CANCELED');
+  });
+
+  it('CASO E10: provedor que ja capturou leva a varredura a APLICAR, nao expirar', async () => {
+    // O provedor recusa o cancelamento porque capturou. A varredura consulta e
+    // aplica a captura pelo caminho normal — com trilha e evento de outbox.
+    const { service, payment, tentativa } = await tentativaAceita();
+    await envelhecer([tentativa.id], new Date(Date.now() - 60 * 60 * 1000));
+
+    const reais = montarDepsDeExpiracao(
+      { getCharge: async () => ({}) } as never,
+      service,
+      15,
+    );
+    const deps: ExpiracaoDeps = {
+      ...reais,
+      cancelarCobranca: async () => {
+        throw new ChargeNotCancelableError('cobranca capturada nao pode ser cancelada');
+      },
+      consultarCobranca: async () => ({
+        providerRef: tentativa.providerRef as string,
+        state: 'SUCCEEDED',
+        amountCents: payment.amountCents,
+        capturedAmountCents: payment.amountCents,
+        refundedAmountCents: 0,
+      }),
+    };
+
+    const resumo = await criarVarreduraDeExpiracao(deps)();
+    expect(resumo).toMatchObject({ expiradas: 0, aplicadas: 1, falhas: 0 });
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+    expect(await prisma.outboxEvent.count()).toBe(1);
+  });
+
 });
