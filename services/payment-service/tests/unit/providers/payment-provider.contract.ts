@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID } from "node:crypto";
 
 import {
+  ChargeNotCancelableError,
   ChargeNotFoundError,
   PaymentProviderError,
   ProviderInvalidRequestError,
@@ -10,7 +11,7 @@ import {
   type PaymentProvider,
   type WebhookEventPayload,
   type WebhookRequest,
-} from '../../../src/providers/payment-provider.port';
+} from "../../../src/providers/payment-provider.port";
 
 /**
  * SUITE DE CONTRATO da porta PaymentProvider.
@@ -32,7 +33,7 @@ import {
  * DECLINED, e o compilador exige o estreitamento antes do acesso — que e
  * exatamente a garantia que a uniao fornece.
  */
-function exigirEstado<E extends ChargeResult['state']>(
+function exigirEstado<E extends ChargeResult["state"]>(
   resultado: ChargeResult,
   estado: E,
 ): Extract<ChargeResult, { state: E }> {
@@ -45,7 +46,7 @@ function exigirEstado<E extends ChargeResult['state']>(
  * Exportado porque os testes especificos de cada adapter precisam do mesmo
  * estreitamento — providerRef e state so existem nas variantes suportadas.
  */
-export function exigirEvento<E extends WebhookEventPayload['eventType']>(
+export function exigirEvento<E extends WebhookEventPayload["eventType"]>(
   evento: WebhookEventPayload,
   tipo: E,
 ): Extract<WebhookEventPayload, { eventType: E }> {
@@ -106,7 +107,10 @@ export interface KitDeContrato {
   };
 
   /** Exigido quando capacidades.transicaoAssincrona e true. */
-  simularSucesso?(provider: PaymentProvider, providerRef: string): WebhookRequest;
+  simularSucesso?(
+    provider: PaymentProvider,
+    providerRef: string,
+  ): WebhookRequest;
 }
 
 export function rodarContratoDeProvedor(kit: KitDeContrato): void {
@@ -117,33 +121,39 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       provider = kit.criar();
     });
 
-    function entrada(overrides: Partial<CreateChargeInput> = {}): CreateChargeInput {
+    function entrada(
+      overrides: Partial<CreateChargeInput> = {},
+    ): CreateChargeInput {
       return {
         amountCents: 12990,
-        currency: 'BRL',
+        currency: "BRL",
         paymentMethodToken: kit.tokens.sucesso,
         idempotencyKey: randomUUID(),
-        reference: { paymentId: randomUUID(), orderId: randomUUID(), attemptCount: 1 },
+        reference: {
+          paymentId: randomUUID(),
+          orderId: randomUUID(),
+          attemptCount: 1,
+        },
         ...overrides,
       };
     }
 
-    it('o kit declara capacidades coerentes com os hooks que forneceu', () => {
-      expect(typeof kit.assinarWebhook).toBe('function');
+    it("o kit declara capacidades coerentes com os hooks que forneceu", () => {
+      expect(typeof kit.assinarWebhook).toBe("function");
 
       if (kit.capacidades.falhaTransiente) {
-        expect(typeof kit.tokens.erroTransiente).toBe('string');
+        expect(typeof kit.tokens.erroTransiente).toBe("string");
       }
       if (kit.capacidades.transicaoAssincrona) {
-        expect(typeof kit.simularSucesso).toBe('function');
+        expect(typeof kit.simularSucesso).toBe("function");
       }
       if (kit.capacidades.falhaAmbigua) {
-        expect(typeof kit.tokens.timeoutAposCobranca).toBe('string');
+        expect(typeof kit.tokens.timeoutAposCobranca).toBe("string");
       }
     });
 
-    describe('buscarCobrancaPorTentativa', () => {
-      it('devolve null quando o provedor nunca recebeu a cobranca', async () => {
+    describe("buscarCobrancaPorTentativa", () => {
+      it("devolve null quando o provedor nunca recebeu a cobranca", async () => {
         // null NAO e erro. E a informacao que autoriza o job a liberar a chave:
         // a chamada nunca chegou, entao refazer a tentativa nao duplica dinheiro.
         await expect(
@@ -151,10 +161,12 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         ).resolves.toBeNull();
       });
 
-      it('encontra a cobranca criada, pela correlacao enviada no createCharge', async () => {
+      it("encontra a cobranca criada, pela correlacao enviada no createCharge", async () => {
         const paymentId = randomUUID();
         const criada = await provider.createCharge(
-          entrada({ reference: { paymentId, orderId: randomUUID(), attemptCount: 1 } }),
+          entrada({
+            reference: { paymentId, orderId: randomUUID(), attemptCount: 1 },
+          }),
         );
 
         const achada = await provider.buscarCobrancaPorTentativa(paymentId, 1);
@@ -163,7 +175,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         expect(achada?.providerRef).toBe(criada.providerRef);
       });
 
-      it('distingue TENTATIVAS diferentes do mesmo pagamento', async () => {
+      it("distingue TENTATIVAS diferentes do mesmo pagamento", async () => {
         // A janela de retentativa faz o MESMO Payment cobrar varias vezes. Uma
         // busca so por paymentId devolveria varias e obrigaria o job a escolher
         // qual e a dele — decisao que ninguem quer tomar com dinheiro no meio.
@@ -177,15 +189,17 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         );
 
         expect(primeira.providerRef).not.toBe(segunda.providerRef);
-        expect((await provider.buscarCobrancaPorTentativa(paymentId, 1))?.providerRef).toBe(
-          primeira.providerRef,
-        );
-        expect((await provider.buscarCobrancaPorTentativa(paymentId, 2))?.providerRef).toBe(
-          segunda.providerRef,
-        );
+        expect(
+          (await provider.buscarCobrancaPorTentativa(paymentId, 1))
+            ?.providerRef,
+        ).toBe(primeira.providerRef);
+        expect(
+          (await provider.buscarCobrancaPorTentativa(paymentId, 2))
+            ?.providerRef,
+        ).toBe(segunda.providerRef);
       });
 
-      it('encontra a cobranca mesmo quando a RESPOSTA se perdeu', async () => {
+      it("encontra a cobranca mesmo quando a RESPOSTA se perdeu", async () => {
         // O caso que justifica o job inteiro: o provedor cobrou, a resposta nao
         // voltou, e do nosso lado ficou uma tentativa PENDING sem providerRef.
         // Se a busca nao encontrasse aqui, o job nao teria como distinguir
@@ -208,42 +222,51 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       });
     });
 
-    describe('createCharge', () => {
-      it('captura na propria chamada com o token de sucesso', async () => {
-        const r = exigirEstado(await provider.createCharge(entrada()), 'SUCCEEDED');
+    describe("createCharge", () => {
+      it("captura na propria chamada com o token de sucesso", async () => {
+        const r = exigirEstado(
+          await provider.createCharge(entrada()),
+          "SUCCEEDED",
+        );
 
         expect(r.capturedAmountCents).toBe(12990);
-        expect(typeof r.providerRef).toBe('string');
+        expect(typeof r.providerRef).toBe("string");
         expect(r.providerRef.length).toBeGreaterThan(0);
       });
 
-      it('devolve PROCESSING quando a confirmacao vem so por webhook', async () => {
+      it("devolve PROCESSING quando a confirmacao vem so por webhook", async () => {
         const r = exigirEstado(
-          await provider.createCharge(entrada({ paymentMethodToken: kit.tokens.processando })),
-          'PROCESSING',
+          await provider.createCharge(
+            entrada({ paymentMethodToken: kit.tokens.processando }),
+          ),
+          "PROCESSING",
         );
 
         expect(r.capturedAmountCents).toBe(0);
       });
 
-      it('RECUSA e resultado de negocio, nao excecao, e sempre traz declineCode', async () => {
+      it("RECUSA e resultado de negocio, nao excecao, e sempre traz declineCode", async () => {
         const r = exigirEstado(
-          await provider.createCharge(entrada({ paymentMethodToken: kit.tokens.recusado })),
-          'DECLINED',
+          await provider.createCharge(
+            entrada({ paymentMethodToken: kit.tokens.recusado }),
+          ),
+          "DECLINED",
         );
 
         expect(r.capturedAmountCents).toBe(0);
-        expect(typeof r.declineCode).toBe('string');
+        expect(typeof r.declineCode).toBe("string");
         expect(r.declineCode.length).toBeGreaterThan(0);
       });
 
-      it('rejeita token desconhecido em vez de suceder silenciosamente', async () => {
+      it("rejeita token desconhecido em vez de suceder silenciosamente", async () => {
         await expect(
-          provider.createCharge(entrada({ paymentMethodToken: kit.tokens.desconhecido })),
+          provider.createCharge(
+            entrada({ paymentMethodToken: kit.tokens.desconhecido }),
+          ),
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('IDEMPOTENCIA: mesma chave e mesmos parametros devolvem a mesma cobranca', async () => {
+      it("IDEMPOTENCIA: mesma chave e mesmos parametros devolvem a mesma cobranca", async () => {
         const base = entrada();
 
         const primeira = await provider.createCharge(base);
@@ -252,7 +275,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         expect(segunda).toEqual(primeira);
       });
 
-      it('IDEMPOTENCIA: mesma chave com parametros DIFERENTES e erro', async () => {
+      it("IDEMPOTENCIA: mesma chave com parametros DIFERENTES e erro", async () => {
         const idempotencyKey = randomUUID();
         await provider.createCharge(entrada({ idempotencyKey }));
 
@@ -261,7 +284,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('IDEMPOTENCIA: replay tardio devolve o resultado ORIGINAL, mesmo apos mudanca de estado', async () => {
+      it("IDEMPOTENCIA: replay tardio devolve o resultado ORIGINAL, mesmo apos mudanca de estado", async () => {
         const base = entrada({ paymentMethodToken: kit.tokens.processando });
         const primeira = await provider.createCharge(base);
 
@@ -277,10 +300,10 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       });
 
       it.each([
-        ['amountCents', { amountCents: 999 }],
-        ['paymentMethodToken', { paymentMethodToken: 'tok_outro_qualquer' }],
+        ["amountCents", { amountCents: 999 }],
+        ["paymentMethodToken", { paymentMethodToken: "tok_outro_qualquer" }],
       ])(
-        'IDEMPOTENCIA: divergencia em %s com a mesma chave e erro',
+        "IDEMPOTENCIA: divergencia em %s com a mesma chave e erro",
         async (_campo, override) => {
           const idempotencyKey = randomUUID();
           const base = entrada({ idempotencyKey });
@@ -292,8 +315,8 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         },
       );
 
-      it.each(['paymentId', 'orderId'] as const)(
-        'IDEMPOTENCIA: divergencia em reference.%s com a mesma chave e erro',
+      it.each(["paymentId", "orderId"] as const)(
+        "IDEMPOTENCIA: divergencia em reference.%s com a mesma chave e erro",
         async (campo) => {
           const idempotencyKey = randomUUID();
           const base = entrada({ idempotencyKey });
@@ -308,48 +331,54 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         },
       );
 
-      it('SO a chave diferente cria cobranca diferente — resto do input identico', async () => {
+      it("SO a chave diferente cria cobranca diferente — resto do input identico", async () => {
         const base = entrada();
 
-        const a = await provider.createCharge({ ...base, idempotencyKey: randomUUID() });
-        const b = await provider.createCharge({ ...base, idempotencyKey: randomUUID() });
+        const a = await provider.createCharge({
+          ...base,
+          idempotencyKey: randomUUID(),
+        });
+        const b = await provider.createCharge({
+          ...base,
+          idempotencyKey: randomUUID(),
+        });
 
         expect(b.providerRef).not.toBe(a.providerRef);
       });
 
-      it.each([0, -1])('rejeita valor invalido (%i)', async (amountCents) => {
-        await expect(provider.createCharge(entrada({ amountCents }))).rejects.toBeInstanceOf(
-          ProviderInvalidRequestError,
-        );
+      it.each([0, -1])("rejeita valor invalido (%i)", async (amountCents) => {
+        await expect(
+          provider.createCharge(entrada({ amountCents })),
+        ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('exige idempotencyKey', async () => {
+      it("exige idempotencyKey", async () => {
         await expect(
-          provider.createCharge(entrada({ idempotencyKey: '' })),
+          provider.createCharge(entrada({ idempotencyKey: "" })),
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
     });
 
-    describe('getCharge', () => {
-      it('devolve o retrato da cobranca criada', async () => {
+    describe("getCharge", () => {
+      it("devolve o retrato da cobranca criada", async () => {
         const criada = await provider.createCharge(entrada());
         const snapshot = await provider.getCharge(criada.providerRef);
 
         expect(snapshot.providerRef).toBe(criada.providerRef);
-        expect(snapshot.state).toBe('SUCCEEDED');
+        expect(snapshot.state).toBe("SUCCEEDED");
         expect(snapshot.amountCents).toBe(12990);
         expect(snapshot.capturedAmountCents).toBe(12990);
         expect(snapshot.refundedAmountCents).toBe(0);
       });
 
-      it('lanca ChargeNotFoundError para referencia inexistente', async () => {
-        await expect(provider.getCharge('ref_que_nao_existe')).rejects.toBeInstanceOf(
-          ChargeNotFoundError,
-        );
+      it("lanca ChargeNotFoundError para referencia inexistente", async () => {
+        await expect(
+          provider.getCharge("ref_que_nao_existe"),
+        ).rejects.toBeInstanceOf(ChargeNotFoundError);
       });
     });
 
-    describe('cancelCharge', () => {
+    describe("cancelCharge", () => {
       async function emProcessamento(): Promise<string> {
         const r = await provider.createCharge(
           entrada({ paymentMethodToken: kit.tokens.processando }),
@@ -357,7 +386,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         return r.providerRef;
       }
 
-      it('cancela cobranca em PROCESSING', async () => {
+      it("cancela cobranca em PROCESSING", async () => {
         const ref = await emProcessamento();
 
         const snapshot = await provider.cancelCharge({
@@ -365,44 +394,56 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
           idempotencyKey: randomUUID(),
         });
 
-        expect(snapshot.state).toBe('CANCELED');
+        expect(snapshot.state).toBe("CANCELED");
       });
 
-      it('IDEMPOTENCIA: mesma chave devolve exatamente o mesmo resultado', async () => {
+      it("IDEMPOTENCIA: mesma chave devolve exatamente o mesmo resultado", async () => {
         const ref = await emProcessamento();
         const idempotencyKey = randomUUID();
 
-        const primeira = await provider.cancelCharge({ providerRef: ref, idempotencyKey });
-        const segunda = await provider.cancelCharge({ providerRef: ref, idempotencyKey });
+        const primeira = await provider.cancelCharge({
+          providerRef: ref,
+          idempotencyKey,
+        });
+        const segunda = await provider.cancelCharge({
+          providerRef: ref,
+          idempotencyKey,
+        });
 
         expect(segunda).toEqual(primeira);
       });
 
-      it('IDEMPOTENCIA: mesma chave para OUTRA cobranca e erro', async () => {
+      it("IDEMPOTENCIA: mesma chave para OUTRA cobranca e erro", async () => {
         const primeiroRef = await emProcessamento();
         const segundoRef = await emProcessamento();
         const idempotencyKey = randomUUID();
 
-        await provider.cancelCharge({ providerRef: primeiroRef, idempotencyKey });
+        await provider.cancelCharge({
+          providerRef: primeiroRef,
+          idempotencyKey,
+        });
 
         await expect(
           provider.cancelCharge({ providerRef: segundoRef, idempotencyKey }),
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('cancelar de novo com chave NOVA tambem e no-op — idempotencia por estado', async () => {
+      it("cancelar de novo com chave NOVA tambem e no-op — idempotencia por estado", async () => {
         const ref = await emProcessamento();
 
-        await provider.cancelCharge({ providerRef: ref, idempotencyKey: randomUUID() });
+        await provider.cancelCharge({
+          providerRef: ref,
+          idempotencyKey: randomUUID(),
+        });
         const segunda = await provider.cancelCharge({
           providerRef: ref,
           idempotencyKey: randomUUID(),
         });
 
-        expect(segunda.state).toBe('CANCELED');
+        expect(segunda.state).toBe("CANCELED");
       });
 
-      it('recusa cancelar cobranca capturada — dinheiro se move por refund', async () => {
+      it("recusa cancelar cobranca capturada — dinheiro se move por refund", async () => {
         const criada = await provider.createCharge(entrada());
 
         await expect(
@@ -410,21 +451,21 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
             providerRef: criada.providerRef,
             idempotencyKey: randomUUID(),
           }),
-        ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
+        ).rejects.toBeInstanceOf(ChargeNotCancelableError);
       });
 
-      it('lanca ChargeNotFoundError para referencia inexistente', async () => {
+      it("lanca ChargeNotFoundError para referencia inexistente", async () => {
         await expect(
           provider.cancelCharge({
-            providerRef: 'ref_que_nao_existe',
+            providerRef: "ref_que_nao_existe",
             idempotencyKey: randomUUID(),
           }),
         ).rejects.toBeInstanceOf(ChargeNotFoundError);
       });
     });
 
-    describe('refund', () => {
-      it('reembolsa o valor total', async () => {
+    describe("refund", () => {
+      it("reembolsa o valor total", async () => {
         const criada = await provider.createCharge(entrada());
 
         const r = await provider.refund({
@@ -433,43 +474,67 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
           idempotencyKey: randomUUID(),
         });
 
-        expect(r.state).toBe('SUCCEEDED');
+        expect(r.state).toBe("SUCCEEDED");
         expect(r.amountCents).toBe(12990);
-        expect(typeof r.providerRefundRef).toBe('string');
+        expect(typeof r.providerRefundRef).toBe("string");
 
         const snapshot = await provider.getCharge(criada.providerRef);
         expect(snapshot.refundedAmountCents).toBe(12990);
       });
 
-      it('acumula reembolsos parciais ate o valor capturado', async () => {
+      it("acumula reembolsos parciais ate o valor capturado", async () => {
         const criada = await provider.createCharge(entrada());
         const ref = criada.providerRef;
 
-        await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey: randomUUID() });
-        await provider.refund({ providerRef: ref, amountCents: 7990, idempotencyKey: randomUUID() });
+        await provider.refund({
+          providerRef: ref,
+          amountCents: 5000,
+          idempotencyKey: randomUUID(),
+        });
+        await provider.refund({
+          providerRef: ref,
+          amountCents: 7990,
+          idempotencyKey: randomUUID(),
+        });
 
         const snapshot = await provider.getCharge(ref);
         expect(snapshot.refundedAmountCents).toBe(12990);
       });
 
-      it('recusa reembolso acima do disponivel', async () => {
+      it("recusa reembolso acima do disponivel", async () => {
         const criada = await provider.createCharge(entrada());
         const ref = criada.providerRef;
 
-        await provider.refund({ providerRef: ref, amountCents: 12000, idempotencyKey: randomUUID() });
+        await provider.refund({
+          providerRef: ref,
+          amountCents: 12000,
+          idempotencyKey: randomUUID(),
+        });
 
         await expect(
-          provider.refund({ providerRef: ref, amountCents: 991, idempotencyKey: randomUUID() }),
+          provider.refund({
+            providerRef: ref,
+            amountCents: 991,
+            idempotencyKey: randomUUID(),
+          }),
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('IDEMPOTENCIA: mesma chave nao reembolsa duas vezes', async () => {
+      it("IDEMPOTENCIA: mesma chave nao reembolsa duas vezes", async () => {
         const criada = await provider.createCharge(entrada());
         const ref = criada.providerRef;
         const idempotencyKey = randomUUID();
 
-        const primeira = await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey });
-        const segunda = await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey });
+        const primeira = await provider.refund({
+          providerRef: ref,
+          amountCents: 5000,
+          idempotencyKey,
+        });
+        const segunda = await provider.refund({
+          providerRef: ref,
+          amountCents: 5000,
+          idempotencyKey,
+        });
 
         expect(segunda).toEqual(primeira);
 
@@ -477,19 +542,27 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         expect(snapshot.refundedAmountCents).toBe(5000);
       });
 
-      it('IDEMPOTENCIA: mesma chave com VALOR diferente e erro', async () => {
+      it("IDEMPOTENCIA: mesma chave com VALOR diferente e erro", async () => {
         const criada = await provider.createCharge(entrada());
         const ref = criada.providerRef;
         const idempotencyKey = randomUUID();
 
-        await provider.refund({ providerRef: ref, amountCents: 5000, idempotencyKey });
+        await provider.refund({
+          providerRef: ref,
+          amountCents: 5000,
+          idempotencyKey,
+        });
 
         await expect(
-          provider.refund({ providerRef: ref, amountCents: 1000, idempotencyKey }),
+          provider.refund({
+            providerRef: ref,
+            amountCents: 1000,
+            idempotencyKey,
+          }),
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('recusa reembolsar cobranca que nao foi capturada', async () => {
+      it("recusa reembolsar cobranca que nao foi capturada", async () => {
         const criada = await provider.createCharge(
           entrada({ paymentMethodToken: kit.tokens.processando }),
         );
@@ -503,10 +576,10 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
       });
 
-      it('lanca ChargeNotFoundError para referencia inexistente', async () => {
+      it("lanca ChargeNotFoundError para referencia inexistente", async () => {
         await expect(
           provider.refund({
-            providerRef: 'ref_que_nao_existe',
+            providerRef: "ref_que_nao_existe",
             amountCents: 100,
             idempotencyKey: randomUUID(),
           }),
@@ -514,15 +587,17 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       });
     });
 
-    describe('taxonomia de erro', () => {
+    describe("taxonomia de erro", () => {
       (kit.capacidades.falhaTransiente ? it : it.skip)(
-        'falha transiente vem marcada como retryable',
+        "falha transiente vem marcada como retryable",
         async () => {
           let capturado: unknown;
 
           try {
             await provider.createCharge(
-              entrada({ paymentMethodToken: kit.tokens.erroTransiente as string }),
+              entrada({
+                paymentMethodToken: kit.tokens.erroTransiente as string,
+              }),
             );
           } catch (erro) {
             capturado = erro;
@@ -533,7 +608,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         },
       );
 
-      it('falha por requisicao invalida NAO e retryable', async () => {
+      it("falha por requisicao invalida NAO e retryable", async () => {
         let capturado: unknown;
 
         try {
@@ -547,29 +622,32 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
       });
     });
 
-    describe('verifyWebhook', () => {
-      it('verifica e traduz um webhook valido', async () => {
+    describe("verifyWebhook", () => {
+      it("verifica e traduz um webhook valido", async () => {
         const criada = await provider.createCharge(entrada());
         const request = kit.assinarWebhook(provider, {
           providerRef: criada.providerRef,
-          eventType: 'payment.succeeded',
+          eventType: "payment.succeeded",
         });
 
-        const evento = exigirEvento(provider.verifyWebhook(request), 'payment.succeeded');
+        const evento = exigirEvento(
+          provider.verifyWebhook(request),
+          "payment.succeeded",
+        );
 
         expect(evento.providerRef).toBe(criada.providerRef);
-        expect(typeof evento.providerEventId).toBe('string');
+        expect(typeof evento.providerEventId).toBe("string");
         expect(evento.providerEventId.length).toBeGreaterThan(0);
         // O tipo BRUTO tem de sobreviver: e ele que vai para a coluna eventType
         // do inbox, e gravar o nosso rotulo perderia informacao de triagem.
-        expect(evento.providerEventTypeBruto).toBe('payment.succeeded');
+        expect(evento.providerEventTypeBruto).toBe("payment.succeeded");
       });
 
-      it('recusa quando o corpo foi alterado apos a assinatura', async () => {
+      it("recusa quando o corpo foi alterado apos a assinatura", async () => {
         const criada = await provider.createCharge(entrada());
         const request = kit.assinarWebhook(provider, {
           providerRef: criada.providerRef,
-          eventType: 'payment.succeeded',
+          eventType: "payment.succeeded",
         });
 
         // Classe ESPECIFICA, nao toThrow() generico: um adapter que parseasse o
@@ -578,47 +656,54 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         expect(() =>
           provider.verifyWebhook({
             ...request,
-            rawBody: Buffer.concat([request.rawBody, Buffer.from(' ')]),
+            rawBody: Buffer.concat([request.rawBody, Buffer.from(" ")]),
           }),
         ).toThrow(WebhookSignatureError);
       });
 
-      it('recusa quando nao ha cabecalho de assinatura', async () => {
+      it("recusa quando nao ha cabecalho de assinatura", async () => {
         const criada = await provider.createCharge(entrada());
         const request = kit.assinarWebhook(provider, {
           providerRef: criada.providerRef,
-          eventType: 'payment.succeeded',
+          eventType: "payment.succeeded",
         });
 
-        expect(() => provider.verifyWebhook({ ...request, headers: {} })).toThrow(
-          WebhookSignatureError,
-        );
+        expect(() =>
+          provider.verifyWebhook({ ...request, headers: {} }),
+        ).toThrow(WebhookSignatureError);
       });
     });
 
     (kit.capacidades.transicaoAssincrona ? describe : describe.skip)(
-      'transicao assincrona PROCESSING -> SUCCEEDED',
+      "transicao assincrona PROCESSING -> SUCCEEDED",
       () => {
-        it('o webhook e o snapshot ficam coerentes depois da confirmacao', async () => {
+        it("o webhook e o snapshot ficam coerentes depois da confirmacao", async () => {
           const criada = exigirEstado(
-            await provider.createCharge(entrada({ paymentMethodToken: kit.tokens.processando })),
-            'PROCESSING',
+            await provider.createCharge(
+              entrada({ paymentMethodToken: kit.tokens.processando }),
+            ),
+            "PROCESSING",
           );
 
           const antes = await provider.getCharge(criada.providerRef);
-          expect(antes.state).toBe('PROCESSING');
+          expect(antes.state).toBe("PROCESSING");
           expect(antes.capturedAmountCents).toBe(0);
 
-          const simular = kit.simularSucesso as NonNullable<KitDeContrato['simularSucesso']>;
+          const simular = kit.simularSucesso as NonNullable<
+            KitDeContrato["simularSucesso"]
+          >;
           const request = simular(provider, criada.providerRef);
 
-          const evento = exigirEvento(provider.verifyWebhook(request), 'payment.succeeded');
+          const evento = exigirEvento(
+            provider.verifyWebhook(request),
+            "payment.succeeded",
+          );
           expect(evento.providerRef).toBe(criada.providerRef);
 
           // A confirmacao tem de aparecer TAMBEM na fonte da verdade — senao o
           // provedor teria duas versoes do mesmo fato.
           const depois = await provider.getCharge(criada.providerRef);
-          expect(depois.state).toBe('SUCCEEDED');
+          expect(depois.state).toBe("SUCCEEDED");
           expect(depois.capturedAmountCents).toBe(12990);
         });
       },
