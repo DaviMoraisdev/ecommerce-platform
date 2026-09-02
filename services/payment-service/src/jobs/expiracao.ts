@@ -1,7 +1,9 @@
-import type {
-  ChargeResult,
-  ChargeSnapshot,
+import {
+  ChargeNotCancelableError,
+  type ChargeResult,
+  type ChargeSnapshot,
 } from '../providers/payment-provider.port';
+import type { CursorDaVarredura } from './keyset';
 
 /**
  * EXPIRACAO DA JANELA (Bloco 6e).
@@ -109,4 +111,167 @@ export function decidirExpiracao(snapshot: ChargeSnapshot): AcaoDeExpiracao {
         motivo: 'cobranca segue em processamento apos comando de cancelamento',
       };
   }
+}
+
+export interface ExpiracaoDeps {
+  /** Tentativas PENDING COM providerRef, criadas ANTES do limite e APOS o cursor. */
+  buscarExpirando: (
+    limite: Date,
+    lote: number,
+    apos?: CursorDaVarredura,
+  ) => Promise<TentativaExpirando[]>;
+  cancelarCobranca: (providerRef: string, idempotencyKey: string) => Promise<ChargeSnapshot>;
+  consultarCobranca: (providerRef: string) => Promise<ChargeSnapshot>;
+  expirar: (transactionId: string, providerRef: string) => Promise<boolean>;
+  aplicar: (
+    transactionId: string,
+    providerRef: string,
+    resultado: ChargeResult,
+  ) => Promise<boolean>;
+  agora?: () => Date;
+  janelaMinutos?: number;
+  lote?: number;
+  maxLotes?: number;
+}
+
+export interface ResumoDaExpiracao {
+  examinadas: number;
+  expiradas: number;
+  aplicadas: number;
+  triagem: number;
+  falhas: number;
+  /** true = parou no teto de lotes, SEM provar que a fila acabou. */
+  truncada: boolean;
+  /** `null` quando a fila esgotou e o proximo ciclo recomeca do inicio. */
+  proximoCursor: CursorDaVarredura | null;
+}
+
+function naFaixa(valor: number | undefined, padrao: number, min: number, max: number): number {
+  if (valor === undefined || !Number.isInteger(valor)) return padrao;
+  return Math.min(Math.max(valor, min), max);
+}
+
+/**
+ * Chave de idempotencia do CANCELAMENTO.
+ *
+ * Prefixo obrigatorio, nao estetico: com provedor real a chave e global por
+ * conta, entao reusar `paymentId:attemptCount` (a chave do createCharge) faria
+ * o provedor devolver a resposta EM CACHE da cobranca em vez de cancelar.
+ *
+ * Estavel entre ciclos porque `attemptCount` nao muda enquanto o pagamento
+ * esta PROCESSING — invariante da matriz de estados, ja usada pelo 6b.
+ */
+export function chaveDeCancelamento(paymentId: string, attemptCount: number): string {
+  return `cancel:${paymentId}:${attemptCount}`;
+}
+
+/**
+ * COMANDA o cancelamento e devolve o estado em que a cobranca ficou.
+ *
+ * Os dois caminhos convergem num unico ChargeSnapshot: o retorno normal, ou —
+ * quando o provedor recusa porque JA CAPTUROU — a leitura seguinte. Aquela
+ * recusa nao e falha, e INFORMACAO, e distingui-la por CLASSE (e nao por
+ * mensagem) e o motivo de ChargeNotCancelableError existir. Tratada como falha
+ * generica, um pagamento efetivamente cobrado do cliente ficaria preso.
+ */
+async function comandarCancelamento(
+  deps: ExpiracaoDeps,
+  candidata: TentativaExpirando,
+): Promise<ChargeSnapshot> {
+  try {
+    return await deps.cancelarCobranca(
+      candidata.providerRef,
+      chaveDeCancelamento(candidata.paymentId, candidata.attemptCount),
+    );
+  } catch (erro) {
+    if (!(erro instanceof ChargeNotCancelableError)) throw erro;
+    return deps.consultarCobranca(candidata.providerRef);
+  }
+}
+
+export async function tickExpiracao(
+  deps: ExpiracaoDeps,
+  cursorInicial?: CursorDaVarredura,
+): Promise<ResumoDaExpiracao> {
+  const agora = deps.agora ? deps.agora() : new Date();
+  const janela = naFaixa(deps.janelaMinutos, 15, 1, 1440);
+  const lote = naFaixa(deps.lote, 20, 1, 500);
+  const maxLotes = naFaixa(deps.maxLotes, 5, 1, 100);
+
+  // Mesma razao da janela do 6b: sem ela o job cancelaria uma cobranca cuja
+  // requisicao original ainda esta em voo.
+  const limite = new Date(agora.getTime() - janela * 60_000);
+
+  const resumo: ResumoDaExpiracao = {
+    examinadas: 0,
+    expiradas: 0,
+    aplicadas: 0,
+    triagem: 0,
+    falhas: 0,
+    truncada: false,
+    proximoCursor: null,
+  };
+
+  let cursor = cursorInicial;
+
+  for (let pagina = 0; pagina < maxLotes; pagina += 1) {
+    const candidatas = await deps.buscarExpirando(limite, lote, cursor);
+    if (candidatas.length === 0) return resumo;
+
+    resumo.examinadas += candidatas.length;
+
+    for (const candidata of candidatas) {
+      try {
+        const acao = decidirExpiracao(await comandarCancelamento(deps, candidata));
+
+        switch (acao.tipo) {
+          case 'expirar':
+            if (await deps.expirar(candidata.id, candidata.providerRef)) resumo.expiradas += 1;
+            break;
+          case 'aplicar':
+            if (await deps.aplicar(candidata.id, candidata.providerRef, acao.resultado)) {
+              resumo.aplicadas += 1;
+            }
+            break;
+          case 'triagem':
+            resumo.triagem += 1;
+            console.warn('[payment-service] expiracao em triagem', {
+              transactionId: candidata.id,
+              motivo: acao.motivo,
+            });
+            break;
+        }
+      } catch (erro) {
+        // Falha tecnica NAO vira desfecho: a tentativa continua presa e visivel,
+        // e volta no proximo ciclo. Aplicar no escuro mexe em dinheiro.
+        resumo.falhas += 1;
+        console.error('[payment-service] falha ao expirar tentativa', {
+          transactionId: candidata.id,
+          causa: erro instanceof Error ? erro.message : String(erro),
+        });
+      }
+
+      // Avanca SEMPRE, inclusive apos falha: item nao-acionavel continua
+      // candidato e, sem isto, seguraria a varredura para sempre (achado 4.1
+      // do PR #57).
+      cursor = { createdAt: candidata.createdAt, id: candidata.id };
+    }
+
+    if (candidatas.length < lote) return resumo;
+  }
+
+  resumo.truncada = true;
+  resumo.proximoCursor = cursor ?? null;
+  return resumo;
+}
+
+export function criarVarreduraDeExpiracao(
+  deps: ExpiracaoDeps,
+): () => Promise<ResumoDaExpiracao> {
+  let cursor: CursorDaVarredura | undefined;
+  return async () => {
+    const resumo = await tickExpiracao(deps, cursor);
+    cursor = resumo.proximoCursor ?? undefined;
+    return resumo;
+  };
 }

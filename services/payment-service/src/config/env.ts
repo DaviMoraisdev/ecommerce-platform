@@ -84,7 +84,7 @@ export interface AppConfig {
  * O `server.ts` verifica que a lista real tem este tamanho: constante que
  * silenciosamente diverge do codigo e pior que constante nenhuma.
  */
-export const VARREDURAS_POR_CICLO = 2;
+export const VARREDURAS_POR_CICLO = 3;
 
 export class ConfigError extends Error {
   constructor(message: string) {

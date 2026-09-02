@@ -12,6 +12,8 @@ import { registrarEncerramento } from './shutdown';
 import { startOutboxRelay, stopOutboxRelay } from './events/outbox.relay';
 import { closeEventPublisher, initEventPublisher, isPublisherReady, publish } from './events/publisher';
 import { fetchPending, markRetry, markSent } from './events/outbox.repository';
+import { criarVarreduraDeExpiracao } from './jobs/expiracao';
+import { montarDepsDeExpiracao } from './jobs/expiracao.deps';
 
 // Ponto de entrada: o UNICO lugar com process.exit e o unico que liga as pecas.
 // Toda VALIDACAO de ambiente mora no loadConfig, entao falha de configuracao
@@ -69,6 +71,12 @@ bootstrap({
             quarentenarOrfaos,
             idadeMinutos: config.webhookQuarantineMinutes,
           }),
+      },
+      {
+        nome: 'expiracao',
+        executar: criarVarreduraDeExpiracao(
+          montarDepsDeExpiracao(provider, service, config.paymentWindowMinutes),
+        ),
       },
     ];
 

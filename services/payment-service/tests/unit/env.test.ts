@@ -484,14 +484,19 @@ describe('loadConfig — WEBHOOK_QUARANTINE_MINUTES (Bloco 6c)', () => {
   });
 
   it('aceita acima da janela MAIS o intervalo MAIS a duracao do ciclo', () => {
-    // Defaults: poll 1 min, prazo 2 min por varredura x 2 varreduras = 4 min.
-    // Minimo para janela 60 e, portanto, 65 — o primeiro aceito e 66.
+    // Defaults: poll 1 min, prazo 2 min por varredura x 3 varreduras = 6 min.
+    // Minimo para janela 60 e, portanto, 67 — o primeiro aceito e 68.
+    //
+    // Este caso QUEBRA de proposito quando uma varredura e acrescentada (o
+    // 6e subiu de 2 para 3). Derivar o valor de VARREDURAS_POR_CICLO faria
+    // ele passar em silencio, e ninguem reavaliaria o invariante temporal
+    // ao adicionar um job — que e justamente o momento de reavaliar.
     const config = loadConfig({
       ...base,
       PAYMENT_WINDOW_MINUTES: '60',
-      WEBHOOK_QUARANTINE_MINUTES: '66',
+      WEBHOOK_QUARANTINE_MINUTES: '68',
     });
-    expect(config.webhookQuarantineMinutes).toBe(66);
+    expect(config.webhookQuarantineMinutes).toBe(68);
   });
 
   it('RECUSA quando a folga ignora a DURACAO do ciclo', () => {
