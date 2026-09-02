@@ -509,19 +509,64 @@ export class PaymentService {
    * decide. Os invariantes continuam morando aqui, num lugar so. Duplica-los
    * dentro do job e como o publisher do order e do payment divergiram.
    */
+  /**
+   * Desfecho sobre tentativa presa SEM cobranca conhecida (Bloco 6b).
+   *
+   * Exige chave em andamento: naquela populacao a chamada ao provedor FALHOU,
+   * entao o claim nunca foi concluido. Chave ausente ali e estado impossivel.
+   */
   async aplicarDesfechoDeReconciliacao(
     transactionId: string,
     resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
   ): Promise<boolean> {
+    return this.reivindicarEAplicar(transactionId, resultado, { providerRef: null }, 'exigir');
+  }
+
+  /**
+   * Desfecho sobre tentativa cuja cobranca EXISTE (Bloco 6e).
+   *
+   * Duas diferencas em relacao ao 6b, ambas descobertas por TESTE e nao por
+   * leitura:
+   *
+   * 1. A condicao da reivindicacao e o providerRef EXATO que a varredura
+   *    cancelou, nao `{ not: null }`. Se a linha trocou de cobranca entre a
+   *    selecao e a acao, ela nao e mais a nossa.
+   * 2. NAO ha chave em andamento: aqui a chamada ao provedor SUCEDEU (aceite
+   *    assincrono), entao o claim foi concluido e a resposta, congelada.
+   */
+  async aplicarDesfechoDeExpiracao(
+    transactionId: string,
+    providerRef: string,
+    resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
+  ): Promise<boolean> {
+    return this.reivindicarEAplicar(transactionId, resultado, { providerRef }, 'ignorar');
+  }
+
+  /**
+   * Reivindicacao + aplicacao, com a condicao da COBRANCA e o tratamento da
+   * CHAVE parametrizados.
+   *
+   * Extraida no Bloco 6e, no segundo uso. O corpo e identico e o compilador NAO
+   * le WHERE — duas copias divergiriam em silencio, que e o defeito registrado
+   * como `[6b DESCOBERTO]` no TECH_DEBT. O tipo da condicao e restrito a
+   * `providerRef` de proposito: um WhereInput livre deixaria um chamador
+   * afrouxar a reivindicacao, que e o proprio mecanismo de seguranca.
+   */
+  private async reivindicarEAplicar(
+    transactionId: string,
+    resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
+    condicaoDaCobranca: Pick<Prisma.PaymentTransactionWhereInput, 'providerRef'>,
+    chaveEmAndamento: 'exigir' | 'ignorar',
+  ): Promise<boolean> {
     return this.deps.prisma.$transaction(async (tx) => {
       // Reivindicacao: so segue quem encontrar a tentativa AINDA presa. Em
       // Postgres a concorrente bloqueia no lock da linha e reavalia o WHERE
-      // depois do commit — o providerRef ja preenchido a exclui.
+      // depois do commit.
       const reivindicada = await tx.paymentTransaction.updateMany({
         where: {
           id: transactionId,
           status: TransactionStatus.PENDING,
-          providerRef: null,
+          ...condicaoDaCobranca,
         },
         data: { updatedAt: new Date() },
       });
@@ -532,22 +577,26 @@ export class PaymentService {
       });
       const payment = await tx.payment.findUniqueOrThrow({ where: { id: tentativa.paymentId } });
 
-      const registro = await tx.idempotencyRecord.findFirst({
-        where: { paymentId: payment.id, status: 'PROCESSING' },
-        orderBy: { createdAt: 'desc' },
-      });
-      if (registro === null) {
-        // Estado que nao deveria existir: tentativa presa sem chave em
-        // andamento. Falhar alto, porque aplicar o desfecho sem finalizar a
-        // chave deixaria o cliente recebendo IDEMPOTENCIA_EM_ANDAMENTO para
-        // sempre sobre um pagamento ja concluido.
-        throw erroDeDominio(
-          'DEPENDENCIA_INDISPONIVEL',
-          'Tentativa presa sem chave de idempotencia em andamento',
-        );
+      let registroId: string | null = null;
+      if (chaveEmAndamento === 'exigir') {
+        const registro = await tx.idempotencyRecord.findFirst({
+          where: { paymentId: payment.id, status: 'PROCESSING' },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (registro === null) {
+          // Estado que nao deveria existir: tentativa presa sem chave em
+          // andamento. Falhar alto, porque aplicar o desfecho sem finalizar a
+          // chave deixaria o cliente recebendo IDEMPOTENCIA_EM_ANDAMENTO para
+          // sempre sobre um pagamento ja concluido.
+          throw erroDeDominio(
+            'DEPENDENCIA_INDISPONIVEL',
+            'Tentativa presa sem chave de idempotencia em andamento',
+          );
+        }
+        registroId = registro.id;
       }
 
-      await this.aplicarDesfecho(tx, payment, transactionId, registro.id, resultado);
+      await this.aplicarDesfecho(tx, payment, transactionId, registroId, resultado);
       return true;
     });
   }
@@ -596,6 +645,56 @@ export class PaymentService {
     });
   }
 
+  /**
+   * Encerra uma tentativa cuja cobranca foi CANCELADA no provedor (Bloco 6e).
+   *
+   * Difere de liberarTentativaPresa no que mais importa: la o Payment volta a
+   * FAILED e o cliente pode tentar de novo, porque a janela segue aberta. Aqui
+   * ele vai a EXPIRED, TERMINAL (conjunto de transicoes vazio) — a janela
+   * acabou e nao existe tentativa seguinte.
+   *
+   * NAO mexe na chave de idempotencia, e a primeira versao mexia. Copiei a
+   * finalizacao do 6b por analogia e a analogia nao valia: la a chamada ao
+   * provedor FALHOU e o claim ficou PROCESSING; aqui ela SUCEDEU e o claim ja
+   * esta COMPLETED, com resposta congelada entregue ao cliente. O CASO E5 pegou.
+   *
+   * NAO toca em `lastProviderEventAt`, de proposito. Aquele marcador registra
+   * quando o PROVEDOR gerou o evento que nos transicionou; expiracao e acao
+   * NOSSA. Carimbar `Date.now()` faria um evento legitimo do provedor, gerado
+   * antes de agora, ser descartado como obsoleto pelo CAS do Bloco 6d.
+   */
+  async expirarTentativa(transactionId: string, providerRef: string): Promise<boolean> {
+    return this.deps.prisma.$transaction(async (tx) => {
+      const reivindicada = await tx.paymentTransaction.updateMany({
+        where: {
+          id: transactionId,
+          status: TransactionStatus.PENDING,
+          providerRef,
+        },
+        // Codigo proprio: na trilha, distingue expiracao de recusa do provedor
+        // e de liberacao pelo job de reconciliacao.
+        data: { status: TransactionStatus.FAILED, failureCode: 'EXPIRADO_JANELA' },
+      });
+      if (reivindicada.count === 0) return false;
+
+      const tentativa = await tx.paymentTransaction.findUniqueOrThrow({
+        where: { id: transactionId },
+      });
+      const payment = await tx.payment.findUniqueOrThrow({ where: { id: tentativa.paymentId } });
+
+      // Falha ALTO se a matriz nao admitir: expirar de um estado inesperado
+      // seria escrever um desfecho que o dominio nao reconhece.
+      assertTransicao(payment.status, PaymentStatus.EXPIRED);
+
+      await tx.payment.update({
+        where: { id: payment.id },
+        data: { status: PaymentStatus.EXPIRED },
+      });
+
+      return true;
+    });
+  }
+
   // ==========================================================
   // 5. Desfecho
   // ==========================================================
@@ -631,7 +730,7 @@ export class PaymentService {
     tx: Prisma.TransactionClient,
     payment: Payment,
     transactionId: string,
-    registroId: string,
+    registroId: string | null,
     resultado: Awaited<ReturnType<PaymentProvider['createCharge']>>,
   ): Promise<Payment> {
     const novoStatus = mapearEstadoDoProvedor(resultado.state);
@@ -709,13 +808,20 @@ export class PaymentService {
     // existiria um instante com a chave COMPLETED e sem o que devolver no
     // replay. Nesta entrega o invariante e mantido SO pela aplicacao — o
     // CHECK entra na fase contract, quando nao houver escritor antigo.
-    await tx.idempotencyRecord.update({
-      where: { id: registroId },
-      data: {
-        status: 'COMPLETED',
-        completedResponse: this.paraCongelar(p, declineCode),
-      },
-    });
+    // O caminho da EXPIRACAO (Bloco 6e) passa `null`: naquela populacao a
+    // chave ja esta COMPLETED, com resposta congelada que o cliente JA
+    // recebeu. Sobrescreve-la faria duas chamadas com a MESMA chave darem
+    // respostas diferentes — a definicao do que idempotencia impede. O
+    // desfecho final o cliente descobre pelo pagamento, nao pelo replay.
+    if (registroId !== null) {
+      await tx.idempotencyRecord.update({
+        where: { id: registroId },
+        data: {
+          status: 'COMPLETED',
+          completedResponse: this.paraCongelar(p, declineCode),
+        },
+      });
+    }
 
     return p;
   }
