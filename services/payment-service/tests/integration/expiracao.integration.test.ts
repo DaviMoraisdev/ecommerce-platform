@@ -409,4 +409,32 @@ describe('buscarTentativasExpirando', () => {
     expect(await prisma.outboxEvent.count()).toBe(1);
   });
 
+
+  it('CASO E11: expirar de estado TERMINAL e recusado e faz ROLLBACK do CAS', async () => {
+    // A sabotagem S7 mostrou que `assertTransicao` no expirarTentativa nao tinha
+    // teste: remove-la nao derrubava nada. Ela impede escrever EXPIRED sobre um
+    // pagamento que ja tem desfecho — CAPTURED viraria expirado, com o dinheiro
+    // ja cobrado do cliente.
+    //
+    // O caso prova DUAS coisas: a guarda, e que o CAS (que roda ANTES dela)
+    // volta atras. Sem a atomicidade, a tentativa ficaria FAILED com
+    // EXPIRADO_JANELA sobre um pagamento capturado.
+    const { service, payment, tentativa } = await tentativaAceita();
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { status: PaymentStatus.CAPTURED },
+    });
+
+    await expect(
+      service.expirarTentativa(tentativa.id, tentativa.providerRef as string),
+    ).rejects.toThrow();
+
+    const linha = await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: tentativa.id } });
+    expect(linha.status).toBe(TransactionStatus.PENDING);
+    expect(linha.failureCode).toBeNull();
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.CAPTURED);
+  });
+
 });
