@@ -1,13 +1,13 @@
 import type {
   ChargeResult,
   ChargeSnapshot,
-} from "../providers/payment-provider.port";
+} from '../providers/payment-provider.port';
 
 /**
  * EXPIRACAO DA JANELA (Bloco 6e).
  *
  * Populacao COMPLEMENTAR a da reconciliacao (6b): la, `providerRef` NULO
- * significa "chamamos o provedor e nao sabemos o que aconteceu". Aqui,
+ * significa 'chamamos o provedor e nao sabemos o que aconteceu'. Aqui,
  * `providerRef` PRESENTE significa "a cobranca existe e o provedor nunca
  * concluiu". A primeira se resolve PERGUNTANDO; esta, COMANDANDO o
  * cancelamento.
@@ -42,11 +42,11 @@ export interface TentativaExpirando {
  */
 export type AcaoDeExpiracao =
   /** Cancelamento confirmado no provedor: o pagamento vira EXPIRED. */
-  | { tipo: "expirar" }
+  | { tipo: 'expirar' }
   /** O provedor tem desfecho: aplica pelo MESMO caminho do fluxo normal. */
-  | { tipo: "aplicar"; resultado: ChargeResult }
+  | { tipo: 'aplicar'; resultado: ChargeResult }
   /** Estado que o job nao sabe aplicar com seguranca. Nao toca, e sinaliza. */
-  | { tipo: "triagem"; motivo: string };
+  | { tipo: 'triagem'; motivo: string };
 
 /**
  * Funcao PURA: sem banco, sem provedor, sem relogio.
@@ -65,48 +65,48 @@ export type AcaoDeExpiracao =
  */
 export function decidirExpiracao(snapshot: ChargeSnapshot): AcaoDeExpiracao {
   switch (snapshot.state) {
-    case "CANCELED":
+    case 'CANCELED':
       // Unico caminho que produz EXPIRED. O comando pegou: a cobranca esta
       // morta no provedor e o dinheiro reservado foi liberado.
-      return { tipo: "expirar" };
+      return { tipo: 'expirar' };
 
-    case "SUCCEEDED":
+    case 'SUCCEEDED':
       // O provedor capturou ANTES do nosso comando. Marcar EXPIRED aqui
       // registraria como expirado um pagamento que cobrou o cliente — o pior
       // desfecho possivel deste job. Aplica a captura pelo caminho normal.
       return {
-        tipo: "aplicar",
+        tipo: 'aplicar',
         resultado: {
           providerRef: snapshot.providerRef,
-          state: "SUCCEEDED",
+          state: 'SUCCEEDED',
           capturedAmountCents: snapshot.capturedAmountCents,
         },
       };
 
-    case "DECLINED":
+    case 'DECLINED':
       // Mesma regra do CASO R6: declineCode e opcional no snapshot e
       // OBRIGATORIO no ChargeResult. Preencher com fachada gravaria mentira na
       // resposta congelada, devolvida ao cliente em todo replay.
       if (snapshot.declineCode === undefined) {
-        return { tipo: "triagem", motivo: "recusa sem declineCode" };
+        return { tipo: 'triagem', motivo: 'recusa sem declineCode' };
       }
       return {
-        tipo: "aplicar",
+        tipo: 'aplicar',
         resultado: {
           providerRef: snapshot.providerRef,
-          state: "DECLINED",
+          state: 'DECLINED',
           capturedAmountCents: 0,
           declineCode: snapshot.declineCode,
         },
       };
 
-    case "PROCESSING":
+    case 'PROCESSING':
       // Comandamos o cancelamento e a cobranca continua andando. Ou o provedor
       // ignorou, ou o estado mudou entre o comando e a leitura. Nao inventar
       // desfecho: preso e visivel e melhor que resolvido no escuro.
       return {
-        tipo: "triagem",
-        motivo: "cobranca segue em processamento apos comando de cancelamento",
+        tipo: 'triagem',
+        motivo: 'cobranca segue em processamento apos comando de cancelamento',
       };
   }
 }

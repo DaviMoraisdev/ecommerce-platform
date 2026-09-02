@@ -1,15 +1,11 @@
-import {
-  TransactionStatus,
-  TransactionType,
-  type Prisma,
-} from "@prisma/client";
-import { getPrisma } from "../config/database";
-import type { TentativaPresa } from "./reconciliacao";
+import { TransactionStatus, TransactionType, type Prisma } from '@prisma/client';
+import { getPrisma } from '../config/database';
+import type { TentativaPresa } from './reconciliacao';
 import {
   apenasDepoisDoCursor,
   ordenacaoDaVarredura,
   type CursorDaVarredura,
-} from "./keyset";
+} from './keyset';
 
 /**
  * Tentativas que comecaram e nunca terminaram.
@@ -42,11 +38,9 @@ export async function buscarTentativasPresas(
     createdAt: { lt: limite },
   };
 
+
   const presas = await getPrisma().paymentTransaction.findMany({
     where: { AND: [base, ...apenasDepoisDoCursor(apos)] },
-    // Mais antigas primeiro: sao as que ha mais tempo travam um cliente. O `id`
-    // e desempate ESTAVEL — sem ele, duas linhas com o mesmo createdAt podem
-    // trocar de posicao entre paginas e uma delas nunca ser lida.
     orderBy: ordenacaoDaVarredura(),
     take: lote,
     include: { payment: { select: { attemptCount: true } } },

@@ -1,4 +1,4 @@
-import type { Currency } from "../domain/money";
+import type { Currency } from '../domain/money';
 
 /**
  * PORTA do provedor de pagamento.
@@ -18,7 +18,7 @@ import type { Currency } from "../domain/money";
 // ============================================================
 
 /** Vai gravado em Payment.provider. */
-export type ProviderName = "fake" | "stripe";
+export type ProviderName = 'fake' | 'stripe';
 
 /** Referencia da cobranca no provedor. Opaca para nos — nunca interpretada. */
 export type ProviderRef = string;
@@ -38,12 +38,7 @@ export type ProviderRef = string;
  * em um lugar e esquecer o outro deixou de ser possivel — antes as duas
  * declaracoes podiam divergir silenciosamente.
  */
-export const CHARGE_STATES = [
-  "PROCESSING",
-  "SUCCEEDED",
-  "DECLINED",
-  "CANCELED",
-] as const;
+export const CHARGE_STATES = ['PROCESSING', 'SUCCEEDED', 'DECLINED', 'CANCELED'] as const;
 
 export type ChargeState = (typeof CHARGE_STATES)[number];
 
@@ -104,17 +99,17 @@ export interface CreateChargeInput {
 export type ChargeResult =
   | {
       providerRef: ProviderRef;
-      state: "SUCCEEDED";
+      state: 'SUCCEEDED';
       capturedAmountCents: number;
     }
   | {
       providerRef: ProviderRef;
-      state: "PROCESSING";
+      state: 'PROCESSING';
       capturedAmountCents: 0;
     }
   | {
       providerRef: ProviderRef;
-      state: "DECLINED";
+      state: 'DECLINED';
       capturedAmountCents: 0;
       /** Recusa e resultado de negocio — e sempre vem com codigo. */
       declineCode: string;
@@ -163,14 +158,9 @@ export interface RefundInput {
 }
 
 export type RefundResult =
-  | { providerRefundRef: string; state: "SUCCEEDED"; amountCents: number }
-  | { providerRefundRef: string; state: "PROCESSING"; amountCents: number }
-  | {
-      providerRefundRef: string;
-      state: "DECLINED";
-      amountCents: number;
-      declineCode: string;
-    };
+  | { providerRefundRef: string; state: 'SUCCEEDED'; amountCents: number }
+  | { providerRefundRef: string; state: 'PROCESSING'; amountCents: number }
+  | { providerRefundRef: string; state: 'DECLINED'; amountCents: number; declineCode: string };
 
 // ============================================================
 // Webhook (Bloco 4)
@@ -189,12 +179,12 @@ export interface WebhookRequest {
 
 /** Tipos de evento no NOSSO vocabulario. */
 export type PaymentEventType =
-  | "payment.succeeded"
-  | "payment.failed"
-  | "payment.canceled"
-  | "refund.succeeded"
+  | 'payment.succeeded'
+  | 'payment.failed'
+  | 'payment.canceled'
+  | 'refund.succeeded'
   /** Evento que o provedor manda e nos nao tratamos -> inbox com status IGNORED. */
-  | "unsupported";
+  | 'unsupported';
 
 interface WebhookEventBase {
   /**
@@ -231,27 +221,27 @@ interface WebhookEventBase {
  */
 export type WebhookEventPayload =
   | (WebhookEventBase & {
-      eventType: "payment.succeeded";
+      eventType: 'payment.succeeded';
       providerRef: ProviderRef;
-      state: "SUCCEEDED";
+      state: 'SUCCEEDED';
       capturedAmountCents: number;
       refundedAmountCents: number;
     })
   | (WebhookEventBase & {
-      eventType: "payment.failed";
+      eventType: 'payment.failed';
       providerRef: ProviderRef;
-      state: "DECLINED";
+      state: 'DECLINED';
       declineCode?: string;
     })
   | (WebhookEventBase & {
-      eventType: "payment.canceled";
+      eventType: 'payment.canceled';
       providerRef: ProviderRef;
-      state: "CANCELED";
+      state: 'CANCELED';
     })
   | (WebhookEventBase & {
-      eventType: "refund.succeeded";
+      eventType: 'refund.succeeded';
       providerRef: ProviderRef;
-      state: "SUCCEEDED";
+      state: 'SUCCEEDED';
       capturedAmountCents: number;
       refundedAmountCents: number;
     })
@@ -262,7 +252,7 @@ export type WebhookEventPayload =
    * recusados como invalidos. Destino: inbox com status IGNORED.
    */
   | (WebhookEventBase & {
-      eventType: "unsupported";
+      eventType: 'unsupported';
     });
 
 // ============================================================
@@ -322,9 +312,9 @@ export class ChargeNotFoundError extends PaymentProviderError {
  * categoria errada a quem ler depois.
  *
  * Para o job de expiracao (Bloco 6e) isto nao e falha, e INFORMACAO: o provedor
- * acabou de dizer que capturou. Sem classe propria, o job teria de comparar a
- * MENSAGEM — exatamente o que a nota no topo desta secao proibe, e no ramo em
- * que errar significa deixar preso um pagamento que cobrou o cliente.
+ * acabou de dizer que capturou. Sem classe propria, o job compararia a
+ * MENSAGEM — o que a nota no topo desta secao proibe, e no ramo em que errar
+ * deixa preso um pagamento que ja cobrou o cliente.
  */
 export class ChargeNotCancelableError extends PaymentProviderError {
   readonly retryable = false;

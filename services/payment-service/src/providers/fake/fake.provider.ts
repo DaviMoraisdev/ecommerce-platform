@@ -1,6 +1,6 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
-import { assertValidCents, MoneyError } from "../../domain/money";
+import { assertValidCents, MoneyError } from '../../domain/money';
 import {
   ChargeNotCancelableError,
   ChargeNotFoundError,
@@ -21,15 +21,11 @@ import {
   type RefundResult,
   type WebhookEventPayload,
   type WebhookRequest,
-} from "../payment-provider.port";
-import {
-  desserializarEnvelope,
-  traduzirEvento,
-  type CorpoDeEvento,
-} from "./fake.wire";
-import { comportamentoDoToken } from "./fake.tokens";
+} from '../payment-provider.port';
+import { desserializarEnvelope, traduzirEvento, type CorpoDeEvento } from './fake.wire';
+import { comportamentoDoToken } from './fake.tokens';
 
-export const FAKE_SIGNATURE_HEADER = "x-fake-signature";
+export const FAKE_SIGNATURE_HEADER = 'x-fake-signature';
 
 const TOLERANCIA_PADRAO_SEGUNDOS = 300;
 const TOLERANCIA_MAXIMA_SEGUNDOS = 3600;
@@ -41,7 +37,7 @@ const TOLERANCIA_MAXIMA_SEGUNDOS = 3600;
  * refundedAmountCents dentro de SUCCEEDED.
  */
 const TRANSICOES: Record<ChargeState, ReadonlySet<ChargeState>> = {
-  PROCESSING: new Set<ChargeState>(["SUCCEEDED", "DECLINED", "CANCELED"]),
+  PROCESSING: new Set<ChargeState>(['SUCCEEDED', 'DECLINED', 'CANCELED']),
   SUCCEEDED: new Set<ChargeState>([]),
   DECLINED: new Set<ChargeState>([]),
   CANCELED: new Set<ChargeState>([]),
@@ -100,7 +96,7 @@ export interface ConstruirWebhookInput {
 
 export interface SimularTransicaoInput {
   providerRef: ProviderRef;
-  eventType: Exclude<PaymentEventType, "unsupported">;
+  eventType: Exclude<PaymentEventType, 'unsupported'>;
   refundAmountCents?: number;
   declineCode?: string;
   providerEventId?: string;
@@ -108,7 +104,7 @@ export interface SimularTransicaoInput {
 }
 
 export class FakeProvider implements PaymentProvider {
-  readonly name: ProviderName = "fake";
+  readonly name: ProviderName = 'fake';
 
   /**
    * O fake responde da propria memoria, no mesmo processo: o que ele gravou ja
@@ -123,18 +119,9 @@ export class FakeProvider implements PaymentProvider {
    * Reconstruir do estado atual faria o replay tardio mudar de resposta (ou
    * lancar, se a cobranca tiver sido cancelada) — replay tem de ser estavel.
    */
-  private readonly criacaoPorChave = new Map<
-    string,
-    { digital: string; resultado: ChargeResult }
-  >();
-  private readonly cancelamentoPorChave = new Map<
-    string,
-    { digital: string; snapshot: ChargeSnapshot }
-  >();
-  private readonly reembolsoPorChave = new Map<
-    string,
-    { digital: string; resultado: RefundResult }
-  >();
+  private readonly criacaoPorChave = new Map<string, { digital: string; resultado: ChargeResult }>();
+  private readonly cancelamentoPorChave = new Map<string, { digital: string; snapshot: ChargeSnapshot }>();
+  private readonly reembolsoPorChave = new Map<string, { digital: string; resultado: RefundResult }>();
 
   private readonly webhookSecret: string;
   private readonly toleranciaSegundos: number;
@@ -143,19 +130,15 @@ export class FakeProvider implements PaymentProvider {
   private contador = 0;
 
   constructor(options: FakeProviderOptions) {
-    if (!options.webhookSecret || options.webhookSecret.trim() === "") {
-      throw new ProviderInvalidRequestError("webhookSecret e obrigatorio");
+    if (!options.webhookSecret || options.webhookSecret.trim() === '') {
+      throw new ProviderInvalidRequestError('webhookSecret e obrigatorio');
     }
 
     const tolerancia = options.toleranciaSegundos ?? TOLERANCIA_PADRAO_SEGUNDOS;
     // Number.isInteger recusa NaN, Infinity e fracionario numa checagem.
     // Sem isso, NaN ou Infinity tornariam "idade > tolerancia" sempre falso e a
     // protecao antirreplay ficaria fail-OPEN — nenhum evento expiraria.
-    if (
-      !Number.isInteger(tolerancia) ||
-      tolerancia < 0 ||
-      tolerancia > TOLERANCIA_MAXIMA_SEGUNDOS
-    ) {
+    if (!Number.isInteger(tolerancia) || tolerancia < 0 || tolerancia > TOLERANCIA_MAXIMA_SEGUNDOS) {
       throw new ProviderInvalidRequestError(
         `toleranciaSegundos deve ser inteiro entre 0 e ${TOLERANCIA_MAXIMA_SEGUNDOS}`,
       );
@@ -174,8 +157,8 @@ export class FakeProvider implements PaymentProvider {
     this.exigirChaveIdempotente(input.idempotencyKey);
     this.exigirValor(input.amountCents);
 
-    if (input.currency !== "BRL") {
-      throw new ProviderInvalidRequestError("moeda nao suportada");
+    if (input.currency !== 'BRL') {
+      throw new ProviderInvalidRequestError('moeda nao suportada');
     }
 
     const digital = this.digital([
@@ -193,7 +176,7 @@ export class FakeProvider implements PaymentProvider {
     if (anterior) {
       if (anterior.digital !== digital) {
         throw new ProviderInvalidRequestError(
-          "idempotencyKey reutilizada com parametros diferentes",
+          'idempotencyKey reutilizada com parametros diferentes',
         );
       }
       return structuredClone(anterior.resultado);
@@ -202,23 +185,23 @@ export class FakeProvider implements PaymentProvider {
     const comportamento = comportamentoDoToken(input.paymentMethodToken);
     if (!comportamento) {
       // Sem interpolar o token na mensagem: ele autoriza cobranca.
-      throw new ProviderInvalidRequestError("paymentMethodToken desconhecido");
+      throw new ProviderInvalidRequestError('paymentMethodToken desconhecido');
     }
 
-    if (comportamento.kind === "timeout_apos_cobranca") {
+    if (comportamento.kind === 'timeout_apos_cobranca') {
       // A cobranca EXISTE e a chave FICA consumida: o provedor completou e
       // registrou a resposta idempotente; foi o transporte que falhou. Nao
       // consumir a chave aqui simularia um provedor que perde o proprio
       // trabalho, que e justamente o cenario que nao acontece.
-      const cobrada = this.registrar(input, { kind: "succeed" });
+      const cobrada = this.registrar(input, { kind: 'succeed' });
       this.criacaoPorChave.set(input.idempotencyKey, {
         digital,
         resultado: structuredClone(this.comoResultado(cobrada)),
       });
-      throw this.erroTecnico("unavailable");
+      throw this.erroTecnico('unavailable');
     }
 
-    if (comportamento.kind === "error") {
+    if (comportamento.kind === 'error') {
       // A chave NAO e consumida: nada foi criado, entao retentar deve poder
       // suceder. Consumi-la aqui deixaria o pagamento preso para sempre.
       throw this.erroTecnico(comportamento.error);
@@ -244,10 +227,7 @@ export class FakeProvider implements PaymentProvider {
     attemptCount: number,
   ): Promise<ChargeSnapshot | null> {
     for (const cobranca of this.cobrancas.values()) {
-      if (
-        cobranca.paymentId === paymentId &&
-        cobranca.attemptCount === attemptCount
-      ) {
+      if (cobranca.paymentId === paymentId && cobranca.attemptCount === attemptCount) {
         return this.comoSnapshot(cobranca);
       }
     }
@@ -274,7 +254,7 @@ export class FakeProvider implements PaymentProvider {
     if (anterior) {
       if (anterior.digital !== digital) {
         throw new ProviderInvalidRequestError(
-          "idempotencyKey reutilizada com parametros diferentes",
+          'idempotencyKey reutilizada com parametros diferentes',
         );
       }
       return structuredClone(anterior.snapshot);
@@ -282,11 +262,9 @@ export class FakeProvider implements PaymentProvider {
 
     const cobranca = this.exigirCobranca(input.providerRef);
 
-    if (cobranca.state === "SUCCEEDED") {
+    if (cobranca.state === 'SUCCEEDED') {
       // Dinheiro ja se moveu: desfazer exige refund, nao cancelamento.
-      throw new ChargeNotCancelableError(
-        "cobranca capturada nao pode ser cancelada",
-      );
+      throw new ChargeNotCancelableError('cobranca capturada nao pode ser cancelada');
     }
 
     // DECLINED e CANCELED sao terminais: no-op idempotente, para que o job de
@@ -298,8 +276,8 @@ export class FakeProvider implements PaymentProvider {
     // simularTransicao usa a MESMA tabela mas e ESTRITO, porque fabrica evento —
     // emitir payment.canceled para uma cobranca DECLINED produziria fixture
     // incoerente. Diferenca deliberada de tolerancia, nao de regra.
-    if (podeTransicionar(cobranca.state, "CANCELED")) {
-      cobranca.state = "CANCELED";
+    if (podeTransicionar(cobranca.state, 'CANCELED')) {
+      cobranca.state = 'CANCELED';
     }
 
     const snapshot = this.comoSnapshot(cobranca);
@@ -324,7 +302,7 @@ export class FakeProvider implements PaymentProvider {
     if (anterior) {
       if (anterior.digital !== digital) {
         throw new ProviderInvalidRequestError(
-          "idempotencyKey reutilizada com parametros diferentes",
+          'idempotencyKey reutilizada com parametros diferentes',
         );
       }
       return structuredClone(anterior.resultado);
@@ -332,25 +310,20 @@ export class FakeProvider implements PaymentProvider {
 
     const cobranca = this.exigirCobranca(input.providerRef);
 
-    if (cobranca.state !== "SUCCEEDED") {
-      throw new ProviderInvalidRequestError(
-        "so cobranca capturada pode ser reembolsada",
-      );
+    if (cobranca.state !== 'SUCCEEDED') {
+      throw new ProviderInvalidRequestError('so cobranca capturada pode ser reembolsada');
     }
 
-    const disponivel =
-      cobranca.capturedAmountCents - cobranca.refundedAmountCents;
+    const disponivel = cobranca.capturedAmountCents - cobranca.refundedAmountCents;
     if (input.amountCents > disponivel) {
-      throw new ProviderInvalidRequestError(
-        "valor do reembolso excede o disponivel",
-      );
+      throw new ProviderInvalidRequestError('valor do reembolso excede o disponivel');
     }
 
     cobranca.refundedAmountCents += input.amountCents;
 
     const resultado: RefundResult = {
       providerRefundRef: `re_fake_${++this.contador}`,
-      state: "SUCCEEDED",
+      state: 'SUCCEEDED',
       amountCents: input.amountCents,
     };
 
@@ -374,7 +347,7 @@ export class FakeProvider implements PaymentProvider {
     // deve conseguir descobrir qual e a janela de tempo aceita.
     const esperado = this.assinar(timestamp, request.rawBody);
     if (!this.iguaisEmTempoConstante(esperado, hmacRecebido)) {
-      throw new WebhookSignatureError("assinatura nao confere");
+      throw new WebhookSignatureError('assinatura nao confere');
     }
 
     const idade = Math.abs(this.agoraEmSegundos() - timestamp);
@@ -404,46 +377,41 @@ export class FakeProvider implements PaymentProvider {
     const cobranca = this.exigirCobranca(input.providerRef);
 
     switch (input.eventType) {
-      case "payment.succeeded": {
-        this.exigirTransicao(cobranca.state, "SUCCEEDED");
-        cobranca.state = "SUCCEEDED";
+      case 'payment.succeeded': {
+        this.exigirTransicao(cobranca.state, 'SUCCEEDED');
+        cobranca.state = 'SUCCEEDED';
         cobranca.capturedAmountCents = cobranca.amountCents;
         cobranca.declineCode = undefined;
         cobranca.declineMessage = undefined;
         break;
       }
 
-      case "payment.failed": {
-        this.exigirTransicao(cobranca.state, "DECLINED");
-        cobranca.state = "DECLINED";
+      case 'payment.failed': {
+        this.exigirTransicao(cobranca.state, 'DECLINED');
+        cobranca.state = 'DECLINED';
         cobranca.capturedAmountCents = 0;
-        cobranca.declineCode = input.declineCode ?? "generic_decline";
+        cobranca.declineCode = input.declineCode ?? 'generic_decline';
         break;
       }
 
-      case "payment.canceled": {
+      case 'payment.canceled': {
         // Antes isto aceitava DECLINED -> CANCELED, criando uma segunda maquina
         // de estados dentro do proprio Fake.
-        this.exigirTransicao(cobranca.state, "CANCELED");
-        cobranca.state = "CANCELED";
+        this.exigirTransicao(cobranca.state, 'CANCELED');
+        cobranca.state = 'CANCELED';
         cobranca.capturedAmountCents = 0;
         break;
       }
 
-      case "refund.succeeded": {
-        if (cobranca.state !== "SUCCEEDED") {
-          throw new ProviderInvalidRequestError(
-            "so cobranca capturada pode ser reembolsada",
-          );
+      case 'refund.succeeded': {
+        if (cobranca.state !== 'SUCCEEDED') {
+          throw new ProviderInvalidRequestError('so cobranca capturada pode ser reembolsada');
         }
-        const disponivel =
-          cobranca.capturedAmountCents - cobranca.refundedAmountCents;
+        const disponivel = cobranca.capturedAmountCents - cobranca.refundedAmountCents;
         const valor = input.refundAmountCents ?? disponivel;
         this.exigirValor(valor);
         if (valor > disponivel) {
-          throw new ProviderInvalidRequestError(
-            "valor do reembolso excede o disponivel",
-          );
+          throw new ProviderInvalidRequestError('valor do reembolso excede o disponivel');
         }
         cobranca.refundedAmountCents += valor;
         break;
@@ -480,10 +448,7 @@ export class FakeProvider implements PaymentProvider {
         state: (input.state ?? padrao.state) as ChargeState,
         captured_amount_cents: input.capturedAmountCents ?? padrao.capturado,
         refunded_amount_cents: input.refundedAmountCents ?? padrao.reembolsado,
-        decline_code:
-          input.declineCode === undefined
-            ? padrao.declineCode
-            : input.declineCode,
+        decline_code: input.declineCode === undefined ? padrao.declineCode : input.declineCode,
       },
     };
 
@@ -504,17 +469,10 @@ export class FakeProvider implements PaymentProvider {
   ): WebhookRequest {
     const rawBody = Buffer.isBuffer(corpo)
       ? corpo
-      : Buffer.from(
-          typeof corpo === "string" ? corpo : JSON.stringify(corpo),
-          "utf8",
-        );
+      : Buffer.from(typeof corpo === 'string' ? corpo : JSON.stringify(corpo), 'utf8');
 
     const timestamp = opts.timestampSegundos ?? this.agoraEmSegundos();
-    const hmac = this.assinarCom(
-      opts.assinarCom ?? this.webhookSecret,
-      timestamp,
-      rawBody,
-    );
+    const hmac = this.assinarCom(opts.assinarCom ?? this.webhookSecret, timestamp, rawBody);
 
     return {
       rawBody,
@@ -542,27 +500,22 @@ export class FakeProvider implements PaymentProvider {
   private padroesDoEvento(
     eventType: string,
     cobranca?: Cobranca,
-  ): {
-    state: ChargeState;
-    capturado: number;
-    reembolsado: number;
-    declineCode: string | null;
-  } {
+  ): { state: ChargeState; capturado: number; reembolsado: number; declineCode: string | null } {
     const valor = cobranca?.amountCents ?? 0;
 
     switch (eventType) {
-      case "payment.succeeded":
+      case 'payment.succeeded':
         return {
-          state: "SUCCEEDED",
+          state: 'SUCCEEDED',
           capturado: cobranca?.capturedAmountCents || valor,
           reembolsado: cobranca?.refundedAmountCents ?? 0,
           declineCode: null,
         };
 
-      case "refund.succeeded": {
+      case 'refund.succeeded': {
         const capturado = cobranca?.capturedAmountCents || valor;
         return {
-          state: "SUCCEEDED",
+          state: 'SUCCEEDED',
           capturado,
           // Sem reembolso registrado, assume total — mantem o corpo coerente.
           reembolsado: cobranca?.refundedAmountCents || capturado,
@@ -570,25 +523,20 @@ export class FakeProvider implements PaymentProvider {
         };
       }
 
-      case "payment.failed":
+      case 'payment.failed':
         return {
-          state: "DECLINED",
+          state: 'DECLINED',
           capturado: 0,
           reembolsado: 0,
-          declineCode: cobranca?.declineCode ?? "generic_decline",
+          declineCode: cobranca?.declineCode ?? 'generic_decline',
         };
 
-      case "payment.canceled":
-        return {
-          state: "CANCELED",
-          capturado: 0,
-          reembolsado: 0,
-          declineCode: null,
-        };
+      case 'payment.canceled':
+        return { state: 'CANCELED', capturado: 0, reembolsado: 0, declineCode: null };
 
       default:
         return {
-          state: cobranca?.state ?? "PROCESSING",
+          state: cobranca?.state ?? 'PROCESSING',
           capturado: cobranca?.capturedAmountCents ?? 0,
           reembolsado: cobranca?.refundedAmountCents ?? 0,
           declineCode: cobranca?.declineCode ?? null,
@@ -599,9 +547,9 @@ export class FakeProvider implements PaymentProvider {
   private registrar(
     input: CreateChargeInput,
     comportamento:
-      | { kind: "succeed" }
-      | { kind: "processing" }
-      | { kind: "decline"; code: string; message: string },
+      | { kind: 'succeed' }
+      | { kind: 'processing' }
+      | { kind: 'decline'; code: string; message: string },
   ): Cobranca {
     const providerRef = `ch_fake_${++this.contador}`;
 
@@ -609,17 +557,17 @@ export class FakeProvider implements PaymentProvider {
       providerRef,
       paymentId: input.reference.paymentId,
       attemptCount: input.reference.attemptCount,
-      state: "PROCESSING",
+      state: 'PROCESSING',
       amountCents: input.amountCents,
       capturedAmountCents: 0,
       refundedAmountCents: 0,
     };
 
-    if (comportamento.kind === "succeed") {
-      cobranca.state = "SUCCEEDED";
+    if (comportamento.kind === 'succeed') {
+      cobranca.state = 'SUCCEEDED';
       cobranca.capturedAmountCents = input.amountCents;
-    } else if (comportamento.kind === "decline") {
-      cobranca.state = "DECLINED";
+    } else if (comportamento.kind === 'decline') {
+      cobranca.state = 'DECLINED';
       cobranca.declineCode = comportamento.code;
       cobranca.declineMessage = comportamento.message;
     }
@@ -630,33 +578,29 @@ export class FakeProvider implements PaymentProvider {
 
   private comoResultado(cobranca: Cobranca): ChargeResult {
     switch (cobranca.state) {
-      case "SUCCEEDED":
+      case 'SUCCEEDED':
         return {
           providerRef: cobranca.providerRef,
-          state: "SUCCEEDED",
+          state: 'SUCCEEDED',
           capturedAmountCents: cobranca.capturedAmountCents,
         };
 
-      case "PROCESSING":
-        return {
-          providerRef: cobranca.providerRef,
-          state: "PROCESSING",
-          capturedAmountCents: 0,
-        };
+      case 'PROCESSING':
+        return { providerRef: cobranca.providerRef, state: 'PROCESSING', capturedAmountCents: 0 };
 
-      case "DECLINED":
+      case 'DECLINED':
         return {
           providerRef: cobranca.providerRef,
-          state: "DECLINED",
+          state: 'DECLINED',
           capturedAmountCents: 0,
-          declineCode: cobranca.declineCode ?? "generic_decline",
+          declineCode: cobranca.declineCode ?? 'generic_decline',
           declineMessage: cobranca.declineMessage,
         };
 
-      case "CANCELED":
+      case 'CANCELED':
         // Inalcancavel: createCharge nunca cria cobranca cancelada, e o replay
         // devolve o resultado ORIGINAL em vez de reconstruir do estado atual.
-        throw new ProviderInvalidRequestError("cobranca ja cancelada");
+        throw new ProviderInvalidRequestError('cobranca ja cancelada');
     }
   }
 
@@ -671,27 +615,23 @@ export class FakeProvider implements PaymentProvider {
     };
   }
 
-  private erroTecnico(
-    tipo: "unavailable" | "invalid" | "authentication",
-  ): Error {
-    if (tipo === "unavailable")
-      return new ProviderUnavailableError("provedor indisponivel");
-    if (tipo === "authentication") {
-      return new ProviderAuthenticationError("credencial do provedor invalida");
+  private erroTecnico(tipo: 'unavailable' | 'invalid' | 'authentication'): Error {
+    if (tipo === 'unavailable') return new ProviderUnavailableError('provedor indisponivel');
+    if (tipo === 'authentication') {
+      return new ProviderAuthenticationError('credencial do provedor invalida');
     }
-    return new ProviderInvalidRequestError("requisicao invalida");
+    return new ProviderInvalidRequestError('requisicao invalida');
   }
 
   private exigirCobranca(providerRef: ProviderRef): Cobranca {
     const cobranca = this.cobrancas.get(providerRef);
-    if (!cobranca)
-      throw new ChargeNotFoundError("cobranca nao encontrada no provedor");
+    if (!cobranca) throw new ChargeNotFoundError('cobranca nao encontrada no provedor');
     return cobranca;
   }
 
   private exigirChaveIdempotente(chave: string): void {
-    if (!chave || chave.trim() === "") {
-      throw new ProviderInvalidRequestError("idempotencyKey e obrigatoria");
+    if (!chave || chave.trim() === '') {
+      throw new ProviderInvalidRequestError('idempotencyKey e obrigatoria');
     }
   }
 
@@ -699,17 +639,16 @@ export class FakeProvider implements PaymentProvider {
     try {
       assertValidCents(amountCents);
     } catch (erro) {
-      if (erro instanceof MoneyError)
-        throw new ProviderInvalidRequestError(erro.message);
+      if (erro instanceof MoneyError) throw new ProviderInvalidRequestError(erro.message);
       throw erro;
     }
     if (amountCents === 0) {
-      throw new ProviderInvalidRequestError("valor deve ser maior que zero");
+      throw new ProviderInvalidRequestError('valor deve ser maior que zero');
     }
   }
 
   private digital(partes: unknown[]): string {
-    return createHash("sha256").update(JSON.stringify(partes)).digest("hex");
+    return createHash('sha256').update(JSON.stringify(partes)).digest('hex');
   }
 
   /**
@@ -721,7 +660,7 @@ export class FakeProvider implements PaymentProvider {
     const ms = this.relogio().getTime();
     if (!Number.isFinite(ms)) {
       throw new WebhookSignatureError(
-        "relogio invalido — impossivel avaliar a janela antirreplay",
+        'relogio invalido — impossivel avaliar a janela antirreplay',
       );
     }
     return Math.floor(ms / 1000);
@@ -732,40 +671,31 @@ export class FakeProvider implements PaymentProvider {
   ): string {
     // Cabecalho HTTP e case-insensitive; Node normaliza para minusculo, mas um
     // chamador direto pode nao ter normalizado.
-    const chave = Object.keys(headers).find(
-      (k) => k.toLowerCase() === FAKE_SIGNATURE_HEADER,
-    );
+    const chave = Object.keys(headers).find((k) => k.toLowerCase() === FAKE_SIGNATURE_HEADER);
     const bruto = chave ? headers[chave] : undefined;
     const valor = Array.isArray(bruto) ? bruto[0] : bruto;
 
-    if (!valor || valor.trim() === "") {
-      throw new WebhookSignatureError("cabecalho de assinatura ausente");
+    if (!valor || valor.trim() === '') {
+      throw new WebhookSignatureError('cabecalho de assinatura ausente');
     }
     return valor;
   }
 
-  private decompor(assinatura: string): {
-    timestamp: number;
-    hmacRecebido: string;
-  } {
+  private decompor(assinatura: string): { timestamp: number; hmacRecebido: string } {
     const partes = new Map<string, string>();
-    for (const item of assinatura.split(",")) {
-      const separador = item.indexOf("=");
+    for (const item of assinatura.split(',')) {
+      const separador = item.indexOf('=');
       if (separador <= 0) continue;
-      partes.set(
-        item.slice(0, separador).trim(),
-        item.slice(separador + 1).trim(),
-      );
+      partes.set(item.slice(0, separador).trim(), item.slice(separador + 1).trim());
     }
 
-    const t = partes.get("t");
-    const v1 = partes.get("v1");
-    if (!t || !v1)
-      throw new WebhookSignatureError("cabecalho de assinatura malformado");
+    const t = partes.get('t');
+    const v1 = partes.get('v1');
+    if (!t || !v1) throw new WebhookSignatureError('cabecalho de assinatura malformado');
 
     const timestamp = Number(t);
     if (!Number.isInteger(timestamp) || timestamp <= 0) {
-      throw new WebhookSignatureError("timestamp da assinatura invalido");
+      throw new WebhookSignatureError('timestamp da assinatura invalido');
     }
 
     return { timestamp, hmacRecebido: v1 };
@@ -775,24 +705,17 @@ export class FakeProvider implements PaymentProvider {
     return this.assinarCom(this.webhookSecret, timestamp, rawBody);
   }
 
-  private assinarCom(
-    segredo: string,
-    timestamp: number,
-    rawBody: Buffer,
-  ): string {
+  private assinarCom(segredo: string, timestamp: number, rawBody: Buffer): string {
     // O timestamp entra DENTRO do material assinado. Se ficasse so no cabecalho,
     // um atacante poderia reenviar o corpo com timestamp novo e passar pela
     // janela de tolerancia — replay attack.
-    const material = Buffer.concat([
-      Buffer.from(`${timestamp}.`, "utf8"),
-      rawBody,
-    ]);
-    return createHmac("sha256", segredo).update(material).digest("hex");
+    const material = Buffer.concat([Buffer.from(`${timestamp}.`, 'utf8'), rawBody]);
+    return createHmac('sha256', segredo).update(material).digest('hex');
   }
 
   private iguaisEmTempoConstante(esperado: string, recebido: string): boolean {
-    const a = Buffer.from(esperado, "utf8");
-    const b = Buffer.from(recebido, "utf8");
+    const a = Buffer.from(esperado, 'utf8');
+    const b = Buffer.from(recebido, 'utf8');
 
     // timingSafeEqual exige mesmo tamanho. Comparar tamanho antes nao vaza
     // segredo: o comprimento do hex de um SHA-256 e publico e fixo.

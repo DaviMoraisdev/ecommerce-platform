@@ -1,4 +1,4 @@
-import type { Prisma } from "@prisma/client";
+import type { Prisma } from '@prisma/client';
 
 /**
  * PAGINACAO POR CHAVE, compartilhada pelas varreduras que percorrem
@@ -46,5 +46,5 @@ export function apenasDepoisDoCursor(
  * constante compartilhada poderia ser mutada por um chamador distraido.
  */
 export function ordenacaoDaVarredura(): Prisma.PaymentTransactionOrderByWithRelationInput[] {
-  return [{ createdAt: "asc" }, { id: "asc" }];
+  return [{ createdAt: 'asc' }, { id: 'asc' }];
 }

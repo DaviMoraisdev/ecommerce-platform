@@ -2,14 +2,14 @@ import {
   TransactionStatus,
   TransactionType,
   type Prisma,
-} from "@prisma/client";
-import { getPrisma } from "../config/database";
-import type { TentativaExpirando } from "./expiracao";
+} from '@prisma/client';
+import { getPrisma } from '../config/database';
+import type { TentativaExpirando } from './expiracao';
 import {
   apenasDepoisDoCursor,
   ordenacaoDaVarredura,
   type CursorDaVarredura,
-} from "./keyset";
+} from './keyset';
 
 /**
  * Tentativas cuja COBRANCA EXISTE no provedor e que nunca foram concluidas.
