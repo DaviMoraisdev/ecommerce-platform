@@ -437,4 +437,34 @@ describe('buscarTentativasExpirando', () => {
     expect(atual.status).toBe(PaymentStatus.CAPTURED);
   });
 
+
+  it('CASO E12: recusa aplicada pelo caminho da expiracao persiste o desfecho inteiro', async () => {
+    // Item 8 da lista de testes ausentes do review: o CASO X3 cobre a DECISAO,
+    // mas nenhum caso provava a PERSISTENCIA desse ramo pelo caminho novo.
+    const { service, payment, tentativa } = await tentativaAceita();
+
+    const aplicou = await service.aplicarDesfechoDeExpiracao(
+      tentativa.id,
+      tentativa.providerRef as string,
+      {
+        providerRef: tentativa.providerRef as string,
+        state: 'DECLINED',
+        capturedAmountCents: 0,
+        declineCode: 'expired_card',
+        declineMessage: 'Cartao expirado',
+      },
+    );
+    expect(aplicou).toBe(true);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.FAILED);
+
+    const linha = await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: tentativa.id } });
+    expect(linha.status).toBe(TransactionStatus.FAILED);
+    expect(linha.failureCode).toBe('expired_card');
+
+    // Recusa NAO gera evento: so a captura libera o pedido.
+    expect(await prisma.outboxEvent.count()).toBe(0);
+  });
+
 });
