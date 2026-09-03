@@ -601,3 +601,24 @@ describe('loadConfig — knobs do runtime de jobs (Bloco 6c)', () => {
     );
   });
 });
+
+
+describe('PAYMENT_EXPIRATION_ENABLED (Bloco 6e)', () => {
+  it('vem DESLIGADA por padrao', () => {
+    // Fail-closed: a varredura produz EXPIRED e a saga so passa a receber esse
+    // desfecho no 6f. Default ligado criaria pagamentos terminais sem evento.
+    expect(loadConfig({ ...base }).expiracaoHabilitada).toBe(false);
+  });
+
+  it.each(['false', 'TRUE', '1', 'sim', ''])('mantem desligada para %p', (valor) => {
+    expect(
+      loadConfig({ ...base, PAYMENT_EXPIRATION_ENABLED: valor }).expiracaoHabilitada,
+    ).toBe(false);
+  });
+
+  it("liga apenas com o literal 'true'", () => {
+    expect(
+      loadConfig({ ...base, PAYMENT_EXPIRATION_ENABLED: 'true' }).expiracaoHabilitada,
+    ).toBe(true);
+  });
+});

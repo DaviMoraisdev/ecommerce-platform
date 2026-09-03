@@ -4,6 +4,7 @@ import {
   type ChargeSnapshot,
 } from '../providers/payment-provider.port';
 import type { CursorDaVarredura } from './keyset';
+import { mensagemSegura } from '../domain/mensagem-segura';
 
 /**
  * EXPIRACAO DA JANELA (Bloco 6e).
@@ -161,8 +162,12 @@ function naFaixa(valor: number | undefined, padrao: number, min: number, max: nu
  * Estavel entre ciclos porque `attemptCount` nao muda enquanto o pagamento
  * esta PROCESSING — invariante da matriz de estados, ja usada pelo 6b.
  */
-export function chaveDeCancelamento(paymentId: string, attemptCount: number): string {
-  return `cancel:${paymentId}:${attemptCount}`;
+export function chaveDeCancelamento(
+  paymentId: string,
+  attemptCount: number,
+  providerRef: string,
+): string {
+  return `cancel:${paymentId}:${attemptCount}:${providerRef}`;
 }
 
 /**
@@ -178,15 +183,28 @@ async function comandarCancelamento(
   deps: ExpiracaoDeps,
   candidata: TentativaExpirando,
 ): Promise<ChargeSnapshot> {
+  let snapshot: ChargeSnapshot;
+
   try {
-    return await deps.cancelarCobranca(
+    snapshot = await deps.cancelarCobranca(
       candidata.providerRef,
-      chaveDeCancelamento(candidata.paymentId, candidata.attemptCount),
+      chaveDeCancelamento(candidata.paymentId, candidata.attemptCount, candidata.providerRef),
     );
   } catch (erro) {
     if (!(erro instanceof ChargeNotCancelableError)) throw erro;
+    snapshot = await deps.consultarCobranca(candidata.providerRef);
+  }
+
+  // Achado 4.2 do review: um cancelamento aceito de forma ASSINCRONA devolve
+  // PROCESSING, e a resposta do COMANDO fica congelada pela idempotencia do
+  // provedor — todo ciclo seguinte releria o MESMO snapshot obsoleto e o
+  // pagamento ficaria preso para sempre, que e o problema que este job existe
+  // para eliminar. A CONSULTA nao passa pela chave: devolve estado vivo.
+  if (snapshot.state === 'PROCESSING') {
     return deps.consultarCobranca(candidata.providerRef);
   }
+
+  return snapshot;
 }
 
 export async function tickExpiracao(
@@ -222,7 +240,23 @@ export async function tickExpiracao(
 
     for (const candidata of candidatas) {
       try {
-        const acao = decidirExpiracao(await comandarCancelamento(deps, candidata));
+        const snapshot = await comandarCancelamento(deps, candidata);
+
+        // Achado 4.1 do review: o snapshot TEM de ser da cobranca que pedimos.
+        // Aplicar o estado de outra escreveria desfecho sobre o pagamento errado.
+        // Fail-closed: triagem, sem nenhuma escrita.
+        if (snapshot.providerRef !== candidata.providerRef) {
+          resumo.triagem += 1;
+          console.warn('[payment-service] snapshot de OUTRA cobranca', {
+            transactionId: candidata.id,
+            pedida: candidata.providerRef,
+            recebida: snapshot.providerRef,
+          });
+          cursor = { createdAt: candidata.createdAt, id: candidata.id };
+          continue;
+        }
+
+        const acao = decidirExpiracao(snapshot);
 
         switch (acao.tipo) {
           case 'expirar':
@@ -247,7 +281,7 @@ export async function tickExpiracao(
         resumo.falhas += 1;
         console.error('[payment-service] falha ao expirar tentativa', {
           transactionId: candidata.id,
-          causa: erro instanceof Error ? erro.message : String(erro),
+          causa: mensagemSegura(erro),
         });
       }
 

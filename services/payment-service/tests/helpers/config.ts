@@ -39,6 +39,7 @@ export function configDeTeste(overrides: Partial<AppConfig> = {}): AppConfig {
     orderServiceUrl: 'http://localhost:3006',
     orderServiceTimeoutMs: 5000,
     paymentWindowMinutes: 15,
+    expiracaoHabilitada: false,
     webhookMaxAttempts: 5,
     webhookQuarantineMinutes: 60,
     jobsPollIntervalMs: 60_000,

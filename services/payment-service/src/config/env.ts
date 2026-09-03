@@ -38,6 +38,16 @@ export interface AppConfig {
    * que nunca vai passar; reduzir arrisca desistir de falha transitoria que se
    * resolveria sozinha.
    */
+  /**
+   * Liga a varredura de EXPIRACAO (Bloco 6e). Default DESLIGADA.
+   *
+   * A varredura produz `Payment.EXPIRED`, e a saga ainda nao recebe esse
+   * desfecho (o evento e o binding entram no 6f). Ligada antes disso, cada
+   * pagamento expirado vira um registro SEM evento de outbox — e acrescentar
+   * o produtor depois so cobre transicoes NOVAS, deixando um passivo
+   * historico que nenhum backfill automatico recupera.
+   */
+  expiracaoHabilitada: boolean;
   webhookMaxAttempts: number;
   /**
    * Idade a partir da qual um evento AINDA inaplicavel vai para QUARANTINED
@@ -502,6 +512,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     paymentWindowMinutes,
     webhookQuarantineMinutes,
+    // Fail-closed: qualquer valor diferente de 'true' mantem desligada.
+    expiracaoHabilitada: source.PAYMENT_EXPIRATION_ENABLED === 'true',
     webhookMaxAttempts: parseTentativas(source.WEBHOOK_MAX_ATTEMPTS, 'WEBHOOK_MAX_ATTEMPTS', 5),
     jobsPollIntervalMs,
     jobsStopTimeoutMs,

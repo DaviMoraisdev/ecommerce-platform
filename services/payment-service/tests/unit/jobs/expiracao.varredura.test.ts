@@ -107,8 +107,8 @@ describe('tickExpiracao', () => {
     const d = deps();
     await tickExpiracao(d);
 
-    expect(chaveDeCancelamento('pay_1', 2)).toBe('cancel:pay_1:2');
-    expect(d.cancelarCobranca).toHaveBeenCalledWith('ch_1', 'cancel:pay_1:2');
+    expect(chaveDeCancelamento('pay_1', 2, 'ch_1')).toBe('cancel:pay_1:2:ch_1');
+    expect(d.cancelarCobranca).toHaveBeenCalledWith('ch_1', 'cancel:pay_1:2:ch_1');
   });
 
   it('CASO Y5: a fiacao liga o cancelamento ao PROVEDOR, nao a um literal', async () => {
@@ -133,4 +133,39 @@ describe('tickExpiracao', () => {
     expect(getCharge).toHaveBeenCalledWith('ch_9');
     expect(d.janelaMinutos).toBe(30);
   });
+
+  it('CASO Y6: snapshot de OUTRA cobranca vai para triagem, sem NENHUMA escrita', async () => {
+    // Achado 4.1 do review. A chave passou a incluir o providerRef, mas a chave
+    // sozinha nao basta: um adaptador pode devolver o snapshot errado. Aplicar
+    // o estado de outra cobranca escreveria desfecho sobre o pagamento errado —
+    // no pior caso a cobranca real continua VIVA e captura depois de o pagamento
+    // local ter sido encerrado.
+    const d = deps({
+      cancelarCobranca: jest.fn(async () => snapshot({ providerRef: 'ch_OUTRA' })),
+    });
+
+    const resumo = await tickExpiracao(d);
+
+    expect(resumo).toMatchObject({ examinadas: 1, triagem: 1, expiradas: 0, aplicadas: 0 });
+    expect(d.expirar).not.toHaveBeenCalled();
+    expect(d.aplicar).not.toHaveBeenCalled();
+  });
+
+  it('CASO Y7: cancelamento que devolve PROCESSING decide pelo estado VIVO', async () => {
+    // Achado 4.2 do review. Com provedor real, um cancelamento aceito de forma
+    // assincrona devolve PROCESSING e essa resposta fica CONGELADA pela
+    // idempotencia da chave: todo ciclo seguinte releria o mesmo snapshot
+    // obsoleto e o pagamento ficaria preso para sempre — o problema que este
+    // job existe para eliminar. A consulta nao passa pela chave.
+    const d = deps({
+      cancelarCobranca: jest.fn(async () => snapshot({ state: 'PROCESSING' })),
+      consultarCobranca: jest.fn(async () => snapshot({ state: 'CANCELED' })),
+    });
+
+    const resumo = await tickExpiracao(d);
+
+    expect(d.consultarCobranca).toHaveBeenCalledWith('ch_1');
+    expect(resumo).toMatchObject({ expiradas: 1, triagem: 0, falhas: 0 });
+  });
+
 });

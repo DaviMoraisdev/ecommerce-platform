@@ -217,7 +217,7 @@ describe('buscarTentativasExpirando', () => {
     expect(pagina3).toEqual([]);
   });
 
-  it('CASO E5: expirar leva o pagamento a EXPIRED e FINALIZA a chave', async () => {
+  it('CASO E5: expirar leva a EXPIRED e NAO reescreve a resposta congelada', async () => {
     const { service, payment, tentativa } = await tentativaAceita();
 
     const expirou = await service.expirarTentativa(

@@ -12,6 +12,7 @@ import { mapearEstadoDoProvedor, podeTransicionar } from '../domain/payment-stat
 import { enqueue } from '../events/outbox.repository';
 import { montarEventoDeCaptura } from '../events/payment.events';
 import type { WebhookEventPayload } from '../providers/payment-provider.port';
+import { mensagemSegura } from '../domain/mensagem-segura';
 
 /**
  * Quanto o `providerCreatedAt` pode estar a FRENTE do nosso relogio.
@@ -223,16 +224,6 @@ function sanitizar(valor: unknown, no: NoDoContrato | null, profundidade = 0): u
   return no === null ? '[nao-reconhecido]' : valor;
 }
 
-/**
- * Mensagem gravada em lastError. NUNCA a mensagem original: erro de Prisma
- * carrega nome de tabela e coluna, e o inbox e lido em triagem operacional.
- */
-function mensagemSegura(erro: unknown): string {
-  if (erro instanceof Prisma.PrismaClientKnownRequestError) {
-    return `falha de banco (${erro.code})`;
-  }
-  return 'falha inesperada no processamento do webhook';
-}
 
 type Registro = { id: string } | { duplicata: WebhookStatus };
 
