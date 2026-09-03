@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  ChargeNotCancelableError,
   ChargeNotFoundError,
   PaymentProviderError,
   ProviderInvalidRequestError,
@@ -410,7 +411,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
             providerRef: criada.providerRef,
             idempotencyKey: randomUUID(),
           }),
-        ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
+        ).rejects.toBeInstanceOf(ChargeNotCancelableError);
       });
 
       it('lanca ChargeNotFoundError para referencia inexistente', async () => {

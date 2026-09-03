@@ -302,6 +302,24 @@ export class ChargeNotFoundError extends PaymentProviderError {
   readonly retryable = false;
 }
 
+/**
+ * A cobranca EXISTE, mas o estado dela nao admite cancelamento — hoje, apenas
+ * o estado capturado: dinheiro que ja se moveu volta por refund, nunca por
+ * cancelamento.
+ *
+ * Classe propria, e NAO ProviderInvalidRequestError: a requisicao esta correta;
+ * quem nao permite e o ESTADO. Herdar de "requisicao malformada" ensinaria a
+ * categoria errada a quem ler depois.
+ *
+ * Para o job de expiracao (Bloco 6e) isto nao e falha, e INFORMACAO: o provedor
+ * acabou de dizer que capturou. Sem classe propria, o job compararia a
+ * MENSAGEM — o que a nota no topo desta secao proibe, e no ramo em que errar
+ * deixa preso um pagamento que ja cobrou o cliente.
+ */
+export class ChargeNotCancelableError extends PaymentProviderError {
+  readonly retryable = false;
+}
+
 /** Assinatura ausente, invalida ou fora da janela de tolerancia. */
 export class WebhookSignatureError extends PaymentProviderError {
   readonly retryable = false;

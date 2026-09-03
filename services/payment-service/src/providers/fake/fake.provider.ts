@@ -2,6 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 import { assertValidCents, MoneyError } from '../../domain/money';
 import {
+  ChargeNotCancelableError,
   ChargeNotFoundError,
   ProviderAuthenticationError,
   ProviderInvalidRequestError,
@@ -263,7 +264,7 @@ export class FakeProvider implements PaymentProvider {
 
     if (cobranca.state === 'SUCCEEDED') {
       // Dinheiro ja se moveu: desfazer exige refund, nao cancelamento.
-      throw new ProviderInvalidRequestError('cobranca capturada nao pode ser cancelada');
+      throw new ChargeNotCancelableError('cobranca capturada nao pode ser cancelada');
     }
 
     // DECLINED e CANCELED sao terminais: no-op idempotente, para que o job de

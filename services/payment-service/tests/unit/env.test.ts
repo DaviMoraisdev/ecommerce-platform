@@ -483,15 +483,50 @@ describe('loadConfig — WEBHOOK_QUARANTINE_MINUTES (Bloco 6c)', () => {
     ).toThrow(/deve ser MAIOR/);
   });
 
-  it('aceita acima da janela MAIS o intervalo MAIS a duracao do ciclo', () => {
-    // Defaults: poll 1 min, prazo 2 min por varredura x 2 varreduras = 4 min.
-    // Minimo para janela 60 e, portanto, 65 — o primeiro aceito e 66.
+  it('flag DESLIGADA: a folga cobre DUAS varreduras', () => {
+    // Achado 4.1 da 2a rodada. A constante era fixa em 3 e exigia margem para
+    // uma varredura que nao roda — uma configuracao valida ANTES do PR passava
+    // a ser recusada no boot. Feature default-off nao pode derrubar implantacao.
+    // Defaults: poll 1 min, prazo 2 min x 2 varreduras = 4. Minimo 65.
     const config = loadConfig({
       ...base,
       PAYMENT_WINDOW_MINUTES: '60',
       WEBHOOK_QUARANTINE_MINUTES: '66',
     });
     expect(config.webhookQuarantineMinutes).toBe(66);
+    expect(config.varredurasPorCiclo).toBe(2);
+  });
+
+  it('flag DESLIGADA: 65 continua recusado — o limite nao afrouxou', () => {
+    expect(() =>
+      loadConfig({ ...base, PAYMENT_WINDOW_MINUTES: '60', WEBHOOK_QUARANTINE_MINUTES: '65' }),
+    ).toThrow(/deve ser MAIOR/);
+  });
+
+  it('flag LIGADA: a folga sobe para TRES varreduras', () => {
+    // Prazo 2 min x 3 = 6. Minimo 67, primeiro aceito 68.
+    const config = loadConfig({
+      ...base,
+      PAYMENT_EXPIRATION_ENABLED: 'true',
+      PAYMENT_WINDOW_MINUTES: '60',
+      WEBHOOK_QUARANTINE_MINUTES: '68',
+    });
+    expect(config.webhookQuarantineMinutes).toBe(68);
+    expect(config.varredurasPorCiclo).toBe(3);
+  });
+
+  it('flag LIGADA: o valor que passava DESLIGADA e recusado', () => {
+    // A assercao que liga os dois casos: 66 e valido com 2 varreduras e
+    // invalido com 3. Sem ela, os dois testes acima poderiam passar com um
+    // calculo que ignora a flag.
+    expect(() =>
+      loadConfig({
+        ...base,
+        PAYMENT_EXPIRATION_ENABLED: 'true',
+        PAYMENT_WINDOW_MINUTES: '60',
+        WEBHOOK_QUARANTINE_MINUTES: '66',
+      }),
+    ).toThrow(/deve ser MAIOR/);
   });
 
   it('RECUSA quando a folga ignora a DURACAO do ciclo', () => {
@@ -594,5 +629,26 @@ describe('loadConfig — knobs do runtime de jobs (Bloco 6c)', () => {
     expect(() => loadConfig({ ...base, JOBS_VARREDURA_TIMEOUT_MS: '600001' })).toThrow(
       /JOBS_VARREDURA_TIMEOUT_MS/,
     );
+  });
+});
+
+
+describe('PAYMENT_EXPIRATION_ENABLED (Bloco 6e)', () => {
+  it('vem DESLIGADA por padrao', () => {
+    // Fail-closed: a varredura produz EXPIRED e a saga so passa a receber esse
+    // desfecho no 6f. Default ligado criaria pagamentos terminais sem evento.
+    expect(loadConfig({ ...base }).expiracaoHabilitada).toBe(false);
+  });
+
+  it.each(['false', 'TRUE', '1', 'sim', ''])('mantem desligada para %p', (valor) => {
+    expect(
+      loadConfig({ ...base, PAYMENT_EXPIRATION_ENABLED: valor }).expiracaoHabilitada,
+    ).toBe(false);
+  });
+
+  it("liga apenas com o literal 'true'", () => {
+    expect(
+      loadConfig({ ...base, PAYMENT_EXPIRATION_ENABLED: 'true' }).expiracaoHabilitada,
+    ).toBe(true);
   });
 });
