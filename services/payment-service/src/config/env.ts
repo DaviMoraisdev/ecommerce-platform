@@ -48,6 +48,8 @@ export interface AppConfig {
    * historico que nenhum backfill automatico recupera.
    */
   expiracaoHabilitada: boolean;
+  /** Derivado da flag. Ver `varredurasPorCiclo`. */
+  varredurasPorCiclo: number;
   webhookMaxAttempts: number;
   /**
    * Idade a partir da qual um evento AINDA inaplicavel vai para QUARANTINED
@@ -94,7 +96,22 @@ export interface AppConfig {
  * O `server.ts` verifica que a lista real tem este tamanho: constante que
  * silenciosamente diverge do codigo e pior que constante nenhuma.
  */
-export const VARREDURAS_POR_CICLO = 3;
+export const VARREDURAS_SEMPRE_ATIVAS = 2;
+
+/**
+ * Quantas varreduras rodam por ciclo, dado o estado da flag de expiracao.
+ *
+ * Achado 4.1 da 2a rodada do PR #60: a constante era FIXA em 3, entao com a
+ * expiracao DESLIGADA o boot exigia margem para uma varredura que nao roda —
+ * e recusava configuracao que era valida antes do PR. Uma feature default-off
+ * derrubando implantacao e pior que a feature.
+ *
+ * Derivar da flag tambem permitiu VOLTAR a igualdade estrita no guard do
+ * server.ts, que a versao anterior tinha afrouxado para `>`.
+ */
+export function varredurasPorCiclo(expiracaoHabilitada: boolean): number {
+  return VARREDURAS_SEMPRE_ATIVAS + (expiracaoHabilitada ? 1 : 0);
+}
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -475,8 +492,11 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   // uma pode consumir o prazo inteiro. Janela 1, poll 1, quarentena 3 e prazo
   // de 10 min passavam no boot — e a reentrega sincrona quarentenava o evento
   // muito antes da proxima reconciliacao.
+  // A folga tem de refletir as varreduras EFETIVAMENTE habilitadas.
+  const expiracaoHabilitada = source.PAYMENT_EXPIRATION_ENABLED === 'true';
+  const porCiclo = varredurasPorCiclo(expiracaoHabilitada);
   const minutosDePoll = Math.ceil(jobsPollIntervalMs / 60_000);
-  const minutosDeCiclo = Math.ceil((jobsVarreduraTimeoutMs * VARREDURAS_POR_CICLO) / 60_000);
+  const minutosDeCiclo = Math.ceil((jobsVarreduraTimeoutMs * porCiclo) / 60_000);
   const folgaMinima = paymentWindowMinutes + minutosDePoll + minutosDeCiclo;
 
   if (webhookQuarantineMinutes <= folgaMinima) {
@@ -512,8 +532,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     paymentWindowMinutes,
     webhookQuarantineMinutes,
-    // Fail-closed: qualquer valor diferente de 'true' mantem desligada.
-    expiracaoHabilitada: source.PAYMENT_EXPIRATION_ENABLED === 'true',
+    expiracaoHabilitada,
+    varredurasPorCiclo: porCiclo,
     webhookMaxAttempts: parseTentativas(source.WEBHOOK_MAX_ATTEMPTS, 'WEBHOOK_MAX_ATTEMPTS', 5),
     jobsPollIntervalMs,
     jobsStopTimeoutMs,

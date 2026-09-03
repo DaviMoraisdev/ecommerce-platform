@@ -12,10 +12,15 @@ import { Prisma } from '@prisma/client';
 /**
  * Mensagem gravada em lastError. NUNCA a mensagem original: erro de Prisma
  * carrega nome de tabela e coluna, e o inbox e lido em triagem operacional.
+ * O CONTEXTO vem do chamador (achado 5.1 da 2a rodada): a mensagem citava
+ * webhook, e passou a cobrir tambem falhas de cancelCharge, getCharge e
+ * persistencia da expiracao — falha do job seria registrada como falha de
+ * webhook, atrapalhando diagnostico e alerta.
+ *
  */
-export function mensagemSegura(erro: unknown): string {
+export function mensagemSegura(erro: unknown, contexto = 'processamento'): string {
   if (erro instanceof Prisma.PrismaClientKnownRequestError) {
     return `falha de banco (${erro.code})`;
   }
-  return 'falha inesperada no processamento do webhook';
+  return `falha inesperada no ${contexto}`;
 }

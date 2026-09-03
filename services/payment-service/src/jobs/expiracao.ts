@@ -281,7 +281,7 @@ export async function tickExpiracao(
         resumo.falhas += 1;
         console.error('[payment-service] falha ao expirar tentativa', {
           transactionId: candidata.id,
-          causa: mensagemSegura(erro),
+          causa: mensagemSegura(erro, 'cancelamento da cobranca'),
         });
       }
 

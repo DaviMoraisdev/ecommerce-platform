@@ -274,7 +274,7 @@ export class WebhookService {
       // sobrescreve como FAILED o PROCESSED que a execucao concorrente acabou de
       // gravar, e a reconciliacao passa a ver como pendente um evento aplicado.
       // Nao substitui o claim exclusivo (Bloco 6); remove o pior sintoma dele.
-      const mensagem = mensagemSegura(erro);
+      const mensagem = mensagemSegura(erro, 'processamento do webhook');
       const marcadas = await this.deps.prisma.webhookEvent.updateMany({
         where: {
           id: registro.id,
