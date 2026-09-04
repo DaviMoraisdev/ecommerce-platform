@@ -31,7 +31,7 @@ import {
   type PaymentProvider,
 } from '../providers/payment-provider.port';
 import { enqueue } from '../events/outbox.repository';
-import { montarEventoDeCaptura } from '../events/payment.events';
+import { montarEventoDeCaptura, montarEventoDeExpiracao } from '../events/payment.events';
 
 export interface PaymentServiceDeps {
   prisma: PrismaClient;
@@ -690,6 +690,22 @@ export class PaymentService {
         where: { id: payment.id },
         data: { status: PaymentStatus.EXPIRED },
       });
+
+      // Efeito e evento no MESMO commit — a razao de a outbox existir. Publicar
+      // fora da transacao deixaria a janela em que o pagamento esta EXPIRED e o
+      // pedido nunca fica sabendo: estoque reservado para sempre.
+      await enqueue(
+        tx,
+        montarEventoDeExpiracao(
+          {
+            paymentId: payment.id,
+            orderId: payment.orderId,
+            amountCents: payment.amountCents,
+            currency: payment.currency,
+          },
+          new Date(),
+        ),
+      );
 
       return true;
     });

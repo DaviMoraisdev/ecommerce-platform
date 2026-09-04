@@ -1,6 +1,11 @@
 import type { Prisma } from '@prisma/client';
 import type { OutboxInput } from './outbox.repository';
-import { ROUTING_PAYMENT_CAPTURED, eventIdDeCaptura } from './topology';
+import {
+  ROUTING_PAYMENT_CAPTURED,
+  ROUTING_PAYMENT_EXPIRED,
+  eventIdDeCaptura,
+  eventIdDeExpiracao,
+} from './topology';
 
 /**
  * Entrada EXPLICITA, e nao o `Payment` inteiro.
@@ -50,6 +55,52 @@ export function montarEventoDeCaptura(captura: CapturaConfirmada, agora: Date): 
   return {
     eventId,
     routingKey: ROUTING_PAYMENT_CAPTURED,
+    payload: payload as unknown as Prisma.InputJsonValue,
+  };
+}
+
+/**
+ * Entrada do evento de EXPIRACAO (Bloco 6f).
+ *
+ * NAO tem `capturedAmountCents`: nada foi capturado, e o campo existiria so
+ * para ser zero. Campo que so pode ter um valor e ruido no contrato, e o
+ * consumidor teria de decidir o que fazer com ele.
+ */
+export interface ExpiracaoConfirmada {
+  paymentId: string;
+  orderId: string;
+  amountCents: number;
+  currency: string;
+}
+
+/** Mesmo criterio do PayloadDeCaptura: minimo, fechado, nada do provedor. */
+export interface PayloadDeExpiracao {
+  eventId: string;
+  paymentId: string;
+  orderId: string;
+  amountCents: number;
+  currency: string;
+  occurredAt: string;
+}
+
+export function montarEventoDeExpiracao(
+  expiracao: ExpiracaoConfirmada,
+  agora: Date,
+): OutboxInput {
+  const eventId = eventIdDeExpiracao(expiracao.paymentId);
+
+  const payload: PayloadDeExpiracao = {
+    eventId,
+    paymentId: expiracao.paymentId,
+    orderId: expiracao.orderId,
+    amountCents: expiracao.amountCents,
+    currency: expiracao.currency,
+    occurredAt: agora.toISOString(),
+  };
+
+  return {
+    eventId,
+    routingKey: ROUTING_PAYMENT_EXPIRED,
     payload: payload as unknown as Prisma.InputJsonValue,
   };
 }
