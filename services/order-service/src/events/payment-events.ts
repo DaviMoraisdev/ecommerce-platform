@@ -1,4 +1,4 @@
-// Contrato do evento payment.captured, do lado de quem recebe.
+// Contrato dos eventos de pagamento, do lado de quem recebe.
 // Espelha PayloadDeCaptura do payment-service (TECH_DEBT: duplicacao, Fase 10).
 // NOTA: o payload NAO tem campo "type" — o notification cruza type x routingKey,
 // aqui essa defesa nao existe e o binding estrito faz o papel dela.
@@ -44,27 +44,33 @@ export function eventIdEsperado(paymentId: string): string {
 
 // Devolve null em vez de lancar: quem chama traduz isso em DLQ, e "invalido"
 // nao e situacao excepcional aqui — e uma das saidas esperadas.
-export function parseCaptura(raw: string): CapturaEvent | null {
-  let v: unknown;
-  try {
-    v = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
-  const o = v as Record<string, unknown>;
+/**
+ * Campos comuns aos dois eventos, validados UMA vez.
+ *
+ * Extraido no Bloco 6f, no segundo uso. O criterio e o mesmo do keyset no
+ * payment-service: o COMPILADOR nao pega divergencia entre dois validadores —
+ * um passa a aceitar o que o outro recusa, e a diferenca so aparece quando uma
+ * mensagem hostil escolhe o caminho mais frouxo.
+ */
+interface CamposComuns {
+  eventId: string;
+  paymentId: string;
+  orderId: string;
+  amountCents: number;
+  currency: string;
+  occurredAt?: string;
+}
 
+function validarComuns(
+  o: Record<string, unknown>,
+  esperado: (paymentId: string) => string,
+): CamposComuns | null {
   if (!idValido(o.eventId)) return null;
   if (!idValido(o.paymentId)) return null;
   if (!idValido(o.orderId)) return null;
   if (!centavosValidos(o.amountCents)) return null;
-  if (!centavosValidos(o.capturedAmountCents)) return null;
-  // Codigo ISO-4217: exatamente tres letras maiusculas. Aceitar "qualquer
-  // string nao vazia" deixava passar CR/LF (forja linha de log) e dezenas de
-  // KB (amplifica log). Regex ancorada de tamanho fixo nao tem backtracking —
-  // o risco de ReDoS vem de quantificador aninhado, nao de regex em si.
   if (typeof o.currency !== 'string' || !/^[A-Z]{3}$/.test(o.currency)) return null;
-  if (o.eventId !== eventIdEsperado(o.paymentId)) return null;
+  if (o.eventId !== esperado(o.paymentId)) return null;
   if (o.occurredAt !== undefined && typeof o.occurredAt !== 'string') return null;
 
   return {
@@ -72,8 +78,53 @@ export function parseCaptura(raw: string): CapturaEvent | null {
     paymentId: o.paymentId,
     orderId: o.orderId,
     amountCents: o.amountCents,
-    capturedAmountCents: o.capturedAmountCents,
     currency: o.currency,
     occurredAt: o.occurredAt as string | undefined,
   };
+}
+
+/** Objeto JSON, ou null. Recusa array e primitivo antes de qualquer campo. */
+function comoObjeto(raw: string): Record<string, unknown> | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
+  return v as Record<string, unknown>;
+}
+
+
+export function parseCaptura(raw: string): CapturaEvent | null {
+  const o = comoObjeto(raw);
+  if (o === null) return null;
+
+  const comuns = validarComuns(o, eventIdEsperado);
+  if (comuns === null) return null;
+
+  if (!centavosValidos(o.capturedAmountCents)) return null;
+
+  return { ...comuns, capturedAmountCents: o.capturedAmountCents };
+}
+
+/**
+ * Contrato do evento payment.expired (Bloco 6f).
+ *
+ * NAO tem `capturedAmountCents`, porque nada foi capturado. O `amountCents`
+ * continua vindo para que o consumidor possa conferir contra o total do pedido
+ * antes de cancelar — cancelar pedido a partir de um evento cujo valor nao bate
+ * seria agir sobre o pedido errado.
+ */
+export interface ExpiracaoEvent extends CamposComuns {}
+
+export function eventIdEsperadoDeExpiracao(paymentId: string): string {
+  return 'payment.expired:' + paymentId;
+}
+
+export function parseExpiracao(raw: string): ExpiracaoEvent | null {
+  const o = comoObjeto(raw);
+  if (o === null) return null;
+
+  return validarComuns(o, eventIdEsperadoDeExpiracao);
 }

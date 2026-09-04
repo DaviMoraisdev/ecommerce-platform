@@ -17,6 +17,9 @@ export type ResultadoAplicacao =
   // Logo, tudo que alcanca a checagem de status e OUTRO pagamento — segunda
   // cobranca, nunca "o efeito ja existe".
   | { tipo: 'compensacao-registrada'; motivo: string }
+  // Bloco 6f: o efeito desejado pela expiracao JA existe. Nao e duplicata (o
+  // inbox nao tinha a marca) nem anomalia — outro caminho cancelou o pedido.
+  | { tipo: 'ja-cancelado' }
   | { tipo: 'pedido-inexistente' }
   | { tipo: 'valor-divergente'; esperadoCents: number; recebidoCents: number }
   | { tipo: 'captura-parcial'; autorizadoCents: number; capturadoCents: number }
@@ -208,6 +211,10 @@ export async function decidirEntrega(
       // C5 — o evento FOI processado; o que ele produziu foi uma pendencia de
       // estorno em vez de uma transicao.
       return { type: 'ack', reason: 'compensacao registrada: ' + resultado.motivo };
+    case 'ja-cancelado':
+      // ack: reentregar nao produziria nada diferente, e o estado final e o
+      // que a expiracao queria.
+      return { type: 'ack', reason: 'pedido ja cancelado' };
     case 'pedido-inexistente':
       // C3 — o payment so emite captura para pedido que consultou antes.
       return { type: 'nack-dlq', reason: 'pedido inexistente' };

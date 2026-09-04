@@ -19,6 +19,18 @@ export const EXCHANGE_PAGAMENTOS_TYPE = 'topic';
 // silencio em quem consome.
 export const BINDING_PAYMENT_CAPTURED = 'payment.captured';
 
+// Bloco 6f. SEGUNDO binding na MESMA fila, e nao fila nova: o consumidor ja
+// tem DLQ, classificacao de erro, teto de tentativas e sanitizacao de log —
+// duplicar tudo isso para um segundo tipo de evento seria duplicar codigo cuja
+// unica prova sao os casos C.
+//
+// O binding continua ESTRITO. O custo aceito e head-of-line blocking ENTRE os
+// tipos: um payment.expired malformado ocupa o slot do prefetch(1) e segura as
+// capturas atras dele. Mitigado pelo teto de tentativas (vai para DLQ) e pelo
+// volume baixo de expiracao. Fila separada por tipo fica registrada como
+// gatilho, se aparecer poison message real.
+export const BINDING_PAYMENT_EXPIRED = 'payment.expired';
+
 export const QUEUE_PAGAMENTOS = 'orders.payments';
 export const DLX_PAGAMENTOS = 'orders.payments.dlx';
 export const DLQ_PAGAMENTOS = 'orders.payments.dlq';

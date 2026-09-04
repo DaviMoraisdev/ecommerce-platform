@@ -4,6 +4,7 @@ import { CapturaEvent } from '../events/payment-events';
 import { ResultadoAplicacao } from '../events/payments.consumer';
 import { BINDING_PAYMENT_CAPTURED } from '../events/payments.topology';
 import { aplicarTransicao } from './order.service';
+import { SemEfeito, alvoDoP2002 } from './inbox-efeito';
 
 // Autoria FIXA. O comentario do normalizeChangedBy exige identidade vinda do
 // contexto do chamador, nunca do payload — aceitar changedBy da mensagem
@@ -15,30 +16,6 @@ const AUTOR = 'payment-service';
 // valor que nao corresponde.
 const MOEDA = 'BRL';
 
-/**
- * Erro de controle: desfecho legitimo que NAO deve deixar rastro.
- *
- * O invariante do inbox e "linha existe se e somente se o efeito aconteceu".
- * Como o insert do inbox e a primeira coisa da transacao, os desfechos sem
- * efeito precisam DESFAZER a transacao — e a unica forma de abortar uma
- * $transaction interativa e lancar. Commitar a marca de um evento que nao
- * produziu efeito faria a redentrega ser lida como duplicata: o mesmo buraco do
- * claim em armazenamento separado, dentro de um banco so.
- */
-class SemEfeito extends Error {
-  constructor(readonly resultado: ResultadoAplicacao) {
-    super('desfecho sem efeito');
-  }
-}
-
-// P2002 nao e uma coisa so: pode vir do @unique do inbox (duplicata de verdade)
-// ou do unique parcial de pending_compensations (corrida). O formato do
-// meta.target varia entre array de campos e nome de indice, entao normalizamos.
-function alvoDoP2002(err: Prisma.PrismaClientKnownRequestError): string {
-  const alvo = (err.meta as { target?: unknown } | undefined)?.target;
-  if (Array.isArray(alvo)) return alvo.join(',');
-  return typeof alvo === 'string' ? alvo : '';
-}
 
 export async function aplicarCaptura(ev: CapturaEvent): Promise<ResultadoAplicacao> {
   try {
