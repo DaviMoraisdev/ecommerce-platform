@@ -6,7 +6,10 @@ import {
   resetarTentativas,
   ResultadoAplicacao,
 } from '../src/events/payments.consumer';
-import { BINDING_PAYMENT_CAPTURED } from '../src/events/payments.topology';
+import {
+  BINDING_PAYMENT_CAPTURED,
+  BINDING_PAYMENT_EXPIRED,
+} from '../src/events/payments.topology';
 
 function corpo(over: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -22,12 +25,13 @@ function corpo(over: Record<string, unknown> = {}): string {
 }
 
 function deps(resultado: ResultadoAplicacao | Error) {
-  return {
-    aplicar: jest.fn(async () => {
-      if (resultado instanceof Error) throw resultado;
-      return resultado;
-    }),
-  };
+  const responder = jest.fn(async () => {
+    if (resultado instanceof Error) throw resultado;
+    return resultado;
+  });
+  // Os DOIS handlers respondem igual: os casos C existentes provam a traducao
+  // de resultado em acao, que nao depende de qual evento chegou.
+  return { aplicar: responder, aplicarExpiracao: responder };
 }
 
 // O contador de tentativas e estado de modulo compartilhado entre os casos.
@@ -292,3 +296,75 @@ describe('decidirEntrega — traducao de resultado em acao no broker', () => {
     expect(acao.reason).not.toContain('senha_supersecreta');
   });
 });
+
+describe('decidirEntrega — despacho por routing key (Bloco 6f)', () => {
+  function corpoExpiracao(over: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      eventId: 'payment.expired:pay_1',
+      paymentId: 'pay_1',
+      orderId: 'ord_1',
+      amountCents: 10000,
+      currency: 'BRL',
+      occurredAt: '2026-09-04T12:00:00.000Z',
+      ...over,
+    });
+  }
+
+  function depsSeparadas() {
+    return {
+      aplicar: jest.fn(async (): Promise<ResultadoAplicacao> => ({ tipo: 'aplicado' })),
+      aplicarExpiracao: jest.fn(async (): Promise<ResultadoAplicacao> => ({ tipo: 'aplicado' })),
+    };
+  }
+
+  it('CASO C30: payment.expired vai para o handler de EXPIRACAO, nao o de captura', async () => {
+    // Sem esta assercao, um despacho que ignorasse a routing key e chamasse
+    // sempre a captura passaria verde: os dois devolvem 'aplicado'.
+    const d = depsSeparadas();
+
+    await expect(
+      decidirEntrega(corpoExpiracao(), BINDING_PAYMENT_EXPIRED, d),
+    ).resolves.toEqual({ type: 'ack', reason: 'processado' });
+
+    expect(d.aplicarExpiracao).toHaveBeenCalledTimes(1);
+    expect(d.aplicar).not.toHaveBeenCalled();
+  });
+
+  it('CASO C31: payment.captured continua indo para o handler de CAPTURA', async () => {
+    // A contraparte do C30. Sem ela, uma inversao dos dois ramos deixaria o C30
+    // verde provando o oposto — mesma razao do CASO 27 do Bloco 6d.
+    const d = depsSeparadas();
+
+    await decidirEntrega(corpo(), BINDING_PAYMENT_CAPTURED, d);
+
+    expect(d.aplicar).toHaveBeenCalledTimes(1);
+    expect(d.aplicarExpiracao).not.toHaveBeenCalled();
+  });
+
+  it('CASO C32: payload de expiracao invalido vai para DLQ sem tocar no handler', async () => {
+    // O eventId TEM de bater com 'payment.expired:' + paymentId. Um evento com
+    // id descolado do identificador financeiro atravessaria a trava de
+    // idempotencia do inbox.
+    const d = depsSeparadas();
+
+    await expect(
+      decidirEntrega(corpoExpiracao({ eventId: 'payment.expired:outro' }), BINDING_PAYMENT_EXPIRED, d),
+    ).resolves.toEqual({ type: 'nack-dlq', reason: 'payload invalido ou incompleto' });
+
+    expect(d.aplicarExpiracao).not.toHaveBeenCalled();
+  });
+
+  it('CASO C33: routing key desconhecida continua em DLQ sem tocar no banco', async () => {
+    // O binding e estrito nos DOIS tipos. Uma key fora da lista significa
+    // topologia adulterada, e o C8 original passa a valer para o registro
+    // inteiro, nao so para a captura.
+    const d = depsSeparadas();
+
+    const acao = await decidirEntrega(corpoExpiracao(), 'payment.refunded', d);
+
+    expect(acao.type).toBe('nack-dlq');
+    expect(d.aplicar).not.toHaveBeenCalled();
+    expect(d.aplicarExpiracao).not.toHaveBeenCalled();
+  });
+});
+

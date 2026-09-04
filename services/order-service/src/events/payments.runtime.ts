@@ -1,6 +1,7 @@
 import amqp from 'amqplib';
 import { DeliveryAction, decidirEntrega, decidirPorTamanho, sanitizarParaLog } from './payments.consumer';
 import { aplicarCaptura } from '../services/payment-capture.service';
+import { aplicarExpiracao } from '../services/payment-expiration.service';
 import {
   EXCHANGE_PAGAMENTOS,
   EXCHANGE_PAGAMENTOS_TYPE,
@@ -8,6 +9,7 @@ import {
   DLX_PAGAMENTOS,
   DLQ_PAGAMENTOS,
   BINDING_PAYMENT_CAPTURED,
+  BINDING_PAYMENT_EXPIRED,
 } from './payments.topology';
 
 // Interface minima do canal: o que este modulo realmente usa. Depender do tipo
@@ -350,7 +352,10 @@ export async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: 
 
   let acao: DeliveryAction;
   try {
-    acao = await decidirEntrega(msg.content.toString(), routingKey, { aplicar: aplicarCaptura });
+    acao = await decidirEntrega(msg.content.toString(), routingKey, {
+      aplicar: aplicarCaptura,
+      aplicarExpiracao,
+    });
   } catch (err) {
     // decidirEntrega ja classifica falha de aplicacao; cair aqui e falha do
     // proprio decisor, e requeue continua sendo o conservador.
