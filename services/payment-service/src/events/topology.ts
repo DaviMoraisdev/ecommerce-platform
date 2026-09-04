@@ -34,3 +34,25 @@ export const ROUTING_PAYMENT_CAPTURED = 'payment.captured';
 export function eventIdDeCaptura(paymentId: string): string {
   return ROUTING_PAYMENT_CAPTURED + ':' + paymentId;
 }
+
+/**
+ * Bloco 6f. Publicado pelo job de EXPIRACAO da janela (Bloco 6e), no mesmo
+ * commit da transicao para `Payment.EXPIRED`.
+ *
+ * O 6e entregou a expiracao DESLIGADA justamente porque este evento nao
+ * existia: cada pagamento expirado viraria registro sem evento de outbox, e um
+ * produtor acrescentado depois so cobre transicoes NOVAS. Publicar sem o
+ * binding do lado consumidor tambem nao servia — o publisher usa `mandatory` +
+ * `basic.return`, entao a mensagem voltaria como nao roteavel. Por isso os dois
+ * lados entram juntos.
+ */
+export const ROUTING_PAYMENT_EXPIRED = 'payment.expired';
+
+/**
+ * Mesma construcao do `eventIdDeCaptura`, e pela mesma razao: `OutboxEvent`
+ * tem `eventId` @unique, entao id DERIVADO faz a segunda gravacao COLIDIR em
+ * vez de duplicar. EXPIRED e terminal, logo ha no maximo um por pagamento.
+ */
+export function eventIdDeExpiracao(paymentId: string): string {
+  return ROUTING_PAYMENT_EXPIRED + ':' + paymentId;
+}

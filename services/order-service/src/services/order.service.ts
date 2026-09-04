@@ -306,6 +306,31 @@ async function compensar(orderId: string, erroOriginal: unknown): Promise<void> 
   }
 }
 
+/**
+ * Libera as reservas do inventory depois de um cancelamento JA aplicado.
+ *
+ * Fora de qualquer transacao de propósito: e chamada HTTP ao inventory. Dentro
+ * de um $transaction seguraria locks e, pior, um rollback posterior deixaria o
+ * estoque liberado sem o cancelamento correspondente.
+ *
+ * O status e a fonte da verdade; o release e idempotente. Se ele falhar, a
+ * pendencia DURAVEL cobre a reconciliacao — por isso quem chama pode seguir
+ * como sucesso em vez de repetir o cancelamento.
+ *
+ * Extraida no Bloco 6f, no segundo uso: o consumidor de payment.expired precisa
+ * exatamente deste comportamento depois de cancelar por expiracao.
+ */
+export async function liberarReservaAposCancelamento(orderId: string): Promise<void> {
+  try {
+    await inventoryClient.release(orderId);
+  } catch (e) {
+    const motivo = e instanceof Error ? e.message : String(e);
+    console.error('[order] cancelamento de ' + orderId + ' nao liberou o estoque: ' + motivo);
+    await registrarCompensacaoPendente(orderId, 'cancel_release_falhou:' + motivo);
+  }
+}
+
+
 // Orquestra a mudanca de status: aplica a transicao (Bloco 6) e, se CANCELADO,
 // libera as reservas no inventory. O status e a fonte da verdade; se o release
 // falhar, loga para reconciliacao (o release e idempotente).
@@ -316,13 +341,7 @@ export async function changeOrderStatus(
 ) {
   const order = await updateOrderStatus(orderId, newStatus, changedBy);
   if (newStatus === OrderStatus.CANCELADO) {
-    try {
-      await inventoryClient.release(orderId);
-    } catch (e) {
-      const motivo = e instanceof Error ? e.message : String(e);
-      console.error('[order] cancelamento de ' + orderId + ' nao liberou o estoque: ' + motivo);
-      await registrarCompensacaoPendente(orderId, 'cancel_release_falhou:' + motivo);
-    }
+    await liberarReservaAposCancelamento(orderId);
   }
 
 

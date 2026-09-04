@@ -5,6 +5,7 @@ import {
   DLX_PAGAMENTOS,
   DLQ_PAGAMENTOS,
   BINDING_PAYMENT_CAPTURED,
+  BINDING_PAYMENT_EXPIRED,
 } from '../src/events/payments.topology';
 
 function canalFalso() {
@@ -65,6 +66,25 @@ describe('montarTopologia', () => {
       'payment.*',
     );
   });
+
+  it('CASO C34: a fila tem EXATAMENTE os bindings esperados, nem mais nem menos', async () => {
+    // O CASO C11 usa toHaveBeenCalledWith, que prova que UMA chamada aconteceu e
+    // nada sobre as outras: trocar o binding estrito por 'payment.*' o deixaria
+    // verde, e apagar um binding tambem. Aqui o conjunto INTEIRO e fixado.
+    //
+    // Binding ausente e falha silenciosa da pior especie: o servico sobe, a fila
+    // existe, e simplesmente nunca recebe aquele tipo de evento.
+    const ch = canalFalso();
+    await montarTopologia(ch);
+
+    const chaves = ch.bindQueue.mock.calls
+      .filter((c) => c[0] === QUEUE_PAGAMENTOS)
+      .map((c) => c[2])
+      .sort();
+
+    expect(chaves).toEqual([BINDING_PAYMENT_CAPTURED, BINDING_PAYMENT_EXPIRED].sort());
+  });
+
 
   it('CASO C12: prefetch limita o dano de um crash', async () => {
     // Sem prefetch o broker despeja a fila inteira no processo; um crash

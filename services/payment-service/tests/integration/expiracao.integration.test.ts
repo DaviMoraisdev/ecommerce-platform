@@ -467,4 +467,33 @@ describe('buscarTentativasExpirando', () => {
     expect(await prisma.outboxEvent.count()).toBe(0);
   });
 
+
+  it('CASO E13: expirar enfileira UM evento payment.expired, no mesmo commit', async () => {
+    // Sem o evento, o pagamento fica EXPIRED e o pedido nunca sabe: estoque
+    // reservado para sempre. Por isso o 6e ficou desligado ate o 6f existir.
+    const { service, payment, tentativa } = await tentativaAceita();
+
+    expect(await prisma.outboxEvent.count()).toBe(0);
+    expect(await service.expirarTentativa(tentativa.id, tentativa.providerRef as string)).toBe(true);
+
+    const eventos = await prisma.outboxEvent.findMany();
+    expect(eventos).toHaveLength(1);
+    expect(eventos[0].routingKey).toBe('payment.expired');
+    expect(eventos[0].eventId).toBe(`payment.expired:${payment.id}`);
+  });
+
+  it('CASO E14: segunda expiracao NAO enfileira evento novo', async () => {
+    // O CAS ja impede a segunda transicao; este caso prova que o evento vive
+    // DENTRO dela. Se o enqueue estivesse fora, a reentrega do job publicaria
+    // de novo — e o eventId derivado colidiria, mas so depois de a transacao
+    // ter sido aberta a toa.
+    const { service, tentativa } = await tentativaAceita();
+    await service.expirarTentativa(tentativa.id, tentativa.providerRef as string);
+
+    expect(await service.expirarTentativa(tentativa.id, tentativa.providerRef as string)).toBe(
+      false,
+    );
+    expect(await prisma.outboxEvent.count()).toBe(1);
+  });
+
 });

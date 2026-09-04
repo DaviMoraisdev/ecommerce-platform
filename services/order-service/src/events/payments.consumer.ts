@@ -1,6 +1,6 @@
 import { Prisma } from '@prisma/client';
-import { CapturaEvent, parseCaptura } from './payment-events';
-import { BINDING_PAYMENT_CAPTURED } from './payments.topology';
+import { CapturaEvent, ExpiracaoEvent, parseCaptura, parseExpiracao } from './payment-events';
+import { BINDING_PAYMENT_CAPTURED, BINDING_PAYMENT_EXPIRED } from './payments.topology';
 
 export type DeliveryAction =
   | { type: 'ack'; reason: string }
@@ -17,6 +17,9 @@ export type ResultadoAplicacao =
   // Logo, tudo que alcanca a checagem de status e OUTRO pagamento — segunda
   // cobranca, nunca "o efeito ja existe".
   | { tipo: 'compensacao-registrada'; motivo: string }
+  // Bloco 6f: o efeito desejado pela expiracao JA existe. Nao e duplicata (o
+  // inbox nao tinha a marca) nem anomalia — outro caminho cancelou o pedido.
+  | { tipo: 'ja-cancelado' }
   | { tipo: 'pedido-inexistente' }
   | { tipo: 'valor-divergente'; esperadoCents: number; recebidoCents: number }
   | { tipo: 'captura-parcial'; autorizadoCents: number; capturadoCents: number }
@@ -91,6 +94,41 @@ function contarRequeue(chave: string): number {
 
 export interface ConsumerDeps {
   aplicar: (ev: CapturaEvent) => Promise<ResultadoAplicacao>;
+  /** Bloco 6f. Separado de `aplicar` porque o EVENTO e outro, nao so o efeito. */
+  aplicarExpiracao: (ev: ExpiracaoEvent) => Promise<ResultadoAplicacao>;
+}
+
+/**
+ * Reconhecimento do que chegou: routing key conhecida + payload valido.
+ *
+ * Uniao discriminada em vez de `null` com dois significados: "key desconhecida"
+ * e "payload invalido" produzem a MESMA acao hoje (DLQ) por razoes diferentes, e
+ * colapsar as duas no mesmo retorno faria a proxima pessoa achar que sao a
+ * mesma coisa.
+ *
+ * O que isto preserva: a routing key precisa estar AQUI para o fluxo alcancar o
+ * banco. Com o binding estrito, key fora da lista significa topologia
+ * adulterada — e continua sendo DLQ sem tocar em nada.
+ */
+type Reconhecimento =
+  | { tipo: 'ok'; eventId: string; aplicar: () => Promise<ResultadoAplicacao> }
+  | { tipo: 'key-desconhecida' }
+  | { tipo: 'payload-invalido' };
+
+function reconhecer(raw: string, routingKey: string, deps: ConsumerDeps): Reconhecimento {
+  if (routingKey === BINDING_PAYMENT_CAPTURED) {
+    const ev = parseCaptura(raw);
+    if (ev === null) return { tipo: 'payload-invalido' };
+    return { tipo: 'ok', eventId: ev.eventId, aplicar: () => deps.aplicar(ev) };
+  }
+
+  if (routingKey === BINDING_PAYMENT_EXPIRED) {
+    const ev = parseExpiracao(raw);
+    if (ev === null) return { tipo: 'payload-invalido' };
+    return { tipo: 'ok', eventId: ev.eventId, aplicar: () => deps.aplicarExpiracao(ev) };
+  }
+
+  return { tipo: 'key-desconhecida' };
 }
 
 // Teto de bytes da mensagem. prefetch(1) limita QUANTAS mensagens chegam por
@@ -149,7 +187,11 @@ export async function decidirEntrega(
 ): Promise<DeliveryAction> {
   // C8 — antes de tudo: o binding e estrito, entao outra key aqui significa
   // topologia adulterada. Nao chega a tocar no banco.
-  if (routingKey !== BINDING_PAYMENT_CAPTURED) {
+  const reconhecido = reconhecer(raw, routingKey, deps);
+
+  // C8 — o binding e estrito, entao outra key aqui significa topologia
+  // adulterada. Nao chega a tocar no banco.
+  if (reconhecido.tipo === 'key-desconhecida') {
     return {
       type: 'nack-dlq',
       reason: 'routing key fora do binding: ' + sanitizarParaLog(routingKey),
@@ -157,25 +199,24 @@ export async function decidirEntrega(
   }
 
   // C2 — payload quebrado nao melhora com o tempo.
-  const evento = parseCaptura(raw);
-  if (evento === null) {
+  if (reconhecido.tipo === 'payload-invalido') {
     return { type: 'nack-dlq', reason: 'payload invalido ou incompleto' };
   }
 
   let resultado: ResultadoAplicacao;
   try {
-    resultado = await deps.aplicar(evento);
+    resultado = await reconhecido.aplicar();
   } catch (err) {
     const motivo = sanitizarParaLog(err instanceof Error ? err.message : String(err));
     if (ehDeterministico(err)) {
       // Erro que nao muda com o tempo. Requeue aqui seria loop eterno ocupando
       // o unico slot do prefetch(1) e travando mensagens validas atras.
-      tentativas.delete(evento.eventId);
+      tentativas.delete(reconhecido.eventId);
       return { type: 'nack-dlq', reason: 'falha deterministica ao aplicar: ' + motivo };
     }
     // C6 — falha de infra. Requeue, porque perder evento por indisponibilidade
     // momentanea e o pior desfecho possivel aqui...
-    const n = contarRequeue(evento.eventId);
+    const n = contarRequeue(reconhecido.eventId);
     if (n > MAX_TENTATIVAS) {
       // ...mas nao para sempre: um erro permanente que a classificacao nao
       // reconhece travaria a fila inteira. DLQ preserva a mensagem.
@@ -195,7 +236,7 @@ export async function decidirEntrega(
     };
   }
   // Desfecho terminal: a contagem desta chave deixa de interessar.
-  tentativas.delete(evento.eventId);
+  tentativas.delete(reconhecido.eventId);
 
   switch (resultado.tipo) {
     case 'aplicado':
@@ -208,6 +249,10 @@ export async function decidirEntrega(
       // C5 — o evento FOI processado; o que ele produziu foi uma pendencia de
       // estorno em vez de uma transicao.
       return { type: 'ack', reason: 'compensacao registrada: ' + resultado.motivo };
+    case 'ja-cancelado':
+      // ack: reentregar nao produziria nada diferente, e o estado final e o
+      // que a expiracao queria.
+      return { type: 'ack', reason: 'pedido ja cancelado' };
     case 'pedido-inexistente':
       // C3 — o payment so emite captura para pedido que consultou antes.
       return { type: 'nack-dlq', reason: 'pedido inexistente' };
