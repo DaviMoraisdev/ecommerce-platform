@@ -55,6 +55,12 @@ export async function montarTopologia(ch: ChannelLike): Promise<void> {
   });
   await ch.bindQueue(QUEUE_PAGAMENTOS, EXCHANGE_PAGAMENTOS, BINDING_PAYMENT_CAPTURED);
 
+  // Bloco 6f. SEGUNDO binding na MESMA fila. Acrescentar binding e idempotente
+  // e nao toca nos argumentos da fila — que sao IMUTAVEIS no RabbitMQ e, se
+  // fossem declarados diferentes, derrubariam o consumidor com
+  // PRECONDITION_FAILED. O assertQueue acima segue inalterado de proposito.
+  await ch.bindQueue(QUEUE_PAGAMENTOS, EXCHANGE_PAGAMENTOS, BINDING_PAYMENT_EXPIRED);
+
   // Limite de dano, nao otimizacao: sem prefetch o broker despeja a fila
   // inteira no processo e um crash devolve tudo de uma vez.
   await ch.prefetch(1);
