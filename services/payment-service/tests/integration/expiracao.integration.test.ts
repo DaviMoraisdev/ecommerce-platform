@@ -497,35 +497,27 @@ describe('buscarTentativasExpirando', () => {
   });
 
 
-  it('CASO E15: falha ao enfileirar o evento faz ROLLBACK da expiracao inteira', async () => {
-    // Achado 6.2 do review: o CASO E13 so afirma que pagamento e evento existem
-    // depois do sucesso — passaria igual com o enqueue movido para FORA da
-    // transacao. Este caso prova o que importa: se o evento nao pode ser
-    // gravado, a transicao NAO acontece. Sem isso o pagamento ficaria EXPIRED
-    // sem evento, e o pedido nunca saberia.
+  it('CASO E15: a escrita do evento participa da MESMA transacao da expiracao', async () => {
+    // Primeira versao deste caso quebrava o enqueue e exigia rollback — e a
+    // sondagem W1 mostrou que ela NAO provava nada: trocar o `tx` pelo cliente
+    // global deixava o caso verde, porque no cenario do teste aquele cliente
+    // tambem estourava. Nos caminhos felizes, gravar dentro ou fora da transacao
+    // produz o MESMO estado final; so um aborto POSTERIOR separa os dois.
+    //
+    // Aqui a transacao inteira e abortada depois que o servico termina. A linha
+    // gravada com `tx` desaparece; uma gravada fora sobreviveria.
     const { payment, tentativa } = await tentativaAceita();
 
-    // So o $transaction precisa ser embrulhado: tudo dentro do expirarTentativa
-    // passa pelo `tx`, nao pelo cliente de fora.
-    const prismaQuebrado = {
-      $transaction: (fn: (tx: unknown) => Promise<unknown>) =>
-        prisma.$transaction((tx) =>
-          fn(
-            new Proxy(tx, {
-              get(alvo, prop) {
-                const valor = Reflect.get(alvo, prop) as unknown;
-                if (prop !== 'outboxEvent') {
-                  return typeof valor === 'function' ? valor.bind(alvo) : valor;
-                }
-                return { create: () => Promise.reject(new Error('outbox indisponivel')) };
-              },
-            }),
-          ),
-        ),
+    const prismaQueAborta = {
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
+        prisma.$transaction(async (tx) => {
+          await fn(tx);
+          throw new Error('rollback forcado');
+        }),
     } as unknown as PrismaClient;
 
-    const serviceQuebrado = new PaymentService({
-      prisma: prismaQuebrado,
+    const serviceQueAborta = new PaymentService({
+      prisma: prismaQueAborta,
       orderClient: orderClientFalso(jest.fn(async () => pedidoDeTeste({ id: payment.orderId }))),
       provider: new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK }),
       currency: 'BRL',
@@ -533,10 +525,10 @@ describe('buscarTentativasExpirando', () => {
     });
 
     await expect(
-      serviceQuebrado.expirarTentativa(tentativa.id, tentativa.providerRef as string),
-    ).rejects.toThrow();
+      serviceQueAborta.expirarTentativa(tentativa.id, tentativa.providerRef as string),
+    ).rejects.toThrow('rollback forcado');
 
-    // Nada aconteceu: nem o pagamento, nem a tentativa, nem a outbox.
+    // Nada sobreviveu: nem o pagamento, nem a tentativa, nem o evento.
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.status).toBe(PaymentStatus.PROCESSING);
     const linha = await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: tentativa.id } });
