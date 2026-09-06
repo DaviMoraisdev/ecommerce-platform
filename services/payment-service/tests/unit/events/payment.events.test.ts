@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { montarEventoDeCaptura,
   montarEventoDeExpiracao, type CapturaConfirmada } from '../../../src/events/payment.events';
 
@@ -81,5 +83,31 @@ describe('montarEventoDeExpiracao (Bloco 6f)', () => {
       'paymentId',
     ]);
     expect(payload.occurredAt).toBe('2026-09-04T10:00:00.000Z');
+  });
+});
+
+
+describe('contrato payment.expired (lado produtor)', () => {
+  it('CASO K3: o produtor GERA exatamente o payload publicado', () => {
+    // A fixture e a MESMA que a suite do order-service usa para provar o que ela
+    // aceita. Ate aqui os dois lados testavam com literais escritos
+    // separadamente: um campo renomeado passava nos DOIS e so falhava em
+    // producao (achados 5.1 e 6.3 do review do PR #61).
+    const esperado = JSON.parse(
+      readFileSync(join(__dirname, '../../../../../contracts/payment.expired.v1.json'), 'utf-8'),
+    ) as Record<string, unknown>;
+
+    const evento = montarEventoDeExpiracao(
+      {
+        paymentId: 'pay_contrato',
+        orderId: 'ord_contrato',
+        amountCents: 12990,
+        currency: 'BRL',
+      },
+      new Date('2026-09-06T12:00:00.000Z'),
+    );
+
+    expect(evento.payload).toEqual(esperado);
+    expect(evento.eventId).toBe(esperado.eventId);
   });
 });

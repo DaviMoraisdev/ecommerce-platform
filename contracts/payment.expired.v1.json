@@ -1,0 +1,8 @@
+{
+  "eventId": "payment.expired:pay_contrato",
+  "paymentId": "pay_contrato",
+  "orderId": "ord_contrato",
+  "amountCents": 12990,
+  "currency": "BRL",
+  "occurredAt": "2026-09-06T12:00:00.000Z"
+}

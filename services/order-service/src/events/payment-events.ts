@@ -71,7 +71,16 @@ function validarComuns(
   if (!centavosValidos(o.amountCents)) return null;
   if (typeof o.currency !== 'string' || !/^[A-Z]{3}$/.test(o.currency)) return null;
   if (o.eventId !== esperado(o.paymentId)) return null;
-  if (o.occurredAt !== undefined && typeof o.occurredAt !== 'string') return null;
+  // Achado 4.5: antes bastava ser string — vazia, com CR/LF ou com dezenas de
+  // KB passava. O produtor SEMPRE envia, entao aceitar lixo aqui e aceitar
+  // mensagem fora do contrato publicado. Continua opcional para nao apertar o
+  // contrato da captura neste PR; a divergencia obrigatorio/opcional fica
+  // registrada no TECH_DEBT.
+  if (o.occurredAt !== undefined) {
+    if (typeof o.occurredAt !== 'string') return null;
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(o.occurredAt)) return null;
+    if (!Number.isFinite(Date.parse(o.occurredAt))) return null;
+  }
 
   return {
     eventId: o.eventId,
