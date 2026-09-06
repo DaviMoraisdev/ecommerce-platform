@@ -6,6 +6,7 @@ import { DomainError } from '../domain/errors';
 import * as cartClient from '../clients/cart.client';
 import * as inventoryClient from '../clients/inventory.client';
 import { enqueue } from '../events/outbox.repository';
+import { sanitizarParaLog } from '../domain/texto-seguro';
 import {
   ROUTING_ORDER_CREATED,
   ROUTING_ORDER_STATUS_CHANGED,
@@ -306,25 +307,94 @@ async function compensar(orderId: string, erroOriginal: unknown): Promise<void> 
   }
 }
 
+const MAX_REASON = 500;
+export const MOTIVO_LIBERACAO_PENDENTE = 'expiracao_release_pendente:';
+
 /**
- * Libera as reservas do inventory depois de um cancelamento JA aplicado.
+ * Registra um incidente na pendencia do pedido, DENTRO da transacao de quem chama.
  *
- * Fora de qualquer transacao de propósito: e chamada HTTP ao inventory. Dentro
- * de um $transaction seguraria locks e, pior, um rollback posterior deixaria o
- * estoque liberado sem o cancelamento correspondente.
+ * O indice `pending_compensations_open_key` e UNIQUE PARCIAL (orderId WHERE
+ * resolvedAt IS NULL): existe no maximo UMA pendencia aberta por pedido, por
+ * decisao do Bloco 5b. Duas consequencias que este helper trata:
  *
- * O status e a fonte da verdade; o release e idempotente. Se ele falhar, a
- * pendencia DURAVEL cobre a reconciliacao — por isso quem chama pode seguir
- * como sucesso em vez de repetir o cancelamento.
+ * 1. `create` cego dentro de uma transacao COLIDIRIA quando ja ha pendencia
+ *    aberta, e em Postgres um erro dentro da transacao a envenena — o catch
+ *    daria ilusao de tratamento e o proximo statement falharia. Por isso o
+ *    findFirst antes, como o aplicarCaptura ja faz.
+ * 2. Um incidente novo sobre pedido que ja tem pendencia aberta NAO pode virar
+ *    linha nova. Antes ele era simplesmente DESCARTADO (achado 4.2 da 1a rodada
+ *    do PR #61): a triagem nunca via a contradicao. Agora ele e AGREGADO ao
+ *    motivo existente.
+ */
+export async function registrarPendencia(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  motivo: string,
+): Promise<void> {
+  const seguro = sanitizarParaLog(motivo);
+  const aberta = await tx.pendingCompensation.findFirst({
+    where: { orderId, resolvedAt: null },
+  });
+
+  if (aberta === null) {
+    await tx.pendingCompensation.create({ data: { orderId, reason: seguro } });
+    return;
+  }
+
+  if (aberta.reason.includes(seguro)) return;
+
+  await tx.pendingCompensation.update({
+    where: { id: aberta.id },
+    data: { reason: (aberta.reason + ' | ' + seguro).slice(0, MAX_REASON) },
+  });
+}
+
+/**
+ * Conclui a liberacao de estoque cuja INTENCAO ja esta gravada.
  *
- * Extraida no Bloco 6f, no segundo uso: o consumidor de payment.expired precisa
- * exatamente deste comportamento depois de cancelar por expiracao.
+ * Achado 4.1 da 1a rodada do PR #61, e era falha real: antes o release era
+ * tentado depois do commit SEM nenhum registro previo. Uma queda do processo
+ * entre o commit e a chamada deixava o pedido CANCELADO, o estoque RESERVADO e
+ * NENHUM rastro — e a reentrega batia no @unique do inbox e devolvia duplicata
+ * antes de alcancar o release. Buraco silencioso e permanente.
+ *
+ * Agora a intencao e gravada DENTRO da transacao do cancelamento. Queda aqui
+ * deixa a pendencia ABERTA: recuperavel e visivel.
+ *
+ * `resolvedAt` so e marcado na pendencia que for A NOSSA (prefixo do motivo).
+ * Fechar uma pendencia aberta por outro fluxo esconderia o problema dele.
+ *
+ * LIMITE DECLARADO: quem reexecuta pendencia aberta e o job de reconciliacao da
+ * saga, registrado na Fase 10 e AINDA NAO IMPLEMENTADO. Ate la a recuperacao e
+ * manual — mas visivel, que e a diferenca entre bug recuperavel e silencioso.
+ */
+export async function concluirLiberacao(orderId: string): Promise<void> {
+  try {
+    await inventoryClient.release(orderId);
+  } catch (e) {
+    const motivo = sanitizarParaLog(e instanceof Error ? e.message : String(e));
+    console.error('[order] release de ' + orderId + ' falhou; pendencia segue aberta: ' + motivo);
+    return;
+  }
+
+  await prisma.pendingCompensation.updateMany({
+    where: { orderId, resolvedAt: null, reason: { startsWith: MOTIVO_LIBERACAO_PENDENTE } },
+    data: { resolvedAt: new Date() },
+  });
+}
+
+/**
+ * Libera as reservas depois de um cancelamento JA aplicado pelo caminho HTTP.
+ *
+ * Continua sem intencao previa porque ali existe um chamador sincrono vendo o
+ * resultado. O caminho ASSINCRONO (consumidor de payment.expired) usa
+ * registrarPendencia + concluirLiberacao.
  */
 export async function liberarReservaAposCancelamento(orderId: string): Promise<void> {
   try {
     await inventoryClient.release(orderId);
   } catch (e) {
-    const motivo = e instanceof Error ? e.message : String(e);
+    const motivo = sanitizarParaLog(e instanceof Error ? e.message : String(e));
     console.error('[order] cancelamento de ' + orderId + ' nao liberou o estoque: ' + motivo);
     await registrarCompensacaoPendente(orderId, 'cancel_release_falhou:' + motivo);
   }

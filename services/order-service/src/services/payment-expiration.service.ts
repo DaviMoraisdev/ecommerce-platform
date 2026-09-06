@@ -4,7 +4,12 @@ import { ExpiracaoEvent } from '../events/payment-events';
 import { ResultadoAplicacao } from '../events/payments.consumer';
 import { BINDING_PAYMENT_EXPIRED } from '../events/payments.topology';
 import { SemEfeito, alvoDoP2002 } from './inbox-efeito';
-import { aplicarTransicao, liberarReservaAposCancelamento } from './order.service';
+import {
+  MOTIVO_LIBERACAO_PENDENTE,
+  aplicarTransicao,
+  concluirLiberacao,
+  registrarPendencia,
+} from './order.service';
 
 // Mesma autoria fixa da captura: identidade vem do contexto, nunca do payload.
 const AUTOR = 'payment-service';
@@ -70,16 +75,17 @@ export async function aplicarExpiracao(ev: ExpiracaoEvent): Promise<ResultadoApl
         // PAGO, ENVIADO ou ENTREGUE. Contradicao real: registra para triagem
         // humana e NAO toca no pedido.
         const motivo = 'expiracao_para_pedido_' + order.status.toLowerCase() + ':' + ev.paymentId;
-        const aberta = await tx.pendingCompensation.findFirst({
-          where: { orderId: ev.orderId, resolvedAt: null },
-        });
-        if (aberta === null) {
-          await tx.pendingCompensation.create({ data: { orderId: ev.orderId, reason: motivo } });
-        }
+        await registrarPendencia(tx, ev.orderId, motivo);
         return { tipo: 'compensacao-registrada', motivo };
       }
 
       await aplicarTransicao(tx, ev.orderId, OrderStatus.CANCELADO, AUTOR);
+
+      // INTENCAO DURAVEL, no MESMO commit do cancelamento (achado 4.1).
+      // Sem ela, uma queda entre o commit e o release deixaria o pedido
+      // CANCELADO com estoque RESERVADO e nenhum rastro: a reentrega bate no
+      // @unique do inbox e devolve duplicata antes de chegar ao release.
+      await registrarPendencia(tx, ev.orderId, MOTIVO_LIBERACAO_PENDENTE + ev.paymentId);
       return { tipo: 'aplicado' };
     });
   } catch (err) {
@@ -98,7 +104,7 @@ export async function aplicarExpiracao(ev: ExpiracaoEvent): Promise<ResultadoApl
   // cancelamento. Falha vira pendencia DURAVEL, e por isso quem chama pode dar
   // ack: repetir a mensagem nao melhora nada e o cancelamento ja aconteceu.
   if (resultado.tipo === 'aplicado') {
-    await liberarReservaAposCancelamento(ev.orderId);
+    await concluirLiberacao(ev.orderId);
   }
 
   return resultado;

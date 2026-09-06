@@ -1,6 +1,10 @@
 import { Prisma } from '@prisma/client';
 import { CapturaEvent, ExpiracaoEvent, parseCaptura, parseExpiracao } from './payment-events';
 import { BINDING_PAYMENT_CAPTURED, BINDING_PAYMENT_EXPIRED } from './payments.topology';
+import { sanitizarParaLog } from '../domain/texto-seguro';
+
+// Reexportado: os casos C importam daqui desde o Bloco 5b.
+export { sanitizarParaLog };
 
 export type DeliveryAction =
   | { type: 'ack'; reason: string }
@@ -147,25 +151,6 @@ export function decidirPorTamanho(bytes: number): DeliveryAction | null {
   };
 }
 
-// Conteudo vindo do broker entra em log. Duas defesas distintas:
-//  - caractere de controle: CR/LF permite forjar linha de log falsa;
-//  - credencial: err.message de biblioteca costuma trazer a URL do broker
-//    inteira, com a senha dentro do userinfo.
-// A redacao e por token, sem regex: regex sobre entrada nao controlada e
-// superficie de ReDoS e sempre deixa um caso escapar. Mesma abordagem do
-// motivoSeguro do payment-service.
-export function sanitizarParaLog(s: string): string {
-  let semControle = '';
-  for (const ch of s) {
-    const code = ch.charCodeAt(0);
-    semControle += code < 32 || code === 127 ? '?' : ch;
-  }
-  const redigido = semControle
-    .split(' ')
-    .map((parte) => (parte.includes('://') ? '[uri redigida]' : parte))
-    .join(' ');
-  return redigido.length > 200 ? redigido.slice(0, 200) + '...' : redigido;
-}
 
 /**
  * Traduz o resultado do efeito em acao no broker. Nao toca banco nem canal — o

@@ -3,7 +3,7 @@ import { prisma } from '../config/database';
 import { CapturaEvent } from '../events/payment-events';
 import { ResultadoAplicacao } from '../events/payments.consumer';
 import { BINDING_PAYMENT_CAPTURED } from '../events/payments.topology';
-import { aplicarTransicao } from './order.service';
+import { aplicarTransicao, registrarPendencia } from './order.service';
 import { SemEfeito, alvoDoP2002 } from './inbox-efeito';
 
 // Autoria FIXA. O comentario do normalizeChangedBy exige identidade vinda do
@@ -75,12 +75,7 @@ export async function aplicarCaptura(ev: CapturaEvent): Promise<ResultadoAplicac
         // findFirst antes de criar, em vez de create-e-trata-P2002: em Postgres
         // um erro DENTRO da transacao a envenena, e o catch daria a ilusao de
         // ter tratado enquanto o proximo statement falharia.
-        const aberta = await tx.pendingCompensation.findFirst({
-          where: { orderId: ev.orderId, resolvedAt: null },
-        });
-        if (aberta === null) {
-          await tx.pendingCompensation.create({ data: { orderId: ev.orderId, reason: motivo } });
-        }
+        await registrarPendencia(tx, ev.orderId, motivo);
         return { tipo: 'compensacao-registrada', motivo };
       }
 

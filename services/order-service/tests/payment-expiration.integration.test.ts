@@ -72,7 +72,11 @@ describe('aplicarExpiracao — compensacao da saga', () => {
     expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
     // Sem esta chamada o pedido some do fluxo mas a mercadoria continua reservada.
     expect(release).toHaveBeenCalledWith(o.id);
-    expect(await prisma.pendingCompensation.count({ where: { orderId: o.id } })).toBe(0);
+    // A intencao e gravada ANTES do release e RESOLVIDA depois dele.
+    const pendencias = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pendencias).toHaveLength(1);
+    expect(pendencias[0].reason).toContain('expiracao_release_pendente');
+    expect(pendencias[0].resolvedAt).not.toBeNull();
   });
 
   it('CASO X2: reentrega do MESMO evento e duplicata, sem segundo cancelamento', async () => {
@@ -146,6 +150,73 @@ describe('aplicarExpiracao — compensacao da saga', () => {
 
     const pendencias = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
     expect(pendencias).toHaveLength(1);
-    expect(pendencias[0].reason).toContain('cancel_release_falhou');
+    expect(pendencias[0].reason).toContain('expiracao_release_pendente');
+    // Segue ABERTA: e o que o job de reconciliacao da saga vai reexecutar.
+    expect(pendencias[0].resolvedAt).toBeNull();
   });
+
+  it('CASO X7: a intencao ja esta GRAVADA quando o release e chamado', async () => {
+    // Achado 4.1 da 1a rodada. O buraco anterior era uma janela: commit, queda,
+    // e nenhum rastro — a reentrega batia no @unique do inbox e devolvia
+    // duplicata antes de alcancar o release. Pedido CANCELADO com estoque
+    // RESERVADO, para sempre e em silencio.
+    //
+    // Este caso prova a ORDEM, que e o que fecha a janela: no instante da
+    // chamada externa a pendencia ja existe no banco. Uma queda ali deixa a
+    // linha aberta, recuperavel e visivel.
+    let existiaNaChamada = false;
+    release.mockImplementation((async (orderId: string) => {
+      const aberta = await prisma.pendingCompensation.findFirst({
+        where: { orderId, resolvedAt: null },
+      });
+      existiaNaChamada = aberta !== null;
+    }) as never);
+
+    const o = await pedido();
+    await aplicarExpiracao(evento(o.id));
+
+    expect(existiaNaChamada).toBe(true);
+  });
+
+  it('CASO X8: pendencia JA aberta e agregada, nao descartada', async () => {
+    // Achado 4.2 da 1a rodada. O indice unico e PARCIAL (orderId WHERE
+    // resolvedAt IS NULL): so existe uma pendencia aberta por pedido, entao
+    // incidente novo nao pode virar linha nova. Antes ele era simplesmente
+    // DESCARTADO e a triagem nunca via a expiracao.
+    const o = await pedido();
+    await prisma.pendingCompensation.create({
+      data: { orderId: o.id, reason: 'incidente_anterior' },
+    });
+
+    await aplicarExpiracao(evento(o.id));
+
+    const pendencias = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pendencias).toHaveLength(1);
+    expect(pendencias[0].reason).toContain('incidente_anterior');
+    expect(pendencias[0].reason).toContain('expiracao_release_pendente');
+    // NAO resolvida: o motivo nao comeca com o nosso prefixo, e fechar a
+    // pendencia de outro fluxo esconderia o problema dele.
+    expect(pendencias[0].resolvedAt).toBeNull();
+  });
+
+  it('CASO X9: contradicao sobre pedido PAGO com pendencia aberta tambem e agregada', async () => {
+    // O mesmo achado no ramo mais grave: expiracao sobre pedido pago e
+    // contradicao, e ela nao pode desaparecer so porque ja havia pendencia.
+    const o = await pedido(OrderStatus.PAGO);
+    await prisma.pendingCompensation.create({
+      data: { orderId: o.id, reason: 'incidente_anterior' },
+    });
+
+    await expect(aplicarExpiracao(evento(o.id))).resolves.toMatchObject({
+      tipo: 'compensacao-registrada',
+    });
+
+    const pendencias = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pendencias).toHaveLength(1);
+    expect(pendencias[0].reason).toContain('expiracao_para_pedido_pago');
+    expect(await prisma.order.findUniqueOrThrow({ where: { id: o.id } })).toMatchObject({
+      status: OrderStatus.PAGO,
+    });
+  });
+
 });
