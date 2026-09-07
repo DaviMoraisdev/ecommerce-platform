@@ -39,9 +39,9 @@ export function montarVarreduras(
     },
   ];
 
-  // A varredura produz EXPIRED e a saga ainda nao recebe esse desfecho. Ligada
-  // antes do 6f, cada expiracao vira registro sem evento de outbox — passivo
-  // historico que acrescentar o produtor depois NAO recupera.
+  // Kill-switch da varredura de expiracao. O gate original (a saga nao
+  // receber EXPIRED) caiu no Bloco 6f; o campo fica porque o job cancela
+  // cobranca no provedor e poder desliga-lo sem deploy tem valor proprio.
   if (config.expiracaoHabilitada) {
     varreduras.push({
       nome: 'expiracao',

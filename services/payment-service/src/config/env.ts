@@ -39,13 +39,15 @@ export interface AppConfig {
    * resolveria sozinha.
    */
   /**
-   * Liga a varredura de EXPIRACAO (Bloco 6e). Default DESLIGADA.
+   * Liga a varredura de EXPIRACAO (Bloco 6e). FAIL-CLOSED: so o literal
+   * 'true' liga.
    *
-   * A varredura produz `Payment.EXPIRED`, e a saga ainda nao recebe esse
-   * desfecho (o evento e o binding entram no 6f). Ligada antes disso, cada
-   * pagamento expirado vira um registro SEM evento de outbox — e acrescentar
-   * o produtor depois so cobre transicoes NOVAS, deixando um passivo
-   * historico que nenhum backfill automatico recupera.
+   * Nasceu como gate: a varredura produz `Payment.EXPIRED` e a saga nao
+   * recebia esse desfecho, entao cada expiracao viraria registro sem evento
+   * de outbox — passivo historico que acrescentar o produtor depois nao
+   * recupera. O Bloco 6f cumpriu a pre-condicao (produtor, binding,
+   * consumidor e compensacao) e o campo permanece como KILL-SWITCH: o job
+   * age sobre dinheiro no provedor.
    */
   expiracaoHabilitada: boolean;
   /** Derivado da flag. Ver `varredurasPorCiclo`. */

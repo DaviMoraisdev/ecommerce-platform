@@ -1,6 +1,7 @@
 import amqp from 'amqplib';
 import { DeliveryAction, decidirEntrega, decidirPorTamanho, sanitizarParaLog } from './payments.consumer';
 import { aplicarCaptura } from '../services/payment-capture.service';
+import { aplicarExpiracao } from '../services/payment-expiration.service';
 import {
   EXCHANGE_PAGAMENTOS,
   EXCHANGE_PAGAMENTOS_TYPE,
@@ -8,6 +9,7 @@ import {
   DLX_PAGAMENTOS,
   DLQ_PAGAMENTOS,
   BINDING_PAYMENT_CAPTURED,
+  BINDING_PAYMENT_EXPIRED,
 } from './payments.topology';
 
 // Interface minima do canal: o que este modulo realmente usa. Depender do tipo
@@ -52,6 +54,12 @@ export async function montarTopologia(ch: ChannelLike): Promise<void> {
     arguments: { 'x-dead-letter-exchange': DLX_PAGAMENTOS },
   });
   await ch.bindQueue(QUEUE_PAGAMENTOS, EXCHANGE_PAGAMENTOS, BINDING_PAYMENT_CAPTURED);
+
+  // Bloco 6f. SEGUNDO binding na MESMA fila. Acrescentar binding e idempotente
+  // e nao toca nos argumentos da fila — que sao IMUTAVEIS no RabbitMQ e, se
+  // fossem declarados diferentes, derrubariam o consumidor com
+  // PRECONDITION_FAILED. O assertQueue acima segue inalterado de proposito.
+  await ch.bindQueue(QUEUE_PAGAMENTOS, EXCHANGE_PAGAMENTOS, BINDING_PAYMENT_EXPIRED);
 
   // Limite de dano, nao otimizacao: sem prefetch o broker despeja a fila
   // inteira no processo e um crash devolve tudo de uma vez.
@@ -350,7 +358,10 @@ export async function tratarMensagem(ch: Canal, msg: { content: Buffer; fields: 
 
   let acao: DeliveryAction;
   try {
-    acao = await decidirEntrega(msg.content.toString(), routingKey, { aplicar: aplicarCaptura });
+    acao = await decidirEntrega(msg.content.toString(), routingKey, {
+      aplicar: aplicarCaptura,
+      aplicarExpiracao,
+    });
   } catch (err) {
     // decidirEntrega ja classifica falha de aplicacao; cair aqui e falha do
     // proprio decisor, e requeue continua sendo o conservador.

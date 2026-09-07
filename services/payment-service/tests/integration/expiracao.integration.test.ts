@@ -467,4 +467,73 @@ describe('buscarTentativasExpirando', () => {
     expect(await prisma.outboxEvent.count()).toBe(0);
   });
 
+
+  it('CASO E13: expirar enfileira UM evento payment.expired, no mesmo commit', async () => {
+    // Sem o evento, o pagamento fica EXPIRED e o pedido nunca sabe: estoque
+    // reservado para sempre. Por isso o 6e ficou desligado ate o 6f existir.
+    const { service, payment, tentativa } = await tentativaAceita();
+
+    expect(await prisma.outboxEvent.count()).toBe(0);
+    expect(await service.expirarTentativa(tentativa.id, tentativa.providerRef as string)).toBe(true);
+
+    const eventos = await prisma.outboxEvent.findMany();
+    expect(eventos).toHaveLength(1);
+    expect(eventos[0].routingKey).toBe('payment.expired');
+    expect(eventos[0].eventId).toBe(`payment.expired:${payment.id}`);
+  });
+
+  it('CASO E14: segunda expiracao NAO enfileira evento novo', async () => {
+    // O CAS ja impede a segunda transicao; este caso prova que o evento vive
+    // DENTRO dela. Se o enqueue estivesse fora, a reentrega do job publicaria
+    // de novo — e o eventId derivado colidiria, mas so depois de a transacao
+    // ter sido aberta a toa.
+    const { service, tentativa } = await tentativaAceita();
+    await service.expirarTentativa(tentativa.id, tentativa.providerRef as string);
+
+    expect(await service.expirarTentativa(tentativa.id, tentativa.providerRef as string)).toBe(
+      false,
+    );
+    expect(await prisma.outboxEvent.count()).toBe(1);
+  });
+
+
+  it('CASO E15: a escrita do evento participa da MESMA transacao da expiracao', async () => {
+    // Primeira versao deste caso quebrava o enqueue e exigia rollback — e a
+    // sondagem W1 mostrou que ela NAO provava nada: trocar o `tx` pelo cliente
+    // global deixava o caso verde, porque no cenario do teste aquele cliente
+    // tambem estourava. Nos caminhos felizes, gravar dentro ou fora da transacao
+    // produz o MESMO estado final; so um aborto POSTERIOR separa os dois.
+    //
+    // Aqui a transacao inteira e abortada depois que o servico termina. A linha
+    // gravada com `tx` desaparece; uma gravada fora sobreviveria.
+    const { payment, tentativa } = await tentativaAceita();
+
+    const prismaQueAborta = {
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
+        prisma.$transaction(async (tx) => {
+          await fn(tx);
+          throw new Error('rollback forcado');
+        }),
+    } as unknown as PrismaClient;
+
+    const serviceQueAborta = new PaymentService({
+      prisma: prismaQueAborta,
+      orderClient: orderClientFalso(jest.fn(async () => pedidoDeTeste({ id: payment.orderId }))),
+      provider: new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK }),
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+
+    await expect(
+      serviceQueAborta.expirarTentativa(tentativa.id, tentativa.providerRef as string),
+    ).rejects.toThrow('rollback forcado');
+
+    // Nada sobreviveu: nem o pagamento, nem a tentativa, nem o evento.
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.status).toBe(PaymentStatus.PROCESSING);
+    const linha = await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: tentativa.id } });
+    expect(linha.status).toBe(TransactionStatus.PENDING);
+    expect(await prisma.outboxEvent.count()).toBe(0);
+  });
+
 });
