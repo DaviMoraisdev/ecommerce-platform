@@ -13,6 +13,7 @@ import { enqueue } from '../events/outbox.repository';
 import { montarEventoDeCaptura } from '../events/payment.events';
 import type { WebhookEventPayload } from '../providers/payment-provider.port';
 import { mensagemSegura } from '../domain/mensagem-segura';
+import { aplicarTotalDeReembolso } from '../domain/reembolso';
 
 /**
  * Quanto o `providerCreatedAt` pode estar a FRENTE do nosso relogio.
@@ -850,21 +851,13 @@ export class WebhookService {
       const aplicado = await this.deps.prisma.$transaction(async (tx) => {
         // CAS sobre o VALOR, nao sobre o status: CAPTURED e terminal e nao muda
         // (decisao 9 da fase — reembolso e aritmetica, nao transicao).
-        const { count } = await tx.payment.updateMany({
-          where: { id: idDoPagamento, refundedAmountCents: baseDoCas },
-          data: { refundedAmountCents: evento.refundedAmountCents },
+        const aplicouOValor = await aplicarTotalDeReembolso(tx, {
+          paymentId: idDoPagamento,
+          base: baseDoCas,
+          total: evento.refundedAmountCents,
+          providerRef: evento.providerRef,
         });
-        if (count === 0) return false;
-
-        await tx.paymentTransaction.create({
-          data: {
-            paymentId: idDoPagamento,
-            type: TransactionType.REFUND,
-            status: TransactionStatus.SUCCEEDED,
-            amountCents: delta,
-            providerRef: evento.providerRef,
-          },
-        });
+        if (!aplicouOValor) return false;
         // Mesma assimetria deliberada do caminho de captura: so se chega aqui
         // tendo ganho o CAS do valor, entao o reembolso foi aplicado.
         await tx.webhookEvent.update({
