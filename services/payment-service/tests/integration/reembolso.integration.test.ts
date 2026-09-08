@@ -232,7 +232,11 @@ describe('reembolsar', () => {
     const primeira = await service.reembolsar(pedido);
     const segunda = await service.reembolsar(pedido);
 
-    expect(segunda).toEqual(primeira);
+    // Os campos que carregam DINHEIRO sao identicos; o que muda e a marca de
+    // replay, que o cliente usa para distinguir 200 de 201 sem interpretar o
+    // corpo. Afirmar igualdade total esconderia essa distincao.
+    expect(primeira).not.toHaveProperty('replay');
+    expect(segunda).toEqual({ ...primeira, replay: true });
 
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.refundedAmountCents).toBe(metade);
