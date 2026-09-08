@@ -4,7 +4,7 @@ Registro de decisões conscientes de adiamento, avaliadas nos code reviews e age
 
 Organizado por **destino**. Só pendências: dívidas pagas são removidas daqui (o histórico permanece nos PRs).
 
-Última atualização: **Fase 5 em andamento** (Blocos 1 a 5 e 6a concluídos; 6b em PR).
+Última atualização: **Fase 5 em andamento** (Blocos 1 a 6f concluídos; Bloco 7 em PR).
 
 ---
 
@@ -17,6 +17,7 @@ Trade-offs aceitos cujo **gatilho** de correção está explícito — não são
 - **`Number()` aceita hexadecimal e exponencial em `parseTimeout` e `parseMinutos` (payment-service):** `PAYMENT_WINDOW_MINUTES=0x10` vira 16 e `1e3` vira 1000. Documentado em teste, não corrigido: hexadecimal num `.env` não é acidente plausível, e um parser próprio só para isso é código a mais para manter. **Gatilho:** se um dos dois for endurecido, os dois vão juntos — corrigir só um cria divergência silenciosa entre parsers irmãos.
 - **Porta de pagamento sem passo de autenticação adicional (3DS/SCA):** A porta PaymentProvider nao expressa autenticacao adicional — `ChargeResult` não tem campo de próxima ação (redirect, desafio). O fluxo assume cartão tokenizado e captura automática. **Gatilho:** exigência de 3D Secure, SCA (Europa) ou qualquer método que precise de interação extra do cliente. Custo: variante nova em `ChargeResult` e ajuste em todos os consumidores.
 
+- **`MAX_REAVALIACOES = 3` no reembolso e um numero sem base empirica (payment-service).** Levantado no Bloco 7. Quando o CAS aritmetico de `refundedAmountCents` perde, o servico recarrega o estado e redecide, ate tres vezes; esgotadas, devolve `contencao` (HTTP 503). Perder o CAS **nao** prova obsolescencia — um reembolso concorrente menor pode ter vencido —, entao o laco de reavaliacao esta correto; o que nao tem base e o teto. Nao houve medicao de contencao real: tres e palpite plausivel, e se for baixo demais um cliente que teria sucesso na quarta volta recebe 503. **Gatilho:** primeira ocorrencia real de `contencao` em log ou em teste de carga. So entao o numero passa a ter evidencia para subir, descer ou virar backoff.
 ---
 
 
@@ -29,6 +30,7 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 - **Drain de `reserved` órfão na migração do 7a:** a migration zerou `inventory.reserved` sem `reservation` (modelo antigo). Seguro por não haver pedidos reais; **com dados reais a estratégia seria backfill, não drain**.
 - **Redrive da DLQ respeita o TTL do claim:** um redrive `DLQ -> fila principal` antes do TTL expirar é visto como duplicata (ack sem reprocessar). **Procedimento:** redrive só após o TTL, ou limpar `notif:evt:<eventId>` antes.
 
+- **Mensagem de commit que cita numero de teste exige as duas suites rodadas naquele estado da arvore.** Regra criada no Bloco 7 por falha propria, nao por hipotese. Depois do incremento 4 (que passou a marcar a resposta congelada com `replay: true`) foi rodada apenas `npm run verify` — a unitaria — e o commit afirmava `139/139 integracao`. O numero era verdade ANTES daquela mudanca e nao foi reexecutado DEPOIS dela; a suite de integracao ficou vermelha por dois incrementos, porque o CASO R9 ainda afirmava igualdade total entre a primeira e a segunda resposta. E a regra "verificar antes de afirmar em artefato duravel" quebrada dentro da propria mensagem de commit, que e artefato duravel. Quem pegou foi o passo final da bateria de sabotagem ("a arvore restaurada tem de estar verde"), que roda as duas suites por construcao — nao o desenvolvimento normal, que so rodava a unitaria. **Consequencia pratica:** ou a mensagem cita os dois numeros com as duas suites executadas naquele commit, ou nao cita numero nenhum.
 ---
 
 ## Exceções de segurança aceitas (→ Fase 7)
@@ -206,6 +208,8 @@ tem superficie demais para uma rodada de review so.
   Prova (2026-08-31): `npm run verify` 711/711; `npm run verify:integration` 103/103.
   Prova (2026-08-30): `npm run verify` 706/706; `npm run verify:integration` 103/103. Duas sabotagens reaplicadas apos as correcoes (B-1: `QUARANTINED` volta a ser tratado como aberto; B-2: varredura sem reavaliacao de estado) derrubaram os casos 20 e 23 respectivamente.
 
+### Bloco 7b — Evento payment.refunded
+- **O reembolso nao emite evento; o order-service nao sabe que houve estorno.** Compromisso assumido no Bloco 7: `POST /payments/:id/refunds` altera `refundedAmountCents` e grava a linha `REFUND`, mas nada e publicado. Do lado do pedido nao existe representacao de estorno — nem total nem parcial. Adiamento **deliberado**, nao esquecimento: emitir o evento exige mexer nos DOIS servicos (outbox e contrato no payment, consumidor e inbox no order, representacao no modelo de pedido), e isso num PR de reembolso juntaria mudancas de servicos diferentes num diff so — o erro que o fluxo de PR desta fase existe para evitar. Escopo do 7b: `payment.refunded` gravado na outbox DENTRO da transacao do efeito, fixture de contrato compartilhada na raiz (mesmo padrao do `contracts/payment.expired.v1.json`), consumidor idempotente no order, e decisao explicita sobre o que o pedido faz com estorno PARCIAL — que e a pergunta de dominio ainda em aberto.
 ### Bloco 8 — Bateria de testes
 - **Provar ROLLBACK de escrita parcial no `$transaction` de `persistirTentativa`.** O que já está provado: o duble de Prisma cobre ordem das operações e decisões, e a integração cobre os `CHECK`, o `@unique` de `orderId` e concorrência real. O que **não** está provado: que uma falha *depois* de uma escrita bem-sucedida dentro da mesma transação desfaz a anterior. No teste de concorrência a falha acontece no primeiro `create`, então não há escrita prévia para desfazer. Exige injetar falha no meio da transação — por exemplo forçar violação de `CHECK` no `paymentTransaction.create` após o `payment.update` de `attemptCount`, e conferir que o contador volta ao valor anterior.
 - **Cobrir o `getPrisma` sem `connectDatabase` prévio.** O caminho de erro existe e tem mensagem explícita, mas nenhum teste o exercita.
@@ -213,6 +217,7 @@ tem superficie demais para uma rodada de review so.
 - **`startOutboxRelay`/`stopOutboxRelay` parcialmente cobertos.** O ciclo de vida os CHAMA na ordem certa (sabotagens W1-W4), o CASO A9 prova que o start agenda o proximo ciclo e o A10 que o stop impede novos ciclos. CONTINUA sem teste: o teto do `stopOutboxRelay` (`STOP_TIMEOUT_MS`), o destino de um tick ainda em voo quando esse teto estoura, e a idempotencia de dois `start` seguidos.
 
 
+- **A rota de reembolso nunca foi exercitada de ponta a ponta contra Postgres.** Levantado no Bloco 7. Os CASOS R1-R10 chamam `service.reembolsar` direto: banco real, sem HTTP. Os CASOS A1-A10 exercem a rota com HTTP real e `exigirRole('ADMIN')` real, mas com servico falso. Nenhum teste atravessa `router -> exigirAdmin -> controller -> service -> Postgres` de uma vez. O que passaria despercebido: rota registrada em caminho errado, `exigirAdmin` fora de ordem na cadeia de middlewares, ou divergencia entre o `STATUS_POR_DESFECHO` do controller e os desfechos que o servico realmente produz contra banco. As duas metades estao provadas; a COSTURA entre elas nao. Mesma natureza dos CASOS 38 e 39 do 6c, que existem exatamente porque a transicao para quarentena nunca havia passado pela rota.
 ### Bloco 9 — Stripe e hardening
 - **Rodar a suíte de contrato (`payment-provider.contract.ts`) contra a Stripe.** É o que valida a abstração da porta.
 - **Sanitização de log**, rate limit no webhook, escopo PCI documentado.
@@ -221,6 +226,7 @@ tem superficie demais para uma rodada de review so.
 - **Revisitar o REQUISITO de gravar `raw` no inbox.** Cinco rodadas de review encontraram defeito na sanitizacao do payload bruto: aliases PCI, estrutura aninhada, colisao de normalizacao, heranca de prototipo. O filtro esta correto hoje e provado por sabotagem, mas a alternativa estrutural e nao gravar `raw` e sim o `WebhookEventPayload` ja validado — sem dado desconhecido, nao ha o que filtrar. Nao foi feito no Bloco 4 porque contraria decisao explicita do Bloco 3 (o `fake.wire` guarda `bruto` para preservar campo extra, e o schema documenta o payload como evidencia para reprocessamento). Se aparecer uma sexta rodada de defeito nesse filtro, a correcao certa e revisitar o requisito, nao o filtro.
 
 
+- **A chave de idempotencia do provedor no reembolso e derivada por prefixo (`refund:${registroId}`), e isso so e seguro porque o espaco de chaves e nosso.** Levantado no Bloco 7. Contra o `FakeProvider`, os prefixos `cancel:` e `refund:` bastam para separar operacoes distintas sobre a mesma cobranca, porque o espaco inteiro e do teste. Com a Stripe a chave de idempotencia e **global por conta** — nao por endpoint, nao por objeto: o prefixo deixa de ser garantia e vira convencao, e dois servicos da mesma conta, ou um replay entre ambientes que compartilhem a conta, podem colidir. Verificar na documentacao da Stripe o escopo real da chave e, se for global, derivar de algo com unicidade propria (o `registroId` ja e UUID; o risco esta no prefixo humano, nao no sufixo). Entra junto da suite de contrato desta secao.
 ### Bloco 10 — Fechamento
 - **Finalizar o README do payment-service e revisar o README da raiz.** Ambos foram *criados/marcados* no PR de manutenção pré-Bloco 3, com o estado daquele momento. O que falta e a revisão final: descrever os endpoints, o fluxo completo e trocar o marcador 🟡 por ✅ quando a fase fechar.
 - **PDF de revisão da fase** em `docs/phase-reviews/phase-05.pdf`.
@@ -288,6 +294,7 @@ tem superficie demais para uma rodada de review so.
 - **Backoff/quarentena/redrive no relay da outbox (produtor):** o publish falho volta a `PENDING` e é retentado em intervalo fixo (sem backoff exponencial, sem quarentena de "poison" nem redrive) — um evento inpublicável causaria head-of-line blocking. Eventos são bem-formados (produtor próprio) → risco baixo hoje; necessário sob carga real. Enum `FAILED` reservado. (PR #43/#44.)
 - **Limpeza do carrinho por versão/CAS:** hoje o checkout remove só os itens comprados por productId; um CAS por versão preservaria mudanças de quantidade. Exige versionamento no cart.
 
+- **`divergencia` e `contencao` do reembolso sao detectados e devolvidos, mas ninguem e avisado (payment-service).** Levantado no Bloco 7. Sao dois problemas de naturezas DIFERENTES que compartilham a mesma lacuna. (a) `divergencia` — `refundedAmountCents > capturedAmountCents` — e estado **duravel e impossivel**: se aparecer, ja existe dinheiro contabilizado errado no banco, e o cliente recebe 409 enquanto a linha continua la. E varredura, e cabe no processor desta secao junto dos casos de `pending_compensations` e `idempotency_records`: escanear e ALERTAR, sem corrigir sozinho, porque acertar valor monetario divergente e decisao humana. (b) `contencao` — tres reavaliacoes de CAS perdidas seguidas — e **transitorio e nao deixa rastro duravel**: nao ha o que varrer, o que falta e contador. Depende da metrica que o item "Processor de reconciliacao da saga" ja lista como requisito ("tudo com retry/backoff, metricas e alerta"), nao de job proprio. Hoje os dois existem apenas como log.
 ### Contratos / arquitetura
 - **Contrato de topologia compartilhado:** EXCHANGE e routing keys duplicados em order (`events/topology.ts`) e notification (`config/topology.ts`). Pacote comum ou aceitar a duplicação.
 - **Ciclo de vida acoplado a efeitos globais:** `start()`/estado do publisher rodam no import, com `process.exit` embutido e estado de módulo global. Separar construção/start/stop + injetar conexão/logger/exit.
