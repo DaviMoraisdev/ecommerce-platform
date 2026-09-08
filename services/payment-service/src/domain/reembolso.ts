@@ -55,3 +55,17 @@ export async function aplicarTotalDeReembolso(
 
   return true;
 }
+
+/** Desfechos possiveis de um reembolso INICIADO por nos (Bloco 7). */
+export type ResultadoDeReembolso =
+  | { tipo: 'aplicado'; totalReembolsadoCents: number; providerRefundRef: string }
+  /** Aceite assincrono: o total so se move quando o webhook confirmar. */
+  | { tipo: 'pendente'; providerRefundRef: string }
+  | { tipo: 'recusado'; declineCode: string }
+  | { tipo: 'valor-invalido' }
+  | { tipo: 'estado-invalido'; status: string }
+  | { tipo: 'excede-o-capturado'; capturadoCents: number; reembolsadoCents: number }
+  /** Dinheiro voltou no provedor e a contabilidade local nao comporta. */
+  | { tipo: 'divergencia'; capturadoCents: number; reembolsadoCents: number }
+  /** CAS perdido acima do teto. Dinheiro movido, total pendente de reconciliacao. */
+  | { tipo: 'contencao' };

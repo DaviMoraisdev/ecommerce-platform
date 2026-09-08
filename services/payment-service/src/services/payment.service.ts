@@ -32,6 +32,8 @@ import {
 } from '../providers/payment-provider.port';
 import { enqueue } from '../events/outbox.repository';
 import { montarEventoDeCaptura, montarEventoDeExpiracao } from '../events/payment.events';
+import { aplicarTotalDeReembolso, type ResultadoDeReembolso } from '../domain/reembolso';
+import type { ProviderRef } from '../providers/payment-provider.port';
 
 export interface PaymentServiceDeps {
   prisma: PrismaClient;
@@ -103,6 +105,9 @@ const NOVA_TENTATIVA_PERMITIDA: ReadonlySet<PaymentStatus> = new Set([
 ]);
 
 export class PaymentService {
+  /** Teto de reavaliacoes do CAS de reembolso. Mesmo criterio do WebhookService. */
+  private static readonly MAX_REAVALIACOES = 3;
+
   private readonly now: () => Date;
 
   constructor(private readonly deps: PaymentServiceDeps) {
@@ -663,6 +668,173 @@ export class PaymentService {
    * NOSSA. Carimbar `Date.now()` faria um evento legitimo do provedor, gerado
    * antes de agora, ser descartado como obsoleto pelo CAS do Bloco 6d.
    */
+  /**
+   * Reembolso INICIADO por nos (Bloco 7), total ou parcial.
+   *
+   * Diferente do caminho de webhook, que REAGE a um reembolso feito por fora.
+   * Aqui nos comandamos, e por isso a ordem das operacoes e o desenho:
+   *
+   * O PROVEDOR E CHAMADO PRIMEIRO, e fora do laco. Reservar localmente antes
+   * obrigaria a DESFAZER quando ele recusa, e desfazer e outro CAS que tambem
+   * pode perder — troca um problema por dois. Chamar primeiro funciona porque o
+   * provedor e o ponto de serializacao real do DINHEIRO: ele tem o proprio
+   * invariante e recusa reembolsar acima do capturado. Nosso CAS protege a
+   * CONTABILIDADE; o provedor protege o dinheiro.
+   *
+   * Perder o CAS NAO e recusa: pode ser um reembolso concorrente de valor menor
+   * que entrou antes. Recarrega e refaz a decisao — mesma licao do achado 4.1
+   * do review do Bloco 4.
+   */
+  async reembolsar(
+    paymentId: string,
+    valorCents: number,
+    chaveDoProvedor: string,
+  ): Promise<ResultadoDeReembolso> {
+    if (!Number.isSafeInteger(valorCents) || valorCents <= 0) {
+      return { tipo: 'valor-invalido' };
+    }
+
+    const inicial = await this.deps.prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
+    if (inicial.status !== PaymentStatus.CAPTURED) {
+      return { tipo: 'estado-invalido', status: inicial.status };
+    }
+
+    // Pre-checagem ANTES de mover dinheiro. Nao e a garantia — e a cortesia de
+    // nao pedir ao provedor algo que ja sabemos invalido.
+    if (inicial.refundedAmountCents + valorCents > inicial.capturedAmountCents) {
+      return {
+        tipo: 'excede-o-capturado',
+        capturadoCents: inicial.capturedAmountCents,
+        reembolsadoCents: inicial.refundedAmountCents,
+      };
+    }
+
+    // A cobranca a reembolsar e a da CAPTURA: e o dinheiro que de fato se moveu.
+    const captura = await this.deps.prisma.paymentTransaction.findFirst({
+      where: {
+        paymentId,
+        type: TransactionType.CAPTURE,
+        status: TransactionStatus.SUCCEEDED,
+        providerRef: { not: null },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (captura?.providerRef == null) {
+      // Pagamento CAPTURED sem linha de captura com referencia e estado que nao
+      // deveria existir. Falhar alto: reembolsar as cegas mexe em dinheiro.
+      throw erroDeDominio('DEPENDENCIA_INDISPONIVEL', 'Captura sem providerRef para reembolsar');
+    }
+
+    // O provedor tambem enforça `soma dos reembolsos <= capturado`, e RECUSA
+    // lancando. Essa recusa nao e falha tecnica: e o ponto de serializacao do
+    // DINHEIRO fazendo o trabalho dele — tipicamente quando um reembolso
+    // concorrente consumiu o saldo entre a nossa pre-checagem e esta chamada.
+    // Tratada como erro generico, viraria 500 no lugar de recusa de dominio.
+    let resultado;
+    try {
+      resultado = await this.deps.provider.refund({
+        providerRef: captura.providerRef as ProviderRef,
+        amountCents: valorCents,
+        idempotencyKey: chaveDoProvedor,
+      });
+    } catch (erro) {
+      if (!(erro instanceof ProviderInvalidRequestError)) throw erro;
+
+      // Reler para responder com os valores REAIS, e nao com os da leitura que
+      // ficou obsoleta durante a chamada.
+      const atual = await this.deps.prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
+      return {
+        tipo: 'excede-o-capturado',
+        capturadoCents: atual.capturedAmountCents,
+        reembolsadoCents: atual.refundedAmountCents,
+      };
+    }
+
+    if (resultado.state === 'DECLINED') {
+      await this.registrarTentativaDeReembolso(
+        paymentId,
+        valorCents,
+        TransactionStatus.FAILED,
+        resultado.providerRefundRef,
+        resultado.declineCode,
+      );
+      return { tipo: 'recusado', declineCode: resultado.declineCode };
+    }
+
+    if (resultado.state === 'PROCESSING') {
+      // NAO move o total: o dinheiro ainda nao voltou. Quem confirma e o
+      // `refund.succeeded`, que carrega o total acumulado — aplicar aqui e la
+      // somaria duas vezes.
+      await this.registrarTentativaDeReembolso(
+        paymentId,
+        valorCents,
+        TransactionStatus.PENDING,
+        resultado.providerRefundRef,
+      );
+      return { tipo: 'pendente', providerRefundRef: resultado.providerRefundRef };
+    }
+
+    let payment = inicial;
+    for (let tentativa = 0; tentativa <= PaymentService.MAX_REAVALIACOES; tentativa += 1) {
+      const alvo = payment.refundedAmountCents + valorCents;
+
+      if (alvo > payment.capturedAmountCents) {
+        // O dinheiro JA voltou no provedor e a contabilidade local nao comporta:
+        // as duas visoes divergiram. Nao forco nem invento desfecho — quem
+        // reconcilia e o webhook, que traz o total ACUMULADO.
+        return {
+          tipo: 'divergencia',
+          capturadoCents: payment.capturedAmountCents,
+          reembolsadoCents: payment.refundedAmountCents,
+        };
+      }
+
+      const aplicado = await this.deps.prisma.$transaction((tx) =>
+        aplicarTotalDeReembolso(tx, {
+          paymentId,
+          base: payment.refundedAmountCents,
+          total: alvo,
+          providerRef: resultado.providerRefundRef,
+        }),
+      );
+
+      if (aplicado) {
+        return {
+          tipo: 'aplicado',
+          totalReembolsadoCents: alvo,
+          providerRefundRef: resultado.providerRefundRef,
+        };
+      }
+
+      payment = await this.deps.prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
+    }
+
+    // Dinheiro movido no provedor, contabilidade nao aplicada. Desfecho proprio,
+    // nao sucesso e nao recusa — o webhook do reembolso conserta o total.
+    return { tipo: 'contencao' };
+  }
+
+  /** Linha de trilha para reembolso que NAO moveu o total (recusado ou pendente). */
+  private async registrarTentativaDeReembolso(
+    paymentId: string,
+    valorCents: number,
+    status: TransactionStatus,
+    providerRef: string,
+    failureCode?: string,
+  ): Promise<void> {
+    await this.deps.prisma.paymentTransaction.create({
+      data: {
+        paymentId,
+        type: TransactionType.REFUND,
+        status,
+        amountCents: valorCents,
+        providerRef,
+        failureCode,
+      },
+    });
+  }
+
+
   async expirarTentativa(transactionId: string, providerRef: string): Promise<boolean> {
     return this.deps.prisma.$transaction(async (tx) => {
       const reivindicada = await tx.paymentTransaction.updateMany({
