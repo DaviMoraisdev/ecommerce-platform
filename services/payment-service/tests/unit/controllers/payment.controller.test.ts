@@ -362,4 +362,45 @@ describe('POST /payments/:id/refunds — autorizacao e mapeamento (Bloco 7)', ()
     expect(res.status).toBe(400);
     expect(reembolsar).not.toHaveBeenCalled();
   });
+
+  // A11 e A12 existem porque o mapeamento de `divergencia` NAO tinha teste
+  // nenhum: a troca de 409 para 500 atravessou a suite inteira sem uma falha.
+  // Mecanismo sem prova e mecanismo que a proxima mudanca desfaz em silencio.
+  const DIVERGENCIA = {
+    tipo: 'divergencia' as const,
+    capturadoCents: 10000,
+    reembolsadoCents: 9000,
+  };
+
+  it('CASO A11: divergencia responde 500, nao 4xx', async () => {
+    const log = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const reembolsar = jest.fn(async () => DIVERGENCIA);
+
+    const res = await pedir(montarApp(jest.fn(), { reembolsar, role: 'ADMIN' }));
+
+    // Anomalia NOSSA: o provedor aceitou o que a contabilidade local nao
+    // comporta. 4xx faria cliente e monitoramento tratarem incidente
+    // operacional como erro de requisicao.
+    expect(res.status).toBe(500);
+    log.mockRestore();
+  });
+
+  it('CASO A12: os valores da divergencia vao para o LOG, nao para o corpo', async () => {
+    const log = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const reembolsar = jest.fn(async () => DIVERGENCIA);
+
+    const res = await pedir(montarApp(jest.fn(), { reembolsar, role: 'ADMIN' }));
+
+    // As duas metades sao afirmadas juntas de proposito. So "nao vaza no corpo"
+    // seria satisfeito por nao registrar nada em lugar nenhum — o que perderia
+    // a informacao que o operador precisa.
+    expect(res.body).not.toHaveProperty('capturadoCents');
+    expect(res.body).not.toHaveProperty('reembolsadoCents');
+    expect(res.body.code).toBe('DIVERGENCIA_DE_REEMBOLSO');
+    expect(log).toHaveBeenCalledWith(
+      '[payment-service] divergencia de reembolso',
+      expect.objectContaining({ capturadoCents: 10000, reembolsadoCents: 9000 }),
+    );
+    log.mockRestore();
+  });
 });

@@ -28,6 +28,7 @@ import { assertTransicao, mapearEstadoDoProvedor } from '../domain/payment-statu
 import {
   PaymentProviderError,
   ProviderInvalidRequestError,
+  RefundExceedsAvailableError,
   type PaymentProvider,
 } from '../providers/payment-provider.port';
 import { enqueue } from '../events/outbox.repository';
@@ -229,10 +230,11 @@ export class PaymentService {
     chave: string,
     fingerprint: string,
     aoCompletar: (existente: IdempotencyRecord) => Promise<T>,
+    paymentId?: string,
   ): Promise<{ registroId: string } | { replay: T }> {
     try {
       const registro = await this.deps.prisma.idempotencyRecord.create({
-        data: { userId, key: chave, requestFingerprint: fingerprint },
+        data: { userId, key: chave, requestFingerprint: fingerprint, paymentId },
       });
       return { registroId: registro.id };
     } catch (erro) {
@@ -742,6 +744,7 @@ export class PaymentService {
       input.idempotencyKey,
       this.fingerprintDoReembolso(input),
       (existente) => this.replayDeReembolso(existente),
+      input.paymentId,
     );
     if ('replay' in reivindicacao) return reivindicacao.replay;
 
@@ -791,7 +794,14 @@ export class PaymentService {
       return { tipo: 'valor-invalido' };
     }
 
-    const inicial = await this.deps.prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
+    // findUnique + erro de dominio, e nao findUniqueOrThrow: o P2025 do Prisma
+    // nao e traduzido em lugar NENHUM deste servico (grep confirmou zero
+    // ocorrencias) e chegaria ao handler generico como 500. Pagamento
+    // inexistente e 404 (achado 4.5).
+    const inicial = await this.deps.prisma.payment.findUnique({ where: { id: paymentId } });
+    if (inicial === null) {
+      throw erroDeDominio('PAGAMENTO_NAO_ENCONTRADO', 'Pagamento nao encontrado');
+    }
     if (inicial.status !== PaymentStatus.CAPTURED) {
       return { tipo: 'estado-invalido', status: inicial.status };
     }
@@ -839,7 +849,7 @@ export class PaymentService {
         idempotencyKey: chaveDoProvedor,
       });
     } catch (erro) {
-      if (!(erro instanceof ProviderInvalidRequestError)) throw erro;
+      if (!(erro instanceof RefundExceedsAvailableError)) throw erro;
 
       // Reler para responder com os valores REAIS, e nao com os da leitura que
       // ficou obsoleta durante a chamada.
@@ -879,6 +889,28 @@ export class PaymentService {
         resultado.providerRefundRef,
       );
       return desfecho;
+    }
+
+    // Fail-closed sobre o estado do provedor (achado 3.1). DECLINED e PROCESSING
+    // ja retornaram acima e o tipo promete que so sobra SUCCEEDED — mas isso e
+    // promessa de COMPILACAO. O adaptador real fala com a rede, e estado
+    // desconhecido tratado como sucesso move contabilidade sobre algo que nao
+    // entendemos. Mesma regra do 6c, onde `registrar` passou a listar os ABERTOS.
+    const estado: string = resultado.state;
+    if (estado !== 'SUCCEEDED') {
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Estado de reembolso desconhecido no provedor',
+      );
+    }
+    // O provedor e a fonte da verdade sobre QUANTO voltou. Contabilizar o valor
+    // pedido quando ele devolveu outro registra um numero que o dinheiro nao
+    // seguiu. Falha alto: nao ha desfecho honesto a inventar aqui.
+    if (resultado.amountCents !== valorCents) {
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Valor reembolsado pelo provedor difere do solicitado',
+      );
     }
 
     let payment = inicial;
@@ -1091,7 +1123,12 @@ export class PaymentService {
 
     if (o.tipo === 'aplicado') {
       if (typeof o.totalReembolsadoCents !== 'number') return null;
-      if (typeof o.providerRefundRef !== 'string') return null;
+      // Inteiro seguro e nao-negativo: `typeof number` sozinho aceita NaN,
+      // Infinity, fracionario e negativo — e isto e dinheiro devolvido ao
+      // cliente como resposta valida (achado 5.1).
+      if (!Number.isSafeInteger(o.totalReembolsadoCents)) return null;
+      if (o.totalReembolsadoCents < 0) return null;
+      if (typeof o.providerRefundRef !== 'string' || o.providerRefundRef === '') return null;
       return {
         tipo: 'aplicado',
         totalReembolsadoCents: o.totalReembolsadoCents,
@@ -1100,12 +1137,12 @@ export class PaymentService {
     }
 
     if (o.tipo === 'pendente') {
-      if (typeof o.providerRefundRef !== 'string') return null;
+      if (typeof o.providerRefundRef !== 'string' || o.providerRefundRef === '') return null;
       return { tipo: 'pendente', providerRefundRef: o.providerRefundRef };
     }
 
     if (o.tipo === 'recusado') {
-      if (typeof o.declineCode !== 'string') return null;
+      if (typeof o.declineCode !== 'string' || o.declineCode === '') return null;
       return { tipo: 'recusado', declineCode: o.declineCode };
     }
 

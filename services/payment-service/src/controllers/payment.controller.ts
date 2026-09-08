@@ -23,6 +23,7 @@ const STATUS_POR_CODIGO: Record<CodigoDeErroDePagamento, number> = {
   REQUISICAO_INVALIDA: 400,
   NAO_AUTORIZADO: 401,
   PEDIDO_NAO_ENCONTRADO: 404,
+  PAGAMENTO_NAO_ENCONTRADO: 404,
   IDEMPOTENCIA_EM_ANDAMENTO: 409,
   IDEMPOTENCIA_JA_FALHOU: 409,
   PEDIDO_NAO_COBRAVEL: 409,
@@ -54,9 +55,10 @@ const STATUS_POR_DESFECHO: Record<DesfechoDeReembolso['tipo'], number> = {
   'valor-invalido': 400,
   'estado-invalido': 409,
   'excede-o-capturado': 409,
-  // Anomalia real: dinheiro voltou no provedor e a contabilidade nao comporta.
-  // 409 com os numeros e mais util ao operador que um 500 opaco.
-  divergencia: 409,
+  // Anomalia NOSSA, nao do cliente: o provedor aceitou um estorno que a
+  // contabilidade local nao comporta. 4xx faria cliente e monitoramento
+  // tratarem incidente operacional como erro de requisicao.
+  divergencia: 500,
   // Retentavel: o CAS perdeu acima do teto sob contencao.
   contencao: 503,
 };
@@ -175,6 +177,20 @@ export function criarPaymentController(service: ServicoDePagamento): PaymentCont
         // 200 no replay; o status do desfecho quando houve efeito novo.
         const status = resultado.replay === true ? 200 : STATUS_POR_DESFECHO[resultado.tipo];
         if (status === 503) res.setHeader('Retry-After', '2');
+        if (resultado.tipo === 'divergencia') {
+          // Os numeros vao para o LOG, nao para o corpo: quem precisa deles e o
+          // operador, e corpo de 5xx nao carrega estado interno.
+          console.error('[payment-service] divergencia de reembolso', {
+            paymentId,
+            capturadoCents: resultado.capturadoCents,
+            reembolsadoCents: resultado.reembolsadoCents,
+          });
+          res.status(status).json({
+            code: 'DIVERGENCIA_DE_REEMBOLSO',
+            error: 'Divergencia entre o provedor e a contabilidade local',
+          });
+          return;
+        }
         res.status(status).json(resultado);
       } catch (erro) {
         if (erro instanceof PaymentDomainError) {

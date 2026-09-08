@@ -5,6 +5,7 @@ import {
   ChargeNotFoundError,
   PaymentProviderError,
   ProviderInvalidRequestError,
+  RefundExceedsAvailableError,
   WebhookSignatureError,
   type ChargeResult,
   type CreateChargeInput,
@@ -461,7 +462,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
 
         await expect(
           provider.refund({ providerRef: ref, amountCents: 991, idempotencyKey: randomUUID() }),
-        ).rejects.toBeInstanceOf(ProviderInvalidRequestError);
+        ).rejects.toBeInstanceOf(RefundExceedsAvailableError);
       });
 
       it('IDEMPOTENCIA: mesma chave nao reembolsa duas vezes', async () => {

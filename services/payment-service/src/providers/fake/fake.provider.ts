@@ -6,6 +6,7 @@ import {
   ChargeNotFoundError,
   ProviderAuthenticationError,
   ProviderInvalidRequestError,
+  RefundExceedsAvailableError,
   ProviderUnavailableError,
   WebhookSignatureError,
   type CancelChargeInput,
@@ -317,7 +318,7 @@ export class FakeProvider implements PaymentProvider {
 
     const disponivel = cobranca.capturedAmountCents - cobranca.refundedAmountCents;
     if (input.amountCents > disponivel) {
-      throw new ProviderInvalidRequestError('valor do reembolso excede o disponivel');
+      throw new RefundExceedsAvailableError('valor do reembolso excede o disponivel');
     }
 
     cobranca.refundedAmountCents += input.amountCents;

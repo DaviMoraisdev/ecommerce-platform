@@ -22,6 +22,10 @@ export type CodigoDeErroDePagamento =
   | 'IDEMPOTENCIA_CONFLITANTE'
   /** O pedido nao existe OU nao pertence ao usuario — indistinguivel. */
   | 'PEDIDO_NAO_ENCONTRADO'
+  /** O pagamento nao existe. Distinto de PEDIDO_NAO_ENCONTRADO: aqui o alvo e
+   * o Payment, nao o Order, e a rota de reembolso e ADMIN — nao ha posse a
+   * proteger com resposta indistinguivel. */
+  | 'PAGAMENTO_NAO_ENCONTRADO'
   /** O pedido nao esta em estado que aceite cobranca. */
   | 'PEDIDO_NAO_COBRAVEL'
   /** Divergencia entre o total do pedido e a soma dos subtotais. */
