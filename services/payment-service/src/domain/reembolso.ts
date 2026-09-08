@@ -57,7 +57,7 @@ export async function aplicarTotalDeReembolso(
 }
 
 /** Desfechos possiveis de um reembolso INICIADO por nos (Bloco 7). */
-export type ResultadoDeReembolso =
+export type DesfechoDeReembolso =
   | { tipo: 'aplicado'; totalReembolsadoCents: number; providerRefundRef: string }
   /** Aceite assincrono: o total so se move quando o webhook confirmar. */
   | { tipo: 'pendente'; providerRefundRef: string }
@@ -77,3 +77,13 @@ export interface ReembolsarInput {
   paymentId: string;
   valorCents: number;
 }
+
+/**
+ * O desfecho, mais a marca de replay.
+ *
+ * `replay` distingue "houve efeito novo" de "esta e a resposta congelada da
+ * mesma chave" — o cliente decide sem interpretar o corpo, igual ao endpoint de
+ * criacao. Intersecao, e nao campo em cada variante, para a uniao continuar
+ * discriminada por `tipo`.
+ */
+export type ResultadoDeReembolso = DesfechoDeReembolso & { replay?: boolean };

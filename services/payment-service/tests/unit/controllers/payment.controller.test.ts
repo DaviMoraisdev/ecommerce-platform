@@ -12,25 +12,37 @@ import {
 } from '../../../src/domain/errors';
 import { criarPaymentRouter } from '../../../src/routes/payment.routes';
 import { pagamentoCriadoDeTeste } from '../../helpers/pagamento';
+import { exigirRole } from '../../../src/middlewares/role.middleware';
 
 const TOKEN_FALSO = 'Bearer token.de.teste';
 
 function montarApp(
   criarPagamento: jest.Mock,
-  opcoes: { autentica?: boolean } = {},
+  opcoes: { autentica?: boolean; role?: string; reembolsar?: jest.Mock } = {},
 ) {
   // Duble do middleware: popula userId como o real faria. Isola o controller —
   // uma falha aqui nunca vem de JWT malformado.
   const authMiddleware: RequestHandler = (req, _res, next) => {
-    if (opcoes.autentica !== false) req.userId = 'usr_1';
+    if (opcoes.autentica !== false) {
+      req.userId = 'usr_1';
+      // A claim `role` e OPCIONAL no token real: por padrao o dublê nao a
+      // popula, e o caminho sem role fica exercitado por construcao.
+      req.userRole = opcoes.role;
+    }
     next();
   };
 
-  const service: ServicoDePagamento = { criarPagamento };
+  const service: ServicoDePagamento = {
+    criarPagamento,
+    reembolsar: opcoes.reembolsar ?? jest.fn(),
+  };
 
   return createApp({
     payments: criarPaymentRouter({
       authMiddleware,
+      // O exigirRole REAL, nao um stub: assim a rota exercita a autorizacao
+      // de verdade em vez de uma imitacao dela.
+      exigirAdmin: exigirRole('ADMIN'),
       controller: criarPaymentController(service),
     }),
     // Este arquivo testa o controller de pagamento; o webhook nao participa.
@@ -227,5 +239,127 @@ describe('POST /payments — erro inesperado', () => {
     expect(resposta.text).not.toContain('ECONNREFUSED');
     expect(resposta.text).not.toContain('5432');
     spy.mockRestore();
+  });
+});
+
+
+describe('POST /payments/:id/refunds — autorizacao e mapeamento (Bloco 7)', () => {
+  function pedir(
+    app: ReturnType<typeof createApp>,
+    opcoes: { chave?: string | null; corpo?: unknown } = {},
+  ) {
+    let req = request(app).post('/payments/pay_1/refunds').set('Authorization', TOKEN_FALSO);
+    if (opcoes.chave !== null) req = req.set('Idempotency-Key', opcoes.chave ?? 'idem_r1');
+    return req.send(opcoes.corpo ?? { valorCents: 100 });
+  }
+
+  it('CASO A1: token SEM role e recusado, e o servico nao e chamado', async () => {
+    // A claim `role` e opcional no token: um token perfeitamente valido chega
+    // sem ela. Recusar tem de ser explicito, nao acidente da comparacao.
+    const reembolsar = jest.fn();
+    const res = await pedir(montarApp(jest.fn(), { reembolsar }));
+
+    expect(res.status).toBe(403);
+    expect(reembolsar).not.toHaveBeenCalled();
+  });
+
+  it('CASO A2: role diferente de ADMIN e recusada', async () => {
+    const reembolsar = jest.fn();
+    const res = await pedir(montarApp(jest.fn(), { role: 'USER', reembolsar }));
+
+    expect(res.status).toBe(403);
+    expect(reembolsar).not.toHaveBeenCalled();
+  });
+
+  it('CASO A3: o 403 NAO revela qual role era exigida', async () => {
+    // O TECH_DEBT registra esse vazamento como divida nos outros servicos; o
+    // endpoint novo nasce sem ele.
+    const res = await pedir(montarApp(jest.fn(), { role: 'USER', reembolsar: jest.fn() }));
+
+    const corpo = JSON.stringify(res.body);
+    expect(corpo).not.toContain('ADMIN');
+    expect(corpo).not.toContain('USER');
+  });
+
+  it('CASO A4: ADMIN passa e o servico recebe a requisicao montada', async () => {
+    const reembolsar = jest.fn(async () => ({
+      tipo: 'aplicado' as const,
+      totalReembolsadoCents: 100,
+      providerRefundRef: 're_1',
+    }));
+
+    const res = await pedir(montarApp(jest.fn(), { role: 'ADMIN', reembolsar }));
+
+    expect(res.status).toBe(201);
+    expect(reembolsar).toHaveBeenCalledWith({
+      userId: 'usr_1',
+      idempotencyKey: 'idem_r1',
+      paymentId: 'pay_1',
+      valorCents: 100,
+    });
+  });
+
+  it('CASO A5: aceite ASSINCRONO responde 202, nao 201', async () => {
+    // O dinheiro ainda nao voltou. O cliente precisa saber que o desfecho ainda
+    // vai mudar, sem interpretar o corpo.
+    const reembolsar = jest.fn(async () => ({ tipo: 'pendente' as const, providerRefundRef: 're_1' }));
+    const res = await pedir(montarApp(jest.fn(), { role: 'ADMIN', reembolsar }));
+
+    expect(res.status).toBe(202);
+  });
+
+  it('CASO A6: replay responde 200, mesmo com desfecho de efeito novo', async () => {
+    const reembolsar = jest.fn(async () => ({
+      tipo: 'aplicado' as const,
+      totalReembolsadoCents: 100,
+      providerRefundRef: 're_1',
+      replay: true,
+    }));
+
+    const res = await pedir(montarApp(jest.fn(), { role: 'ADMIN', reembolsar }));
+
+    expect(res.status).toBe(200);
+  });
+
+  it('CASO A7: estouro do capturado e 409, com os numeros no corpo', async () => {
+    const reembolsar = jest.fn(async () => ({
+      tipo: 'excede-o-capturado' as const,
+      capturadoCents: 1000,
+      reembolsadoCents: 900,
+    }));
+
+    const res = await pedir(montarApp(jest.fn(), { role: 'ADMIN', reembolsar }));
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ capturadoCents: 1000, reembolsadoCents: 900 });
+  });
+
+  it('CASO A8: contencao e 503 RETENTAVEL, com Retry-After', async () => {
+    // Dinheiro movido no provedor e contabilidade pendente: repetir e a acao
+    // certa, e o cliente precisa saber disso pelo cabecalho.
+    const reembolsar = jest.fn(async () => ({ tipo: 'contencao' as const }));
+    const res = await pedir(montarApp(jest.fn(), { role: 'ADMIN', reembolsar }));
+
+    expect(res.status).toBe(503);
+    expect(res.headers['retry-after']).toBe('2');
+  });
+
+  it.each([[{}], [{ valorCents: 0 }], [{ valorCents: -1 }], [{ valorCents: 1.5 }], [{ valorCents: '100' }]])(
+    'CASO A9: corpo %p e 400 sem chegar ao servico',
+    async (corpo) => {
+      const reembolsar = jest.fn();
+      const res = await pedir(montarApp(jest.fn(), { role: 'ADMIN', reembolsar }), { corpo });
+
+      expect(res.status).toBe(400);
+      expect(reembolsar).not.toHaveBeenCalled();
+    },
+  );
+
+  it('CASO A10: sem Idempotency-Key e 400 — reembolso sem chave e reembolso duplo', async () => {
+    const reembolsar = jest.fn();
+    const res = await pedir(montarApp(jest.fn(), { role: 'ADMIN', reembolsar }), { chave: null });
+
+    expect(res.status).toBe(400);
+    expect(reembolsar).not.toHaveBeenCalled();
   });
 });

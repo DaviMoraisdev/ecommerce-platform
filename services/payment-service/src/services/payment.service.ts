@@ -1000,7 +1000,7 @@ export class PaymentService {
       );
     }
 
-    return congelada;
+    return { ...congelada, replay: true };
   }
 
   /** Lista FECHADA, usada nas duas direcoes. Mesma disciplina do paraCongelar. */
