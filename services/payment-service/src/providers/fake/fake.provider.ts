@@ -88,6 +88,7 @@ export interface ConstruirWebhookInput {
   state?: string;
   capturedAmountCents?: number;
   refundedAmountCents?: number;
+  refundRef?: string | null;
   declineCode?: string | null;
 
   timestampSegundos?: number;
@@ -448,6 +449,9 @@ export class FakeProvider implements PaymentProvider {
         state: (input.state ?? padrao.state) as ChargeState,
         captured_amount_cents: input.capturedAmountCents ?? padrao.capturado,
         refunded_amount_cents: input.refundedAmountCents ?? padrao.reembolsado,
+        refund_ref:
+          input.refundRef ??
+          (input.eventType === 'refund.succeeded' ? `re_fake_${++this.contador}` : null),
         decline_code: input.declineCode === undefined ? padrao.declineCode : input.declineCode,
       },
     };

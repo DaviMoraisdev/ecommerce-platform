@@ -240,6 +240,7 @@ export type WebhookEventPayload =
     })
   | (WebhookEventBase & {
       eventType: 'refund.succeeded';
+      providerRefundRef: string;
       providerRef: ProviderRef;
       state: 'SUCCEEDED';
       capturedAmountCents: number;

@@ -98,6 +98,10 @@ function corpo(
   raiz: Record<string, unknown> = {},
   dados: Record<string, unknown> = {},
 ): Record<string, unknown> {
+  // O type efetivo vem de `raiz`, espalhado DEPOIS do default — entao ele
+  // precisa ser lido ANTES para o corpo sair coerente quando o caso pede
+  // refund.succeeded. Mesmo defaulting que construirWebhook faz no fake.
+  const tipo = typeof raiz.type === 'string' ? raiz.type : 'payment.succeeded';
   return {
     id: `evt_${randomUUID()}`,
     type: 'payment.succeeded',
@@ -108,6 +112,7 @@ function corpo(
       state: 'SUCCEEDED',
       captured_amount_cents: VALOR,
       refunded_amount_cents: 0,
+      refund_ref: tipo === 'refund.succeeded' ? `re_${randomUUID()}` : null,
       decline_code: null,
       ...dados,
     },
@@ -395,6 +400,33 @@ describe('webhook — trilha de transacao do CANCELED', () => {
 // 14. Reembolso: quinta variante da uniao, nao pode virar silencio
 // ==========================================================
 describe('webhook — refund.succeeded', () => {
+  // CASO 14b: o helper corpo() passou a suprir refund_ref, entao nenhum outro
+  // caso demonstra que o campo e EXIGIDO — mecanismo sem teste e mecanismo que
+  // a proxima refatoracao apaga em silencio. Este caso e copia do CASO 14 com
+  // UMA unica variavel diferente: refund_ref nulo. Se o 14 da 200 e este da
+  // 400, a diferenca so pode vir do campo.
+  it('CASO 14b: refund.succeeded SEM refund_ref e recusado pelo wire', async () => {
+    const { app, provider } = montarApp();
+    const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { capturedAmountCents: VALOR },
+    });
+
+    const res = await postar(
+      app,
+      provider.assinarCorpo(
+        corpo(
+          { type: 'refund.succeeded' },
+          { charge_ref: chargeRef, refunded_amount_cents: 5000, refund_ref: null },
+        ),
+      ),
+    );
+
+    // A recusa acontece no wire, ANTES do inbox e antes de qualquer efeito.
+    expect(res.status).toBe(400);
+  });
+
   it('CASO 14: reembolso move refundedAmountCents e NAO muda o status', async () => {
     const { app, provider } = montarApp();
     const { payment, chargeRef } = await cenario(PaymentStatus.CAPTURED);
