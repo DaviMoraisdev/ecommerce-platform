@@ -855,7 +855,7 @@ export class WebhookService {
           paymentId: idDoPagamento,
           base: baseDoCas,
           total: evento.refundedAmountCents,
-          providerRef: evento.providerRef,
+          providerRef: evento.providerRefundRef,
         });
         if (!aplicouOValor) return false;
         // Mesma assimetria deliberada do caminho de captura: so se chega aqui

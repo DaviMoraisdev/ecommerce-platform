@@ -902,28 +902,43 @@ export class PaymentService {
         providerRefundRef: resultado.providerRefundRef,
       };
 
-      const aplicado = await this.deps.prisma.$transaction(async (tx) => {
-        const moveu = await aplicarTotalDeReembolso(tx, {
-          paymentId,
-          base: payment.refundedAmountCents,
-          total: alvo,
-          providerRef: resultado.providerRefundRef,
-        });
-        if (!moveu) return false;
-
-        // Resposta congelada na MESMA transacao do efeito (invariante do 6a).
-        // Fora dela existiria o instante em que o dinheiro voltou e a chave
-        // ainda esta PROCESSING — e um retry receberia EM_ANDAMENTO para sempre.
-        await tx.idempotencyRecord.update({
-          where: { id: registroId },
-          data: {
-            status: 'COMPLETED',
+      let aplicado: boolean;
+      try {
+        aplicado = await this.deps.prisma.$transaction(async (tx) => {
+          const moveu = await aplicarTotalDeReembolso(tx, {
             paymentId,
-            completedResponse: this.paraCongelarReembolso(paymentId, desfecho),
-          },
+            base: payment.refundedAmountCents,
+            total: alvo,
+            providerRef: resultado.providerRefundRef,
+          });
+          if (!moveu) return false;
+
+          // Resposta congelada na MESMA transacao do efeito (invariante do 6a).
+          // Fora dela existiria o instante em que o dinheiro voltou e a chave
+          // ainda esta PROCESSING — e um retry receberia EM_ANDAMENTO para sempre.
+          await tx.idempotencyRecord.update({
+            where: { id: registroId },
+            data: {
+              status: 'COMPLETED',
+              paymentId,
+              completedResponse: this.paraCongelarReembolso(paymentId, desfecho),
+            },
+          });
+          return true;
         });
-        return true;
-      });
+      } catch (erro) {
+        // A transacao aborta INTEIRA na colisao — inclusive o updateMany que
+        // somaria de novo. Isso e o comportamento desejado, nao efeito colateral:
+        // o Postgres desfaz tudo e sobra a verdade escrita pelo webhook. Aqui so
+        // falta interpretar e contar ao cliente.
+        const convergido = await this.convergirEstornoJaContabilizado(erro, {
+          paymentId,
+          registroId,
+          providerRefundRef: resultado.providerRefundRef,
+        });
+        if (convergido === null) throw erro;
+        return convergido;
+      }
 
       if (aplicado) return desfecho;
 
@@ -933,6 +948,58 @@ export class PaymentService {
     // Dinheiro movido no provedor, contabilidade nao aplicada. Desfecho proprio,
     // nao sucesso e nao recusa — o webhook do reembolso conserta o total.
     return { tipo: 'contencao' };
+  }
+
+  /**
+   * Converge quando o webhook DESTE estorno venceu a corrida (achado 4.2).
+   *
+   * O provedor devolveu sucesso, o webhook do MESMO estorno chegou primeiro e
+   * ja moveu o total. Nossa transacao colidiu no indice unico parcial e abortou
+   * inteira. Nao ha nada a corrigir no dinheiro: ele voltou uma vez e a
+   * contabilidade registra uma vez. Falta concluir a chave e responder.
+   *
+   * NAO confio na forma do `meta.target`: o indice foi criado em SQL cru e o
+   * Prisma nao o conhece pelo schema. Confirmo por CONSULTA que a linha existe.
+   * Se nao existir, a colisao e outra e o erro sobe — em vez de virar sucesso
+   * silencioso quando alguem acrescentar outra escrita unica a esta transacao.
+   */
+  private async convergirEstornoJaContabilizado(
+    erro: unknown,
+    ctx: { paymentId: string; registroId: string; providerRefundRef: string },
+  ): Promise<ResultadoDeReembolso | null> {
+    if (!(erro instanceof Prisma.PrismaClientKnownRequestError) || erro.code !== 'P2002') {
+      return null;
+    }
+    const linha = await this.deps.prisma.paymentTransaction.findFirst({
+      where: {
+        paymentId: ctx.paymentId,
+        type: TransactionType.REFUND,
+        status: TransactionStatus.SUCCEEDED,
+        providerRef: ctx.providerRefundRef,
+      },
+    });
+    if (linha === null) return null;
+
+    const payment = await this.deps.prisma.payment.findUniqueOrThrow({
+      where: { id: ctx.paymentId },
+    });
+    const desfecho: ResultadoDeReembolso = {
+      tipo: 'aplicado',
+      totalReembolsadoCents: payment.refundedAmountCents,
+      providerRefundRef: ctx.providerRefundRef,
+    };
+    // A transacao original morreu, entao a chave e concluida sozinha aqui. Nao
+    // ha efeito financeiro a acompanhar: ele ja esta no banco, escrito pelo
+    // webhook, e a consulta acima acabou de comprova-lo.
+    await this.deps.prisma.idempotencyRecord.update({
+      where: { id: ctx.registroId },
+      data: {
+        status: 'COMPLETED',
+        paymentId: ctx.paymentId,
+        completedResponse: this.paraCongelarReembolso(ctx.paymentId, desfecho),
+      },
+    });
+    return desfecho;
   }
 
   /** Trilha + conclusao da chave para reembolso que NAO moveu o total. */

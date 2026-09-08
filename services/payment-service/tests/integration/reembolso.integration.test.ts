@@ -6,6 +6,7 @@ import { FakeProvider } from '../../src/providers/fake/fake.provider';
 import { FAKE_TOKENS } from '../../src/providers/fake/fake.tokens';
 import type { PaymentProvider } from '../../src/providers/payment-provider.port';
 import { PaymentService } from '../../src/services/payment.service';
+import { WebhookService } from '../../src/services/webhook.service';
 import { assertTestDatabase } from '../helpers/testDbGuard';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { orderClientFalso, pedidoDeTeste } from '../helpers/prisma-fake';
@@ -27,6 +28,7 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
+  await prisma.webhookEvent.deleteMany();
   await prisma.outboxEvent.deleteMany();
   await prisma.idempotencyRecord.deleteMany();
   await prisma.paymentTransaction.deleteMany();
@@ -259,5 +261,67 @@ describe('reembolsar', () => {
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.refundedAmountCents).toBe(100);
     expect(await linhasDeReembolso(payment.id)).toHaveLength(1);
+  });
+
+  // CASO R11: a corrida do achado 4.2 do review, invertida DE PROPOSITO.
+  //
+  // O webhook do MESMO estorno e entregue ANTES de a transacao do endpoint
+  // abrir. O endpoint perde o CAS, recarrega um total que JA inclui o proprio
+  // estorno e, sem o indice unico parcial, somaria de novo — contabilidade
+  // dobrada, em silencio, no caminho feliz.
+  //
+  // Deterministico por construcao: o Proxy entrega o webhook DENTRO da chamada
+  // ao provedor, nao por timer. Sem isso a ordem dependeria de sorte.
+  it('CASO R11: webhook do MESMO estorno vence o CAS e o endpoint NAO soma de novo', async () => {
+    const webhook = new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 });
+    const real = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+
+    const provedor = new Proxy(real, {
+      get(alvo, prop, receiver) {
+        if (prop !== 'refund') {
+          const valor = Reflect.get(alvo, prop, receiver);
+          return typeof valor === 'function' ? valor.bind(alvo) : valor;
+        }
+        return async (entrada: Parameters<PaymentProvider['refund']>[0]) => {
+          const resultado = await alvo.refund(entrada);
+          // Sem override de valores: os defaults do fake leem a cobranca, que o
+          // refund() acima ja atualizou. Corpo coerente sem repetir aritmetica.
+          //
+          // providerEventId EXPLICITO: o default e `evt_fake_<contador>` e o
+          // contador reinicia a cada instancia do fake. Uma colisao no unique do
+          // inbox faria o processar() devolver DUPLICATA sem aplicar nada, e o
+          // caso passaria com o webhook nunca tendo tocado no banco.
+          const requisicao = alvo.construirWebhook({
+            providerRef: entrada.providerRef,
+            eventType: 'refund.succeeded',
+            refundRef: resultado.providerRefundRef,
+            providerEventId: `evt_${randomUUID()}`,
+          });
+          await webhook.processar('fake', alvo.verifyWebhook(requisicao));
+          return resultado;
+        };
+      },
+    }) as PaymentProvider;
+
+    const ctx = cenario(FAKE_TOKENS.SUCCESS, provedor);
+    await ctx.service.criarPagamento(ctx.input);
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId: ctx.orderId } });
+    expect(payment.status).toBe(PaymentStatus.CAPTURED);
+
+    // Um TERCO do capturado: o dobro ainda cabe, entao a contabilizacao dupla
+    // NAO seria barrada por `excede-o-capturado`. Sem essa folga o caso passaria
+    // pelo motivo errado.
+    const valor = Math.floor(payment.capturedAmountCents / 3);
+
+    const r = await ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, payment.id, valor));
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(valor);
+
+    const sucedidas = (await linhasDeReembolso(payment.id)).filter(
+      (l) => l.status === TransactionStatus.SUCCEEDED,
+    );
+    expect(sucedidas).toHaveLength(1);
+    expect(r).toMatchObject({ tipo: 'aplicado', totalReembolsadoCents: valor });
   });
 });
