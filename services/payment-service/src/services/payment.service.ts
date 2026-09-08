@@ -34,6 +34,7 @@ import { enqueue } from '../events/outbox.repository';
 import { montarEventoDeCaptura, montarEventoDeExpiracao } from '../events/payment.events';
 import { aplicarTotalDeReembolso, type ResultadoDeReembolso } from '../domain/reembolso';
 import type { ProviderRef } from '../providers/payment-provider.port';
+import type { IdempotencyRecord } from '@prisma/client';
 
 export interface PaymentServiceDeps {
   prisma: PrismaClient;
@@ -196,13 +197,38 @@ export class PaymentService {
   private async reivindicarChave(
     input: CriarPagamentoInput,
   ): Promise<{ registroId: string } | { replay: PagamentoCriado }> {
+    return this.reivindicar(
+      input.userId,
+      input.idempotencyKey,
+      this.fingerprintDaRequisicao(input),
+      (existente) => this.replayDePagamento(existente),
+    );
+  }
+
+  /**
+   * Claim-first GENERICO (Bloco 7).
+   *
+   * Generalizado quando o reembolso passou a precisar de idempotencia. O que
+   * varia entre operacoes e o FINGERPRINT e a reconstrucao do replay; todo o
+   * resto — create, colisao no @@unique, fingerprint divergente, FAILED,
+   * EM_ANDAMENTO — e identico e NAO pode divergir. Uma segunda copia deste
+   * mecanismo ao lado do primeiro significaria cobranca (ou reembolso) duplo
+   * quando as duas versoes discordassem, e o compilador nao ve essa divergencia.
+   *
+   * A ORDEM das checagens e preservada byte a byte: o fingerprint vem ANTES dos
+   * ramos de status porque vale para qualquer um deles (achado 4.4 do review do
+   * 6a), e trocar a ordem entre CONFLITANTE e EM_ANDAMENTO mudaria o status HTTP
+   * devolvido a quem reenvia.
+   */
+  private async reivindicar<T>(
+    userId: string,
+    chave: string,
+    fingerprint: string,
+    aoCompletar: (existente: IdempotencyRecord) => Promise<T>,
+  ): Promise<{ registroId: string } | { replay: T }> {
     try {
       const registro = await this.deps.prisma.idempotencyRecord.create({
-        data: {
-          userId: input.userId,
-          key: input.idempotencyKey,
-          requestFingerprint: this.fingerprintDaRequisicao(input),
-        },
+        data: { userId, key: chave, requestFingerprint: fingerprint },
       });
       return { registroId: registro.id };
     } catch (erro) {
@@ -211,7 +237,7 @@ export class PaymentService {
 
     // Colidiu no @@unique([userId, key]): alguem ja reivindicou esta chave.
     const existente = await this.deps.prisma.idempotencyRecord.findUnique({
-      where: { userId_key: { userId: input.userId, key: input.idempotencyKey } },
+      where: { userId_key: { userId, key: chave } },
     });
 
     if (!existente) {
@@ -224,11 +250,10 @@ export class PaymentService {
     }
 
     // Achado 4.4 do review: a chave so pode ser reusada para a MESMA requisicao.
-    // Sem esta comparacao, reutilizar a chave com outro orderId devolvia
-    // silenciosamente o pagamento anterior — o cliente recebia 200 e o pagamento
-    // do pedido errado. Vem ANTES dos ramos de status porque vale para qualquer
-    // um deles.
-    if (existente.requestFingerprint !== this.fingerprintDaRequisicao(input)) {
+    // Sem esta comparacao, reutilizar a chave com outro alvo devolvia
+    // silenciosamente o resultado anterior. Vem ANTES dos ramos de status porque
+    // vale para qualquer um deles.
+    if (existente.requestFingerprint !== fingerprint) {
       throw erroDeDominio(
         'IDEMPOTENCIA_CONFLITANTE',
         'Esta Idempotency-Key ja foi usada com outra requisicao; use uma nova chave',
@@ -236,48 +261,7 @@ export class PaymentService {
     }
 
     if (existente.status === 'COMPLETED') {
-      // Caminho normal: devolve o que foi congelado quando a chave finalizou.
-      if (existente.completedResponse !== null) {
-        const congelada = this.lerCongelada(existente.completedResponse);
-        if (congelada !== null) return { replay: { ...congelada, replay: true } };
-
-        // Snapshot PRESENTE mas corrompido: falha explicita, sem consultar o
-        // Payment vivo. Eu tinha escolhido degradar aqui, para nao impedir o
-        // cliente de descobrir o desfecho — argumento fraco, apontado no review:
-        // a resposta degradada pode estar ERRADA sobre dinheiro (o Payment vivo
-        // e justamente a fonte do defeito que este bloco corrige), e ela sairia
-        // sem nenhuma marca de degradacao. Errar alto e melhor que errar
-        // plausivelmente. O fallback para o vivo fica restrito ao legado de
-        // verdade, com completedResponse === null.
-        console.error(
-          '[payment-service] resposta congelada com forma invalida: ' + existente.id,
-        );
-        throw erroDeDominio(
-          'DEPENDENCIA_INDISPONIVEL',
-          'Registro de idempotencia com resposta armazenada invalida',
-        );
-      }
-
-      // Linha anterior a esta migration: nao ha resposta congelada. Reconstroi
-      // do Payment VIVO — comportamento antigo, com o defeito antigo (pode
-      // devolver o desfecho de outra tentativa no mesmo pedido). Declarado e
-      // logado, nunca silencioso. Some quando o backfill rodar e o
-      // VALIDATE CONSTRAINT fechar a restricao.
-      console.warn(
-        '[payment-service] replay de registro legado sem resposta congelada: ' + existente.id,
-      );
-      // O CHECK idempotency_completed_exige_pagamento garante paymentId nao nulo.
-      const payment = await this.deps.prisma.payment.findUnique({
-        where: { id: existente.paymentId as string },
-        include: { transactions: { orderBy: { createdAt: 'desc' }, take: 1 } },
-      });
-      if (!payment) {
-        throw erroDeDominio(
-          'DEPENDENCIA_INDISPONIVEL',
-          'Registro de idempotencia aponta para pagamento inexistente',
-        );
-      }
-      return { replay: this.comoResposta(payment, payment.transactions[0]?.failureCode, true) };
+      return { replay: await aoCompletar(existente) };
     }
 
     if (existente.status === 'FAILED') {
@@ -292,6 +276,58 @@ export class PaymentService {
       'Outra requisicao com esta Idempotency-Key esta em andamento',
       true,
     );
+  }
+
+  /**
+   * Ramo COMPLETED do PAGAMENTO. Fica aqui, e nao no claim generico, por causa
+   * do RAMO LEGADO: linhas anteriores a migration do 6a nao tem resposta
+   * congelada. Reembolso nao tem legado — nunca existiu antes — entao arrastar
+   * este caminho para la criaria reconstrucao a partir do estado VIVO para uma
+   * operacao que nunca precisou dela.
+   */
+  private async replayDePagamento(existente: IdempotencyRecord): Promise<PagamentoCriado> {
+    // Caminho normal: devolve o que foi congelado quando a chave finalizou.
+    if (existente.completedResponse !== null) {
+      const congelada = this.lerCongelada(existente.completedResponse);
+      if (congelada !== null) return { ...congelada, replay: true };
+
+      // Snapshot PRESENTE mas corrompido: falha explicita, sem consultar o
+      // Payment vivo. Eu tinha escolhido degradar aqui, para nao impedir o
+      // cliente de descobrir o desfecho — argumento fraco, apontado no review:
+      // a resposta degradada pode estar ERRADA sobre dinheiro (o Payment vivo
+      // e justamente a fonte do defeito que este bloco corrige), e ela sairia
+      // sem nenhuma marca de degradacao. Errar alto e melhor que errar
+      // plausivelmente. O fallback para o vivo fica restrito ao legado de
+      // verdade, com completedResponse === null.
+      console.error(
+        '[payment-service] resposta congelada com forma invalida: ' + existente.id,
+      );
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Registro de idempotencia com resposta armazenada invalida',
+      );
+    }
+
+    // Linha anterior a esta migration: nao ha resposta congelada. Reconstroi
+    // do Payment VIVO — comportamento antigo, com o defeito antigo (pode
+    // devolver o desfecho de outra tentativa no mesmo pedido). Declarado e
+    // logado, nunca silencioso. Some quando o backfill rodar e o
+    // VALIDATE CONSTRAINT fechar a restricao.
+    console.warn(
+      '[payment-service] replay de registro legado sem resposta congelada: ' + existente.id,
+    );
+    // O CHECK idempotency_completed_exige_pagamento garante paymentId nao nulo.
+    const payment = await this.deps.prisma.payment.findUnique({
+      where: { id: existente.paymentId as string },
+      include: { transactions: { orderBy: { createdAt: 'desc' }, take: 1 } },
+    });
+    if (!payment) {
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Registro de idempotencia aponta para pagamento inexistente',
+      );
+    }
+    return this.comoResposta(payment, payment.transactions[0]?.failureCode, true);
   }
 
   // ==========================================================
