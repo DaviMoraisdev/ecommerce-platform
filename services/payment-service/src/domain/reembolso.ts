@@ -69,3 +69,11 @@ export type ResultadoDeReembolso =
   | { tipo: 'divergencia'; capturadoCents: number; reembolsadoCents: number }
   /** CAS perdido acima do teto. Dinheiro movido, total pendente de reconciliacao. */
   | { tipo: 'contencao' };
+
+/** Entrada do reembolso idempotente (Bloco 7). */
+export interface ReembolsarInput {
+  userId: string;
+  idempotencyKey: string;
+  paymentId: string;
+  valorCents: number;
+}

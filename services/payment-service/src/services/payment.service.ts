@@ -32,7 +32,11 @@ import {
 } from '../providers/payment-provider.port';
 import { enqueue } from '../events/outbox.repository';
 import { montarEventoDeCaptura, montarEventoDeExpiracao } from '../events/payment.events';
-import { aplicarTotalDeReembolso, type ResultadoDeReembolso } from '../domain/reembolso';
+import {
+  aplicarTotalDeReembolso,
+  type ReembolsarInput,
+  type ResultadoDeReembolso,
+} from '../domain/reembolso';
 import type { ProviderRef } from '../providers/payment-provider.port';
 import type { IdempotencyRecord } from '@prisma/client';
 
@@ -721,11 +725,68 @@ export class PaymentService {
    * que entrou antes. Recarrega e refaz a decisao — mesma licao do achado 4.1
    * do review do Bloco 4.
    */
-  async reembolsar(
-    paymentId: string,
-    valorCents: number,
-    chaveDoProvedor: string,
+  /**
+   * Reembolso IDEMPOTENTE, total ou parcial (Bloco 7).
+   *
+   * Reusa o claim-first do 6a: dois pedidos com a mesma Idempotency-Key colidem
+   * no @@unique ANTES de o dinheiro se mover. Sem isto, um retry de rede vira
+   * reembolso duplo — o pior desfecho possivel desta operacao.
+   *
+   * O FINGERPRINT inclui o VALOR: reusar a chave pedindo outro montante e
+   * IDEMPOTENCIA_CONFLITANTE, nao replay silencioso do reembolso anterior.
+   * Mesmo achado 4.4 que o 6a corrigiu para o orderId.
+   */
+  async reembolsar(input: ReembolsarInput): Promise<ResultadoDeReembolso> {
+    const reivindicacao = await this.reivindicar(
+      input.userId,
+      input.idempotencyKey,
+      this.fingerprintDoReembolso(input),
+      (existente) => this.replayDeReembolso(existente),
+    );
+    if ('replay' in reivindicacao) return reivindicacao.replay;
+
+    const registroId = reivindicacao.registroId;
+
+    let resultado: ResultadoDeReembolso;
+    try {
+      resultado = await this.executarReembolso(input, registroId);
+    } catch (erro) {
+      await this.marcarChaveFalhada(registroId);
+      throw erro;
+    }
+
+    // So `aplicado`, `pendente` e `recusado` CONCLUEM a chave — e eles a
+    // concluem DENTRO da transacao do efeito, nao aqui. Os demais desfechos
+    // marcam FAILED: repetir num replay a resposta de um `excede-o-capturado`
+    // ou de uma `contencao` seria mentir sobre o saldo, porque o estado que os
+    // causou pode ter mudado. Chave nova para tentar de novo.
+    if (resultado.tipo !== 'aplicado' && resultado.tipo !== 'pendente' && resultado.tipo !== 'recusado') {
+      await this.marcarChaveFalhada(registroId);
+    }
+
+    return resultado;
+  }
+
+  /**
+   * Miolo do reembolso, ja com a chave reivindicada.
+   *
+   * O PROVEDOR E CHAMADO PRIMEIRO, e fora do laco. Reservar localmente antes
+   * obrigaria a DESFAZER quando ele recusa, e desfazer e outro CAS que tambem
+   * pode perder — troca um problema por dois. Chamar primeiro funciona porque o
+   * provedor e o ponto de serializacao real do DINHEIRO: ele tem o proprio
+   * invariante e recusa reembolsar acima do capturado. Nosso CAS protege a
+   * CONTABILIDADE; o provedor protege o dinheiro.
+   *
+   * Perder o CAS NAO e recusa: pode ser um reembolso concorrente de valor menor
+   * que entrou antes. Recarrega e refaz a decisao — licao do achado 4.1 do
+   * review do Bloco 4.
+   */
+  private async executarReembolso(
+    input: ReembolsarInput,
+    registroId: string,
   ): Promise<ResultadoDeReembolso> {
+    const { paymentId, valorCents } = input;
+
     if (!Number.isSafeInteger(valorCents) || valorCents <= 0) {
       return { tipo: 'valor-invalido' };
     }
@@ -761,11 +822,15 @@ export class PaymentService {
       throw erroDeDominio('DEPENDENCIA_INDISPONIVEL', 'Captura sem providerRef para reembolsar');
     }
 
+    // Chave DERIVADA do registro de idempotencia: estavel entre retentativas da
+    // MESMA requisicao e distinta entre reembolsos diferentes. Prefixo proprio
+    // porque, com provedor real, a chave e global por conta (licao do 6e).
+    const chaveDoProvedor = `refund:${registroId}`;
+
     // O provedor tambem enforça `soma dos reembolsos <= capturado`, e RECUSA
     // lancando. Essa recusa nao e falha tecnica: e o ponto de serializacao do
-    // DINHEIRO fazendo o trabalho dele — tipicamente quando um reembolso
+    // dinheiro fazendo o trabalho dele — tipicamente quando um reembolso
     // concorrente consumiu o saldo entre a nossa pre-checagem e esta chamada.
-    // Tratada como erro generico, viraria 500 no lugar de recusa de dominio.
     let resultado;
     try {
       resultado = await this.deps.provider.refund({
@@ -787,27 +852,33 @@ export class PaymentService {
     }
 
     if (resultado.state === 'DECLINED') {
+      const desfecho: ResultadoDeReembolso = {
+        tipo: 'recusado',
+        declineCode: resultado.declineCode,
+      };
       await this.registrarTentativaDeReembolso(
-        paymentId,
-        valorCents,
+        { registroId, paymentId, valorCents, desfecho },
         TransactionStatus.FAILED,
         resultado.providerRefundRef,
         resultado.declineCode,
       );
-      return { tipo: 'recusado', declineCode: resultado.declineCode };
+      return desfecho;
     }
 
     if (resultado.state === 'PROCESSING') {
       // NAO move o total: o dinheiro ainda nao voltou. Quem confirma e o
-      // `refund.succeeded`, que carrega o total acumulado — aplicar aqui e la
+      // `refund.succeeded`, que carrega o total ACUMULADO — aplicar aqui e la
       // somaria duas vezes.
+      const desfecho: ResultadoDeReembolso = {
+        tipo: 'pendente',
+        providerRefundRef: resultado.providerRefundRef,
+      };
       await this.registrarTentativaDeReembolso(
-        paymentId,
-        valorCents,
+        { registroId, paymentId, valorCents, desfecho },
         TransactionStatus.PENDING,
         resultado.providerRefundRef,
       );
-      return { tipo: 'pendente', providerRefundRef: resultado.providerRefundRef };
+      return desfecho;
     }
 
     let payment = inicial;
@@ -825,22 +896,36 @@ export class PaymentService {
         };
       }
 
-      const aplicado = await this.deps.prisma.$transaction((tx) =>
-        aplicarTotalDeReembolso(tx, {
+      const desfecho: ResultadoDeReembolso = {
+        tipo: 'aplicado',
+        totalReembolsadoCents: alvo,
+        providerRefundRef: resultado.providerRefundRef,
+      };
+
+      const aplicado = await this.deps.prisma.$transaction(async (tx) => {
+        const moveu = await aplicarTotalDeReembolso(tx, {
           paymentId,
           base: payment.refundedAmountCents,
           total: alvo,
           providerRef: resultado.providerRefundRef,
-        }),
-      );
+        });
+        if (!moveu) return false;
 
-      if (aplicado) {
-        return {
-          tipo: 'aplicado',
-          totalReembolsadoCents: alvo,
-          providerRefundRef: resultado.providerRefundRef,
-        };
-      }
+        // Resposta congelada na MESMA transacao do efeito (invariante do 6a).
+        // Fora dela existiria o instante em que o dinheiro voltou e a chave
+        // ainda esta PROCESSING — e um retry receberia EM_ANDAMENTO para sempre.
+        await tx.idempotencyRecord.update({
+          where: { id: registroId },
+          data: {
+            status: 'COMPLETED',
+            paymentId,
+            completedResponse: this.paraCongelarReembolso(paymentId, desfecho),
+          },
+        });
+        return true;
+      });
+
+      if (aplicado) return desfecho;
 
       payment = await this.deps.prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
     }
@@ -850,25 +935,116 @@ export class PaymentService {
     return { tipo: 'contencao' };
   }
 
-  /** Linha de trilha para reembolso que NAO moveu o total (recusado ou pendente). */
+  /** Trilha + conclusao da chave para reembolso que NAO moveu o total. */
   private async registrarTentativaDeReembolso(
-    paymentId: string,
-    valorCents: number,
+    ctx: {
+      registroId: string;
+      paymentId: string;
+      valorCents: number;
+      desfecho: ResultadoDeReembolso;
+    },
     status: TransactionStatus,
     providerRef: string,
     failureCode?: string,
   ): Promise<void> {
-    await this.deps.prisma.paymentTransaction.create({
-      data: {
-        paymentId,
-        type: TransactionType.REFUND,
-        status,
-        amountCents: valorCents,
-        providerRef,
-        failureCode,
-      },
+    await this.deps.prisma.$transaction(async (tx) => {
+      await tx.paymentTransaction.create({
+        data: {
+          paymentId: ctx.paymentId,
+          type: TransactionType.REFUND,
+          status,
+          amountCents: ctx.valorCents,
+          providerRef,
+          failureCode,
+        },
+      });
+
+      await tx.idempotencyRecord.update({
+        where: { id: ctx.registroId },
+        data: {
+          status: 'COMPLETED',
+          paymentId: ctx.paymentId,
+          completedResponse: this.paraCongelarReembolso(ctx.paymentId, ctx.desfecho),
+        },
+      });
     });
   }
+
+  private fingerprintDoReembolso(input: ReembolsarInput): string {
+    // O VALOR entra: mesma chave com outro montante e requisicao DIFERENTE.
+    return createHash('sha256')
+      .update(`refund:v1:${input.paymentId}:${input.valorCents}`)
+      .digest('hex');
+  }
+
+  /**
+   * Ramo COMPLETED do REEMBOLSO. Sem fallback para o estado vivo: reembolso nao
+   * tem legado, e reconstruir o total de agora devolveria uma resposta
+   * DIFERENTE para a mesma chave se outro reembolso tiver entrado no meio — que
+   * e exatamente o que idempotencia impede.
+   */
+  private async replayDeReembolso(existente: IdempotencyRecord): Promise<ResultadoDeReembolso> {
+    if (existente.completedResponse === null) {
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Registro de reembolso concluido sem resposta armazenada',
+      );
+    }
+
+    const congelada = this.lerCongeladaDeReembolso(existente.completedResponse);
+    if (congelada === null) {
+      console.error('[payment-service] resposta de reembolso com forma invalida: ' + existente.id);
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Registro de idempotencia com resposta armazenada invalida',
+      );
+    }
+
+    return congelada;
+  }
+
+  /** Lista FECHADA, usada nas duas direcoes. Mesma disciplina do paraCongelar. */
+  private paraCongelarReembolso(
+    paymentId: string,
+    desfecho: ResultadoDeReembolso,
+  ): Prisma.InputJsonObject {
+    const corpo: Record<string, unknown> = { tipo: desfecho.tipo, paymentId };
+    if (desfecho.tipo === 'aplicado') {
+      corpo.totalReembolsadoCents = desfecho.totalReembolsadoCents;
+      corpo.providerRefundRef = desfecho.providerRefundRef;
+    }
+    if (desfecho.tipo === 'pendente') corpo.providerRefundRef = desfecho.providerRefundRef;
+    if (desfecho.tipo === 'recusado') corpo.declineCode = desfecho.declineCode;
+    return corpo as Prisma.InputJsonObject;
+  }
+
+  private lerCongeladaDeReembolso(valor: Prisma.JsonValue): ResultadoDeReembolso | null {
+    if (typeof valor !== 'object' || valor === null || Array.isArray(valor)) return null;
+    const o = valor as Record<string, unknown>;
+
+    if (o.tipo === 'aplicado') {
+      if (typeof o.totalReembolsadoCents !== 'number') return null;
+      if (typeof o.providerRefundRef !== 'string') return null;
+      return {
+        tipo: 'aplicado',
+        totalReembolsadoCents: o.totalReembolsadoCents,
+        providerRefundRef: o.providerRefundRef,
+      };
+    }
+
+    if (o.tipo === 'pendente') {
+      if (typeof o.providerRefundRef !== 'string') return null;
+      return { tipo: 'pendente', providerRefundRef: o.providerRefundRef };
+    }
+
+    if (o.tipo === 'recusado') {
+      if (typeof o.declineCode !== 'string') return null;
+      return { tipo: 'recusado', declineCode: o.declineCode };
+    }
+
+    return null;
+  }
+
 
 
   async expirarTentativa(transactionId: string, providerRef: string): Promise<boolean> {

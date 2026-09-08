@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { PaymentStatus, TransactionStatus, TransactionType, type PrismaClient } from '@prisma/client';
 import { connectDatabase, disconnectDatabase } from '../../src/config/database';
+import { PaymentDomainError } from '../../src/domain/errors';
 import { FakeProvider } from '../../src/providers/fake/fake.provider';
 import { FAKE_TOKENS } from '../../src/providers/fake/fake.tokens';
 import type { PaymentProvider } from '../../src/providers/payment-provider.port';
@@ -12,9 +13,10 @@ import { orderClientFalso, pedidoDeTeste } from '../helpers/prisma-fake';
 /**
  * Reembolso INICIADO por nos (Bloco 7).
  *
- * O invariante do bloco e `soma dos reembolsos <= capturado`, e ele tem DUAS
- * barreiras: o provedor (que serializa o dinheiro) e o nosso CAS (que serializa
- * a contabilidade). Os casos abaixo exercitam as duas, contra Postgres real.
+ * O invariante e `soma dos reembolsos <= capturado`, com DUAS barreiras: o
+ * provedor (serializa o DINHEIRO) e o nosso CAS (serializa a CONTABILIDADE).
+ * A terceira defesa e a idempotencia: sem ela, um retry de rede vira reembolso
+ * duplo.
  */
 
 let prisma: PrismaClient;
@@ -50,6 +52,7 @@ function cenario(token: string, provider?: PaymentProvider) {
 
   return {
     service,
+    userId,
     orderId,
     input: {
       userId,
@@ -74,6 +77,10 @@ async function pagamentoCapturado() {
   return { ...ctx, payment };
 }
 
+function pedidoDeReembolso(userId: string, paymentId: string, valorCents: number) {
+  return { userId, idempotencyKey: randomUUID(), paymentId, valorCents };
+}
+
 async function linhasDeReembolso(paymentId: string) {
   return prisma.paymentTransaction.findMany({
     where: { paymentId, type: TransactionType.REFUND },
@@ -83,10 +90,10 @@ async function linhasDeReembolso(paymentId: string) {
 
 describe('reembolsar', () => {
   it('CASO R1: reembolso PARCIAL move o total e registra a movimentacao', async () => {
-    const { service, payment } = await pagamentoCapturado();
+    const { service, userId, payment } = await pagamentoCapturado();
     const metade = Math.floor(payment.capturedAmountCents / 2);
 
-    const r = await service.reembolsar(payment.id, metade, `refund:${randomUUID()}`);
+    const r = await service.reembolsar(pedidoDeReembolso(userId, payment.id, metade));
     expect(r).toMatchObject({ tipo: 'aplicado', totalReembolsadoCents: metade });
 
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
@@ -102,27 +109,22 @@ describe('reembolsar', () => {
   });
 
   it('CASO R2: reembolsos parciais SEQUENCIAIS somam ate o capturado', async () => {
-    const { service, payment } = await pagamentoCapturado();
-    const total = payment.capturedAmountCents;
-    const parte = Math.floor(total / 3);
+    const { service, userId, payment } = await pagamentoCapturado();
+    const parte = Math.floor(payment.capturedAmountCents / 3);
 
-    await service.reembolsar(payment.id, parte, `refund:${randomUUID()}`);
-    await service.reembolsar(payment.id, parte, `refund:${randomUUID()}`);
+    await service.reembolsar(pedidoDeReembolso(userId, payment.id, parte));
+    await service.reembolsar(pedidoDeReembolso(userId, payment.id, parte));
 
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.refundedAmountCents).toBe(parte * 2);
-
-    const linhas = await linhasDeReembolso(payment.id);
-    expect(linhas.map((x) => x.amountCents)).toEqual([parte, parte]);
+    expect((await linhasDeReembolso(payment.id)).map((x) => x.amountCents)).toEqual([parte, parte]);
   });
 
   it('CASO R3: valor acima do disponivel e recusado ANTES de mover dinheiro', async () => {
-    const { service, payment } = await pagamentoCapturado();
+    const { service, userId, payment } = await pagamentoCapturado();
 
     const r = await service.reembolsar(
-      payment.id,
-      payment.capturedAmountCents + 1,
-      `refund:${randomUUID()}`,
+      pedidoDeReembolso(userId, payment.id, payment.capturedAmountCents + 1),
     );
 
     expect(r).toMatchObject({ tipo: 'excede-o-capturado' });
@@ -132,22 +134,22 @@ describe('reembolsar', () => {
   });
 
   it('CASO R4: pagamento que NAO esta CAPTURED nao pode ser reembolsado', async () => {
-    const { service, payment } = await pagamentoCapturado();
+    const { service, userId, payment } = await pagamentoCapturado();
     await prisma.payment.update({
       where: { id: payment.id },
       data: { status: PaymentStatus.FAILED },
     });
 
-    const r = await service.reembolsar(payment.id, 100, `refund:${randomUUID()}`);
-
-    expect(r).toMatchObject({ tipo: 'estado-invalido' });
+    expect(await service.reembolsar(pedidoDeReembolso(userId, payment.id, 100))).toMatchObject({
+      tipo: 'estado-invalido',
+    });
     expect(await linhasDeReembolso(payment.id)).toHaveLength(0);
   });
 
   it.each([0, -1, 1.5])('CASO R5: valor %p e recusado sem tocar em nada', async (valor) => {
-    const { service, payment } = await pagamentoCapturado();
+    const { service, userId, payment } = await pagamentoCapturado();
 
-    expect(await service.reembolsar(payment.id, valor, `refund:${randomUUID()}`)).toEqual({
+    expect(await service.reembolsar(pedidoDeReembolso(userId, payment.id, valor))).toEqual({
       tipo: 'valor-invalido',
     });
     expect(await linhasDeReembolso(payment.id)).toHaveLength(0);
@@ -157,16 +159,15 @@ describe('reembolsar', () => {
     // O caso central do bloco. Cada um pede 60% do capturado: somados excedem.
     // Os dois passam na pre-checagem (leem refunded = 0) e so o PROVEDOR, que e
     // o ponto de serializacao do dinheiro, separa os dois.
-    const { service, payment } = await pagamentoCapturado();
+    const { service, userId, payment } = await pagamentoCapturado();
     const parte = Math.ceil(payment.capturedAmountCents * 0.6);
 
     const [a, b] = await Promise.all([
-      service.reembolsar(payment.id, parte, `refund:${randomUUID()}`),
-      service.reembolsar(payment.id, parte, `refund:${randomUUID()}`),
+      service.reembolsar(pedidoDeReembolso(userId, payment.id, parte)),
+      service.reembolsar(pedidoDeReembolso(userId, payment.id, parte)),
     ]);
 
-    const tipos = [a.tipo, b.tipo].sort();
-    expect(tipos).toEqual(['aplicado', 'excede-o-capturado']);
+    expect([a.tipo, b.tipo].sort()).toEqual(['aplicado', 'excede-o-capturado']);
 
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.refundedAmountCents).toBe(parte);
@@ -175,8 +176,6 @@ describe('reembolsar', () => {
   });
 
   it('CASO R7: aceite ASSINCRONO nao move o total — quem confirma e o webhook', async () => {
-    // O provedor pode aceitar e confirmar depois. Aplicar o delta aqui E no
-    // webhook somaria duas vezes: o evento carrega o total ACUMULADO.
     const { payment } = await pagamentoCapturado();
     const provider = {
       refund: jest.fn(async () => ({
@@ -185,12 +184,9 @@ describe('reembolsar', () => {
         amountCents: 100,
       })),
     } as unknown as PaymentProvider;
+    const ctx = cenario(FAKE_TOKENS.SUCCESS, provider);
 
-    const r = await cenario(FAKE_TOKENS.SUCCESS, provider).service.reembolsar(
-      payment.id,
-      100,
-      `refund:${randomUUID()}`,
-    );
+    const r = await ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, payment.id, 100));
 
     expect(r).toMatchObject({ tipo: 'pendente' });
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
@@ -211,20 +207,53 @@ describe('reembolsar', () => {
         declineCode: 'refund_window_closed',
       })),
     } as unknown as PaymentProvider;
+    const ctx = cenario(FAKE_TOKENS.SUCCESS, provider);
 
-    const r = await cenario(FAKE_TOKENS.SUCCESS, provider).service.reembolsar(
-      payment.id,
-      100,
-      `refund:${randomUUID()}`,
-    );
+    const r = await ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, payment.id, 100));
 
     expect(r).toMatchObject({ tipo: 'recusado', declineCode: 'refund_window_closed' });
-    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
-    expect(atual.refundedAmountCents).toBe(0);
+    expect(
+      (await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } })).refundedAmountCents,
+    ).toBe(0);
 
     const linhas = await linhasDeReembolso(payment.id);
     expect(linhas).toHaveLength(1);
     expect(linhas[0].status).toBe(TransactionStatus.FAILED);
     expect(linhas[0].failureCode).toBe('refund_window_closed');
+  });
+
+  it('CASO R9: a MESMA chave devolve a resposta congelada, sem segundo reembolso', async () => {
+    // Sem isto, um retry de rede vira reembolso duplo — o pior desfecho possivel
+    // desta operacao.
+    const { service, userId, payment } = await pagamentoCapturado();
+    const metade = Math.floor(payment.capturedAmountCents / 2);
+    const pedido = pedidoDeReembolso(userId, payment.id, metade);
+
+    const primeira = await service.reembolsar(pedido);
+    const segunda = await service.reembolsar(pedido);
+
+    expect(segunda).toEqual(primeira);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(metade);
+    expect(await linhasDeReembolso(payment.id)).toHaveLength(1);
+  });
+
+  it('CASO R10: mesma chave com OUTRO valor e conflito, nao replay', async () => {
+    // Mesmo achado 4.4 que o 6a corrigiu para o orderId: sem o valor no
+    // fingerprint, reusar a chave pedindo outro montante devolveria em silencio
+    // o reembolso anterior, e o operador acharia que reembolsou o novo valor.
+    const { service, userId, payment } = await pagamentoCapturado();
+    const pedido = pedidoDeReembolso(userId, payment.id, 100);
+
+    await service.reembolsar(pedido);
+
+    await expect(service.reembolsar({ ...pedido, valorCents: 200 })).rejects.toBeInstanceOf(
+      PaymentDomainError,
+    );
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(100);
+    expect(await linhasDeReembolso(payment.id)).toHaveLength(1);
   });
 });
