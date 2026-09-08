@@ -324,4 +324,68 @@ describe('reembolsar', () => {
     expect(sucedidas).toHaveLength(1);
     expect(r).toMatchObject({ tipo: 'aplicado', totalReembolsadoCents: valor });
   });
+
+  // R12 e R13 cobrem o achado 3.1: a resposta do provedor era aceita sem
+  // validacao. Sem estes casos, sabotar o fail-closed passaria VAZIO — o
+  // mecanismo existiria sem prova nenhuma.
+  it('CASO R12: valor devolvido diferente do pedido falha alto e nao contabiliza', async () => {
+    const real = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const provedor = new Proxy(real, {
+      get(alvo, prop, receiver) {
+        if (prop !== 'refund') {
+          const valor = Reflect.get(alvo, prop, receiver);
+          return typeof valor === 'function' ? valor.bind(alvo) : valor;
+        }
+        return async (entrada: Parameters<PaymentProvider['refund']>[0]) => {
+          const resultado = await alvo.refund(entrada);
+          // O provedor afirma ter devolvido MENOS do que pedimos.
+          return { ...resultado, amountCents: entrada.amountCents - 1 };
+        };
+      },
+    }) as PaymentProvider;
+
+    const ctx = cenario(FAKE_TOKENS.SUCCESS, provedor);
+    await ctx.service.criarPagamento(ctx.input);
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId: ctx.orderId } });
+    const valor = Math.floor(payment.capturedAmountCents / 3);
+
+    await expect(
+      ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, payment.id, valor)),
+    ).rejects.toBeInstanceOf(PaymentDomainError);
+
+    // Nada contabilizado: registrar um numero que o dinheiro nao seguiu e pior
+    // que falhar alto e deixar a divergencia visivel.
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(0);
+  });
+
+  it('CASO R13: estado desconhecido do provedor nao e tratado como sucesso', async () => {
+    const real = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const provedor = new Proxy(real, {
+      get(alvo, prop, receiver) {
+        if (prop !== 'refund') {
+          const valor = Reflect.get(alvo, prop, receiver);
+          return typeof valor === 'function' ? valor.bind(alvo) : valor;
+        }
+        return async (entrada: Parameters<PaymentProvider['refund']>[0]) => {
+          const resultado = await alvo.refund(entrada);
+          // Estado fora do contrato: o tipo promete que nao acontece, mas o tipo
+          // e promessa de compilacao e o adaptador real fala com a rede.
+          return { ...resultado, state: 'ESTRANHO' } as unknown as typeof resultado;
+        };
+      },
+    }) as PaymentProvider;
+
+    const ctx = cenario(FAKE_TOKENS.SUCCESS, provedor);
+    await ctx.service.criarPagamento(ctx.input);
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId: ctx.orderId } });
+    const valor = Math.floor(payment.capturedAmountCents / 3);
+
+    await expect(
+      ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, payment.id, valor)),
+    ).rejects.toBeInstanceOf(PaymentDomainError);
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(0);
+  });
 });
