@@ -388,4 +388,64 @@ describe('reembolsar', () => {
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.refundedAmountCents).toBe(0);
   });
+
+  // R14/R15: a MESMA corrida do R11, em regimes onde o dobro do valor NAO
+  // cabe no capturado. O R11 usa um terco, e so nesse regime a convergencia
+  // por P2002 e alcancada: com valor acima de metade o CAS perde, o alvo
+  // recalculado estoura o capturado e o endpoint devolve `divergencia` para um
+  // estorno que DEU CERTO. Achado 4.1 da 2a rodada de review do PR #62.
+  it.each([
+    ['60% do capturado', 0.6],
+    ['o total capturado', 1],
+  ])('CASO R14/R15: webhook vence num reembolso de %s e o endpoint converge', async (_r, fracao) => {
+    const webhook = new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 });
+    const real = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+
+    const provedor = new Proxy(real, {
+      get(alvo, prop, receiver) {
+        if (prop !== 'refund') {
+          const valor = Reflect.get(alvo, prop, receiver);
+          return typeof valor === 'function' ? valor.bind(alvo) : valor;
+        }
+        return async (entrada: Parameters<PaymentProvider['refund']>[0]) => {
+          const resultado = await alvo.refund(entrada);
+          const requisicao = alvo.construirWebhook({
+            providerRef: entrada.providerRef,
+            eventType: 'refund.succeeded',
+            refundRef: resultado.providerRefundRef,
+            providerEventId: `evt_${randomUUID()}`,
+          });
+          await webhook.processar('fake', alvo.verifyWebhook(requisicao));
+          return resultado;
+        };
+      },
+    }) as PaymentProvider;
+
+    const ctx = cenario(FAKE_TOKENS.SUCCESS, provedor);
+    await ctx.service.criarPagamento(ctx.input);
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId: ctx.orderId } });
+    const valor = Math.floor(payment.capturedAmountCents * fracao);
+
+    const r = await ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, payment.id, valor));
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(valor);
+    const sucedidas = (await linhasDeReembolso(payment.id)).filter(
+      (l) => l.status === TransactionStatus.SUCCEEDED,
+    );
+    expect(sucedidas).toHaveLength(1);
+    expect(r).toMatchObject({ tipo: 'aplicado', totalReembolsadoCents: valor });
+  });
+
+  // R16: o registro de idempotencia tem FK para Payment (onDelete: Restrict).
+  // Gravar o paymentId no CLAIM — mudanca feita para atender o achado 4.1 —
+  // faz um id inexistente estourar violacao de FK antes de a checagem de
+  // existencia rodar, e o 404 fica inalcancavel. Achado 4.4 do revisor.
+  it('CASO R16: pagamento inexistente e erro de dominio, nao falha de FK', async () => {
+    const ctx = cenario(FAKE_TOKENS.SUCCESS);
+
+    await expect(
+      ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, randomUUID(), 100)),
+    ).rejects.toMatchObject({ code: 'PAGAMENTO_NAO_ENCONTRADO' });
+  });
 });

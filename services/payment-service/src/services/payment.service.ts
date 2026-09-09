@@ -739,6 +739,22 @@ export class PaymentService {
    * Mesmo achado 4.4 que o 6a corrigiu para o orderId.
    */
   async reembolsar(input: ReembolsarInput): Promise<ResultadoDeReembolso> {
+    // Existencia ANTES do claim (achado 4.4 da 2a rodada). O IdempotencyRecord
+    // tem FK para Payment (onDelete: Restrict), entao reivindicar com um id
+    // inexistente estoura violacao de FK — P2003, nao P2002 — no create, o erro
+    // sobe cru e o 404 fica INALCANCAVEL. Regressao introduzida ao gravar o
+    // paymentId no claim para atender o achado 4.1: consertei um achado
+    // quebrando outro, na mesma rodada.
+    //
+    // Checagem sem efeito colateral, entao nao fere o claim-first: nao ha o que
+    // ser idempotente a respeito de um pagamento que nao existe.
+    const existe = await this.deps.prisma.payment.findUnique({
+      where: { id: input.paymentId },
+      select: { id: true },
+    });
+    if (existe === null) {
+      throw erroDeDominio('PAGAMENTO_NAO_ENCONTRADO', 'Pagamento nao encontrado');
+    }
     const reivindicacao = await this.reivindicar(
       input.userId,
       input.idempotencyKey,
@@ -861,6 +877,44 @@ export class PaymentService {
       };
     }
 
+    // VALIDACAO DA RESPOSTA, antes de QUALQUER ramo (achado 3.1, 2a rodada).
+    //
+    // Antes isto vivia depois dos ramos DECLINED e PROCESSING, que ja tinham
+    // persistido. O PROCESSING gravava uma tentativa com o valor que NOS
+    // pedimos, sem nunca comparar com o que o provedor disse ter aceitado; e a
+    // referencia nunca era checada. Referencia vazia ou repetida colide no
+    // indice unico parcial e faria a convergencia atribuir a linha de OUTRO
+    // estorno a este pedido — pior que falhar.
+    const estadoDoProvedor: string = resultado.state;
+    if (
+      estadoDoProvedor !== 'SUCCEEDED' &&
+      estadoDoProvedor !== 'PROCESSING' &&
+      estadoDoProvedor !== 'DECLINED'
+    ) {
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Estado de reembolso desconhecido no provedor',
+      );
+    }
+    if (
+      typeof resultado.providerRefundRef !== 'string' ||
+      resultado.providerRefundRef.trim() === ''
+    ) {
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Provedor devolveu referencia de estorno vazia',
+      );
+    }
+    // O provedor e a fonte da verdade sobre QUANTO se moveu. Contabilizar o
+    // valor pedido quando ele devolveu outro registra um numero que o dinheiro
+    // nao seguiu.
+    if (!Number.isSafeInteger(resultado.amountCents) || resultado.amountCents !== valorCents) {
+      throw erroDeDominio(
+        'DEPENDENCIA_INDISPONIVEL',
+        'Valor reembolsado pelo provedor difere do solicitado',
+      );
+    }
+
     if (resultado.state === 'DECLINED') {
       const desfecho: ResultadoDeReembolso = {
         tipo: 'recusado',
@@ -889,28 +943,6 @@ export class PaymentService {
         resultado.providerRefundRef,
       );
       return desfecho;
-    }
-
-    // Fail-closed sobre o estado do provedor (achado 3.1). DECLINED e PROCESSING
-    // ja retornaram acima e o tipo promete que so sobra SUCCEEDED — mas isso e
-    // promessa de COMPILACAO. O adaptador real fala com a rede, e estado
-    // desconhecido tratado como sucesso move contabilidade sobre algo que nao
-    // entendemos. Mesma regra do 6c, onde `registrar` passou a listar os ABERTOS.
-    const estado: string = resultado.state;
-    if (estado !== 'SUCCEEDED') {
-      throw erroDeDominio(
-        'DEPENDENCIA_INDISPONIVEL',
-        'Estado de reembolso desconhecido no provedor',
-      );
-    }
-    // O provedor e a fonte da verdade sobre QUANTO voltou. Contabilizar o valor
-    // pedido quando ele devolveu outro registra um numero que o dinheiro nao
-    // seguiu. Falha alto: nao ha desfecho honesto a inventar aqui.
-    if (resultado.amountCents !== valorCents) {
-      throw erroDeDominio(
-        'DEPENDENCIA_INDISPONIVEL',
-        'Valor reembolsado pelo provedor difere do solicitado',
-      );
     }
 
     let payment = inicial;
@@ -963,7 +995,10 @@ export class PaymentService {
         // somaria de novo. Isso e o comportamento desejado, nao efeito colateral:
         // o Postgres desfaz tudo e sobra a verdade escrita pelo webhook. Aqui so
         // falta interpretar e contar ao cliente.
-        const convergido = await this.convergirEstornoJaContabilizado(erro, {
+        if (!(erro instanceof Prisma.PrismaClientKnownRequestError) || erro.code !== 'P2002') {
+          throw erro;
+        }
+        const convergido = await this.convergirEstornoJaContabilizado({
           paymentId,
           registroId,
           providerRefundRef: resultado.providerRefundRef,
@@ -973,6 +1008,19 @@ export class PaymentService {
       }
 
       if (aplicado) return desfecho;
+      // CAS perdido NAO prova obsolescencia — mas tambem NAO prova que quem
+      // venceu foi outro estorno. Pode ter sido o webhook DESTE, e a identidade
+      // e a unica forma de distinguir. Consultar ANTES de recarregar e redecidir:
+      // sem isto, um reembolso acima de metade do capturado recalcularia
+      // alvo = total_que_ja_o_inclui + valor, estouraria o capturado e devolveria
+      // `divergencia` para um estorno que DEU CERTO. Reembolso TOTAL cai sempre
+      // nesse ramo. Achado 4.1 da 2a rodada de review.
+      const jaAplicado = await this.convergirEstornoJaContabilizado({
+        paymentId,
+        registroId,
+        providerRefundRef: resultado.providerRefundRef,
+      });
+      if (jaAplicado !== null) return jaAplicado;
 
       payment = await this.deps.prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
     }
@@ -996,12 +1044,8 @@ export class PaymentService {
    * silencioso quando alguem acrescentar outra escrita unica a esta transacao.
    */
   private async convergirEstornoJaContabilizado(
-    erro: unknown,
     ctx: { paymentId: string; registroId: string; providerRefundRef: string },
   ): Promise<ResultadoDeReembolso | null> {
-    if (!(erro instanceof Prisma.PrismaClientKnownRequestError) || erro.code !== 'P2002') {
-      return null;
-    }
     const linha = await this.deps.prisma.paymentTransaction.findFirst({
       where: {
         paymentId: ctx.paymentId,
@@ -1127,7 +1171,7 @@ export class PaymentService {
       // Infinity, fracionario e negativo — e isto e dinheiro devolvido ao
       // cliente como resposta valida (achado 5.1).
       if (!Number.isSafeInteger(o.totalReembolsadoCents)) return null;
-      if (o.totalReembolsadoCents < 0) return null;
+      if (o.totalReembolsadoCents <= 0) return null;
       if (typeof o.providerRefundRef !== 'string' || o.providerRefundRef === '') return null;
       return {
         tipo: 'aplicado',
