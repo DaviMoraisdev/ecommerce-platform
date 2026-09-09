@@ -511,4 +511,39 @@ describe('reembolsar', () => {
     expect(atual.refundedAmountCents).toBe(0);
     expect(await linhasDeReembolso(payment.id)).toHaveLength(0);
   });
+
+  // R19 existe porque a sonda X11 da bateria passou VAZIA: o `<= 0` do achado
+  // 5.2 entrou sem prova. Um `aplicado` com total zero e impossivel — todo
+  // reembolso aplicado moveu valor positivo.
+  //
+  // O caso faz um reembolso REAL antes de corromper o congelado. Montar o
+  // registro a mao exigiria reproduzir a receita do fingerprint aqui, e um erro
+  // nela faria o caso passar por IDEMPOTENCIA_CONFLITANTE — verde pelo motivo
+  // errado, a mesma armadilha que o providerEventId explicito do R11 evita.
+  it('CASO R19: snapshot com total ZERO nao volta como aplicado no replay', async () => {
+    const log = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const { service, userId, payment } = await pagamentoCapturado();
+    const pedido = pedidoDeReembolso(userId, payment.id, 1000);
+
+    const primeira = await service.reembolsar(pedido);
+    expect(primeira).toMatchObject({ tipo: 'aplicado' });
+
+    const registro = await prisma.idempotencyRecord.findFirstOrThrow({
+      where: { userId, key: pedido.idempotencyKey },
+    });
+    await prisma.idempotencyRecord.update({
+      where: { id: registro.id },
+      data: {
+        completedResponse: {
+          ...(registro.completedResponse as Record<string, unknown>),
+          totalReembolsadoCents: 0,
+        },
+      },
+    });
+
+    await expect(service.reembolsar(pedido)).rejects.toMatchObject({
+      code: 'DEPENDENCIA_INDISPONIVEL',
+    });
+    log.mockRestore();
+  });
 });
