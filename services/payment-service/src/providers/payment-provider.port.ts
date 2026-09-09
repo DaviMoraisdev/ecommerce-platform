@@ -240,6 +240,7 @@ export type WebhookEventPayload =
     })
   | (WebhookEventBase & {
       eventType: 'refund.succeeded';
+      providerRefundRef: string;
       providerRef: ProviderRef;
       state: 'SUCCEEDED';
       capturedAmountCents: number;
@@ -317,6 +318,19 @@ export class ChargeNotFoundError extends PaymentProviderError {
  * deixa preso um pagamento que ja cobrou o cliente.
  */
 export class ChargeNotCancelableError extends PaymentProviderError {
+  readonly retryable = false;
+}
+
+/**
+ * O estorno pedido excede o saldo ainda reembolsavel da cobranca.
+ *
+ * NAO e requisicao malformada: a requisicao esta correta e o SALDO e que nao
+ * comporta — tipicamente porque um reembolso concorrente consumiu a diferenca
+ * entre a nossa pre-checagem e a chamada. Distinguir por TIPO, e nao por texto
+ * de mensagem, pelo mesmo motivo do ChargeNotCancelableError acima: o ramo que
+ * decide sobre DINHEIRO nao pode depender de string do provedor.
+ */
+export class RefundExceedsAvailableError extends PaymentProviderError {
   readonly retryable = false;
 }
 

@@ -6,6 +6,7 @@ import {
   ChargeNotFoundError,
   ProviderAuthenticationError,
   ProviderInvalidRequestError,
+  RefundExceedsAvailableError,
   ProviderUnavailableError,
   WebhookSignatureError,
   type CancelChargeInput,
@@ -88,6 +89,7 @@ export interface ConstruirWebhookInput {
   state?: string;
   capturedAmountCents?: number;
   refundedAmountCents?: number;
+  refundRef?: string | null;
   declineCode?: string | null;
 
   timestampSegundos?: number;
@@ -316,7 +318,7 @@ export class FakeProvider implements PaymentProvider {
 
     const disponivel = cobranca.capturedAmountCents - cobranca.refundedAmountCents;
     if (input.amountCents > disponivel) {
-      throw new ProviderInvalidRequestError('valor do reembolso excede o disponivel');
+      throw new RefundExceedsAvailableError('valor do reembolso excede o disponivel');
     }
 
     cobranca.refundedAmountCents += input.amountCents;
@@ -448,6 +450,9 @@ export class FakeProvider implements PaymentProvider {
         state: (input.state ?? padrao.state) as ChargeState,
         captured_amount_cents: input.capturedAmountCents ?? padrao.capturado,
         refunded_amount_cents: input.refundedAmountCents ?? padrao.reembolsado,
+        refund_ref:
+          input.refundRef ??
+          (input.eventType === 'refund.succeeded' ? `re_fake_${++this.contador}` : null),
         decline_code: input.declineCode === undefined ? padrao.declineCode : input.declineCode,
       },
     };

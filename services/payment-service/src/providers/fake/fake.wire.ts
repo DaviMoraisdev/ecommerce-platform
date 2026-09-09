@@ -54,6 +54,7 @@ export interface DadosDeCobranca {
   state: ChargeState;
   captured_amount_cents: number;
   refunded_amount_cents: number;
+  refund_ref: string | null;
   decline_code: string | null;
 }
 
@@ -158,6 +159,7 @@ function validarDadosDeCobranca(data: unknown): DadosDeCobranca {
     state: estado as ChargeState,
     captured_amount_cents: centavos(d.captured_amount_cents, 'data.captured_amount_cents'),
     refunded_amount_cents: centavos(d.refunded_amount_cents, 'data.refunded_amount_cents'),
+    refund_ref: identificadorOpcional(d.refund_ref, 'data.refund_ref'),
     decline_code: identificadorOpcional(d.decline_code, 'data.decline_code'),
   };
 }
@@ -240,12 +242,15 @@ export function traduzirEvento(envelope: EnvelopeDeEvento): WebhookEventPayload 
       exigir(reembolsado > 0, 'sem valor reembolsado');
       exigir(reembolsado <= capturado, 'reembolsado acima do capturado');
       exigir(dados.decline_code === null, 'nao deve trazer decline_code');
+      // invalido() retorna never: estreita string|null para string sem cast.
+      if (dados.refund_ref === null) invalido('sem referencia do estorno');
       return {
         ...comCobranca,
         eventType: 'refund.succeeded',
         state: 'SUCCEEDED',
         capturedAmountCents: capturado,
         refundedAmountCents: reembolsado,
+        providerRefundRef: dados.refund_ref,
       };
     }
   }

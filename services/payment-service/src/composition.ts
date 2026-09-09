@@ -11,6 +11,7 @@ import { criarPaymentRouter } from './routes/payment.routes';
 import { criarWebhookRouter } from './routes/webhook.routes';
 import { PaymentService } from './services/payment.service';
 import { WebhookService } from './services/webhook.service';
+import { exigirRole } from './middlewares/role.middleware';
 
 /**
  * Composition root: o unico lugar que conhece todas as pecas e as liga.
@@ -58,6 +59,8 @@ export function construirApp(config: AppConfig, nucleo?: NucleoDoServico): Expre
   const router = criarPaymentRouter({
     authMiddleware: criarAuthMiddleware(config.jwtSecret),
     controller: criarPaymentController(service),
+    exigirAdmin: exigirRole('ADMIN'),
+    reembolsoHabilitado: config.reembolsoHabilitado,
   });
 
   // O provider e o MESMO objeto usado para criar cobranca: verifyWebhook
