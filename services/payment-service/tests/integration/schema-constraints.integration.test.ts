@@ -480,3 +480,67 @@ describe('regras estruturais', () => {
     expect((erro as Prisma.PrismaClientKnownRequestError).code).toBe('P2003');
   });
 });
+
+
+/**
+ * Achado 5.1 da 2a rodada: o indice vive em SQL cru e o Prisma NAO o conhece
+ * pelo schema. Sem teste, uma migracao futura o remove e a convergencia
+ * financeira quebra sem um unico erro de compilacao.
+ *
+ * Prova pelo COMPORTAMENTO, nao lendo pg_indexes: o catalogo diria que o
+ * indice existe; so a escrita diz que ele MORDE, e que morde no escopo certo.
+ */
+describe('indice parcial de estorno bem-sucedido', () => {
+  async function pagamentoComRef(ref: string, status: string) {
+    const payment = await prisma.payment.create({ data: pagamentoValido() });
+    await prisma.paymentTransaction.create({
+      data: {
+        paymentId: payment.id,
+        type: 'REFUND',
+        status: status as never,
+        amountCents: 100,
+        providerRef: ref,
+      },
+    });
+    return payment;
+  }
+
+  it('recusa dois estornos SUCCEEDED com a mesma referencia', async () => {
+    const ref = `re_${randomUUID()}`;
+    const payment = await pagamentoComRef(ref, 'SUCCEEDED');
+
+    const erro = await capturarViolacao(() =>
+      prisma.paymentTransaction.create({
+        data: {
+          paymentId: payment.id,
+          type: 'REFUND',
+          status: 'SUCCEEDED',
+          amountCents: 100,
+          providerRef: ref,
+        },
+      }),
+    );
+    expect(erro.message).toContain(`providerRef`);
+  });
+
+  it('ACEITA PENDING e SUCCEEDED com a mesma referencia', async () => {
+    // Caminho legitimo do PROCESSING: a linha PENDING nasce com a referencia
+    // do estorno e o webhook confirma depois com a linha SUCCEEDED. Um indice
+    // restrito apenas a `type = REFUND` quebraria ISTO — e foi o predicado que
+    // eu quase escrevi.
+    const ref = `re_${randomUUID()}`;
+    const payment = await pagamentoComRef(ref, 'PENDING');
+
+    await expect(
+      prisma.paymentTransaction.create({
+        data: {
+          paymentId: payment.id,
+          type: 'REFUND',
+          status: 'SUCCEEDED',
+          amountCents: 100,
+          providerRef: ref,
+        },
+      }),
+    ).resolves.toBeDefined();
+  });
+});
