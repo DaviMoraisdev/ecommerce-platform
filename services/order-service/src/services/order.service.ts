@@ -308,7 +308,11 @@ async function compensar(orderId: string, erroOriginal: unknown): Promise<void> 
 }
 
 const MAX_REASON = 500;
-export const MOTIVO_LIBERACAO_PENDENTE = 'expiracao_release_pendente:';
+// Prefixo NEUTRO desde o Bloco 7b: dois fluxos gravam esta pendencia — a
+// expiracao da janela e o estorno integral. O valor anterior dizia
+// "expiracao", e um reembolso passaria a gravar pendencia rotulada com a
+// causa errada, para ser lida por quem faz triagem.
+export const MOTIVO_LIBERACAO_PENDENTE = 'liberacao_release_pendente:';
 
 /**
  * Registra um incidente na pendencia do pedido, DENTRO da transacao de quem chama.

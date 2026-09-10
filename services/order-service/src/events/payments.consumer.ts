@@ -1,6 +1,17 @@
 import { Prisma } from '@prisma/client';
-import { CapturaEvent, ExpiracaoEvent, parseCaptura, parseExpiracao } from './payment-events';
-import { BINDING_PAYMENT_CAPTURED, BINDING_PAYMENT_EXPIRED } from './payments.topology';
+import {
+  CapturaEvent,
+  ExpiracaoEvent,
+  ReembolsoEvent,
+  parseCaptura,
+  parseExpiracao,
+  parseReembolso,
+} from './payment-events';
+import {
+  BINDING_PAYMENT_CAPTURED,
+  BINDING_PAYMENT_EXPIRED,
+  BINDING_PAYMENT_REFUNDED,
+} from './payments.topology';
 import { sanitizarParaLog } from '../domain/texto-seguro';
 
 // Reexportado: os casos C importam daqui desde o Bloco 5b.
@@ -100,6 +111,14 @@ export interface ConsumerDeps {
   aplicar: (ev: CapturaEvent) => Promise<ResultadoAplicacao>;
   /** Bloco 6f. Separado de `aplicar` porque o EVENTO e outro, nao so o efeito. */
   aplicarExpiracao: (ev: ExpiracaoEvent) => Promise<ResultadoAplicacao>;
+  /**
+   * Bloco 7b. Terceiro EVENTO, terceiro efeito.
+   *
+   * Separado de `aplicar` e de `aplicarExpiracao` pela mesma razao: o que
+   * chega e outro contrato, nao a mesma coisa com outro nome. Injetado, entao
+   * o consumidor continua testavel sem banco.
+   */
+  aplicarReembolso: (ev: ReembolsoEvent) => Promise<ResultadoAplicacao>;
 }
 
 /**
@@ -130,6 +149,12 @@ function reconhecer(raw: string, routingKey: string, deps: ConsumerDeps): Reconh
     const ev = parseExpiracao(raw);
     if (ev === null) return { tipo: 'payload-invalido' };
     return { tipo: 'ok', eventId: ev.eventId, aplicar: () => deps.aplicarExpiracao(ev) };
+  }
+
+  if (routingKey === BINDING_PAYMENT_REFUNDED) {
+    const ev = parseReembolso(raw);
+    if (ev === null) return { tipo: 'payload-invalido' };
+    return { tipo: 'ok', eventId: ev.eventId, aplicar: () => deps.aplicarReembolso(ev) };
   }
 
   return { tipo: 'key-desconhecida' };

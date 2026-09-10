@@ -9,6 +9,7 @@ import {
 import {
   BINDING_PAYMENT_CAPTURED,
   BINDING_PAYMENT_EXPIRED,
+  BINDING_PAYMENT_REFUNDED,
 } from '../src/events/payments.topology';
 
 function corpo(over: Record<string, unknown> = {}): string {
@@ -24,14 +25,50 @@ function corpo(over: Record<string, unknown> = {}): string {
   });
 }
 
+function corpoReembolso(over: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    eventId: 'payment.refunded:re_1',
+    paymentId: 'pay_1',
+    orderId: 'ord_1',
+    providerRefundRef: 're_1',
+    capturedAmountCents: 10000,
+    refundedAmountCents: 4000,
+    refundAmountCents: 4000,
+    currency: 'BRL',
+    occurredAt: '2026-09-10T12:00:00.000Z',
+    ...over,
+  });
+}
+
 function deps(resultado: ResultadoAplicacao | Error) {
   const responder = jest.fn(async () => {
     if (resultado instanceof Error) throw resultado;
     return resultado;
   });
-  // Os DOIS handlers respondem igual: os casos C existentes provam a traducao
-  // de resultado em acao, que nao depende de qual evento chegou.
-  return { aplicar: responder, aplicarExpiracao: responder };
+  // Os TRES handlers respondem igual: os casos C existentes provam a traducao
+  // de resultado em acao, que nao depende de qual evento chegou. Quem prova o
+  // DESPACHO e o C35, com mocks distintos.
+  return { aplicar: responder, aplicarExpiracao: responder, aplicarReembolso: responder };
+}
+
+/**
+ * Mocks DISTINTOS por handler.
+ *
+ * A fabrica `deps` acima devolve o MESMO jest.fn para os tres: ela prova a
+ * traducao de resultado em acao, que nao depende de qual evento chegou. Ela
+ * NAO consegue provar despacho — um ramo que chamasse o handler errado
+ * passaria em todos aqueles casos.
+ *
+ * Estava dentro do describe do Bloco 6f e subiu para o modulo no 7b, quando o
+ * terceiro evento precisou da mesma coisa. Escondida la, ela ja tinha me
+ * levado a escrever uma terceira copia sem perceber.
+ */
+function depsSeparadas() {
+  return {
+    aplicar: jest.fn(async (): Promise<ResultadoAplicacao> => ({ tipo: 'aplicado' })),
+    aplicarExpiracao: jest.fn(async (): Promise<ResultadoAplicacao> => ({ tipo: 'aplicado' })),
+    aplicarReembolso: jest.fn(async (): Promise<ResultadoAplicacao> => ({ tipo: 'aplicado' })),
+  };
 }
 
 // O contador de tentativas e estado de modulo compartilhado entre os casos.
@@ -267,7 +304,7 @@ describe('decidirEntrega — traducao de resultado em acao no broker', () => {
   it('CASO C8: routing key fora do binding vai para a DLQ', async () => {
     // O binding e estrito; chegar outra coisa e sinal de topologia adulterada.
     const d = deps({ tipo: 'aplicado' });
-    await expect(decidirEntrega(corpo(), 'payment.refunded', d)).resolves.toEqual(
+    await expect(decidirEntrega(corpo(), 'payment.chargeback', d)).resolves.toEqual(
       expect.objectContaining({ type: 'nack-dlq' }),
     );
     expect(d.aplicar).not.toHaveBeenCalled();
@@ -308,13 +345,6 @@ describe('decidirEntrega — despacho por routing key (Bloco 6f)', () => {
       occurredAt: '2026-09-04T12:00:00.000Z',
       ...over,
     });
-  }
-
-  function depsSeparadas() {
-    return {
-      aplicar: jest.fn(async (): Promise<ResultadoAplicacao> => ({ tipo: 'aplicado' })),
-      aplicarExpiracao: jest.fn(async (): Promise<ResultadoAplicacao> => ({ tipo: 'aplicado' })),
-    };
   }
 
   it('CASO C30: payment.expired vai para o handler de EXPIRACAO, nao o de captura', async () => {
@@ -360,7 +390,7 @@ describe('decidirEntrega — despacho por routing key (Bloco 6f)', () => {
     // inteiro, nao so para a captura.
     const d = depsSeparadas();
 
-    const acao = await decidirEntrega(corpoExpiracao(), 'payment.refunded', d);
+    const acao = await decidirEntrega(corpoExpiracao(), 'payment.chargeback', d);
 
     expect(acao.type).toBe('nack-dlq');
     expect(d.aplicar).not.toHaveBeenCalled();
@@ -368,3 +398,37 @@ describe('decidirEntrega — despacho por routing key (Bloco 6f)', () => {
   });
 });
 
+
+
+describe('decidirEntrega — payment.refunded (Bloco 7b)', () => {
+  it('CASO C35: o despacho por routing key nao cruza handlers', async () => {
+    // Mocks DISTINTOS de proposito: a fabrica `deps` devolve o MESMO jest.fn
+    // para os tres, o que prova traducao de resultado mas NAO prova despacho.
+    // Com o mock compartilhado, um ramo que chamasse o handler errado passaria.
+    const distintos = depsSeparadas();
+
+    await expect(
+      decidirEntrega(corpoReembolso(), BINDING_PAYMENT_REFUNDED, distintos),
+    ).resolves.toEqual(expect.objectContaining({ type: 'ack' }));
+
+    expect(distintos.aplicarReembolso).toHaveBeenCalledTimes(1);
+    expect(distintos.aplicar).not.toHaveBeenCalled();
+    expect(distintos.aplicarExpiracao).not.toHaveBeenCalled();
+  });
+
+  it('CASO C36: eventId amarrado ao PAGAMENTO em vez do estorno vai para a DLQ', async () => {
+    const d = deps({ tipo: 'aplicado' });
+
+    // Exatamente o que um produtor que copiou o padrao dos outros dois eventos
+    // produziria. Aceitar isso faria dois estornos parciais do mesmo pagamento
+    // compartilharem chave de idempotencia, e o segundo sumiria como duplicata.
+    await expect(
+      decidirEntrega(
+        corpoReembolso({ eventId: 'payment.refunded:pay_1' }),
+        BINDING_PAYMENT_REFUNDED,
+        d,
+      ),
+    ).resolves.toEqual(expect.objectContaining({ type: 'nack-dlq' }));
+    expect(d.aplicarReembolso).not.toHaveBeenCalled();
+  });
+});

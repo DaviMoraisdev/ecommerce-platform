@@ -11,7 +11,7 @@ export const EXCHANGE_PAGAMENTOS = 'payments';
 export const EXCHANGE_PAGAMENTOS_TYPE = 'topic';
 
 // Binding ESTRITO, nao "payment.*".
-// Com binding largo, um evento futuro (payment.refunded) chega aqui sem
+// Com binding largo, um evento ainda sem consumidor chega aqui sem
 // handler, e as duas saidas sao ruins: ack-e-ignora e perda silenciosa, DLQ
 // empilha operacao normal numa fila de erro. Com binding estrito o evento nao
 // roteia — e o publisher do payment tem mandatory + basic.return, entao ele
@@ -30,6 +30,21 @@ export const BINDING_PAYMENT_CAPTURED = 'payment.captured';
 // volume baixo de expiracao. Fila separada por tipo fica registrada como
 // gatilho, se aparecer poison message real.
 export const BINDING_PAYMENT_EXPIRED = 'payment.expired';
+
+// Bloco 7b. TERCEIRO binding na mesma fila, pelo mesmo argumento do segundo.
+//
+// O head-of-line blocking entre tipos cresce com cada binding somado a fila, e
+// este e o terceiro — o gatilho de "fila separada por tipo" fica mais perto.
+// Continua aceito porque o volume de reembolso e menor que o de expiracao, e
+// porque a alternativa hoje seria triplicar DLQ, classificacao de erro, teto de
+// tentativas e sanitizacao de log.
+//
+// A ROTA que produz este evento esta DESLIGADA no payment-service ate o fim
+// deste bloco (PAYMENT_REFUND_ENABLED). O binding entra ANTES de ela ligar, e
+// nao depois: o publisher usa mandatory + basic.return, entao evento publicado
+// sem binding volta como nao roteavel. Foi a licao do 6f, onde a expiracao
+// ficou desligada justamente por isso.
+export const BINDING_PAYMENT_REFUNDED = 'payment.refunded';
 
 export const QUEUE_PAGAMENTOS = 'orders.payments';
 export const DLX_PAGAMENTOS = 'orders.payments.dlx';
