@@ -22,7 +22,6 @@ function montarApp(
     autentica?: boolean;
     role?: string;
     reembolsar?: jest.Mock;
-    reembolsoHabilitado?: boolean;
   } = {},
 ) {
   // Duble do middleware: popula userId como o real faria. Isola o controller —
@@ -48,7 +47,6 @@ function montarApp(
       // O exigirRole REAL, nao um stub: assim a rota exercita a autorizacao
       // de verdade em vez de uma imitacao dela.
       exigirAdmin: exigirRole('ADMIN'),
-      reembolsoHabilitado: opcoes.reembolsoHabilitado ?? true,
       controller: criarPaymentController(service),
     }),
     // Este arquivo testa o controller de pagamento; o webhook nao participa.
@@ -408,20 +406,5 @@ describe('POST /payments/:id/refunds — autorizacao e mapeamento (Bloco 7)', ()
       expect.objectContaining({ capturadoCents: 10000, reembolsadoCents: 9000 }),
     );
     log.mockRestore();
-  });
-
-  it('CASO A13: com a flag desligada a rota nao existe e o servico nao e chamado', async () => {
-    const info = jest.spyOn(console, 'info').mockImplementation(() => {});
-    const reembolsar = jest.fn();
-
-    const res = await pedir(
-      montarApp(jest.fn(), { reembolsar, role: 'ADMIN', reembolsoHabilitado: false }),
-    );
-
-    // 404 e nao 503: com a flag off a funcionalidade NAO existe. 503 prometeria
-    // que ela volta sozinha, e quem a traz de volta e o Bloco 7b.
-    expect(res.status).toBe(404);
-    expect(reembolsar).not.toHaveBeenCalled();
-    info.mockRestore();
   });
 });
