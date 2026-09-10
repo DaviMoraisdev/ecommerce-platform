@@ -1,0 +1,11 @@
+{
+  "eventId": "payment.refunded:re_contrato",
+  "paymentId": "pay_contrato",
+  "orderId": "ord_contrato",
+  "providerRefundRef": "re_contrato",
+  "capturedAmountCents": 12990,
+  "refundedAmountCents": 5000,
+  "refundAmountCents": 3000,
+  "currency": "BRL",
+  "occurredAt": "2026-09-10T12:00:00.000Z"
+}

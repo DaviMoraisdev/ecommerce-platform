@@ -56,3 +56,27 @@ export const ROUTING_PAYMENT_EXPIRED = 'payment.expired';
 export function eventIdDeExpiracao(paymentId: string): string {
   return ROUTING_PAYMENT_EXPIRED + ':' + paymentId;
 }
+
+
+/**
+ * Bloco 7b. Publicado quando um estorno e CONTABILIZADO, no mesmo commit em
+ * que `refundedAmountCents` se move.
+ */
+export const ROUTING_PAYMENT_REFUNDED = 'payment.refunded';
+
+/**
+ * Derivado da referencia do ESTORNO, e NAO do pagamento — quebra deliberada
+ * do padrao das duas funcoes acima.
+ *
+ * Elas derivam do paymentId porque CAPTURED e EXPIRED sao terminais: ha no
+ * maximo um por pagamento. Reembolsos sao MUITOS por pagamento, entao derivar
+ * do paymentId faria o segundo estorno parcial colidir no @unique da outbox —
+ * e essa colisao hoje sobe sem tratamento (divida registrada no Bloco 9).
+ *
+ * `providerRefundRef` e unico por estorno por construcao, e desde o Bloco 7
+ * existe nos DOIS caminhos que aplicam reembolso. A mesma identidade que
+ * resolveu a contabilizacao dupla resolve a deduplicacao do evento.
+ */
+export function eventIdDeReembolso(providerRefundRef: string): string {
+  return ROUTING_PAYMENT_REFUNDED + ':' + providerRefundRef;
+}

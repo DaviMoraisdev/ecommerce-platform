@@ -846,13 +846,14 @@ export class WebhookService {
       }
 
       const baseDoCas = payment.refundedAmountCents;
+      const dadosDoPagamento = { id: payment.id, orderId: payment.orderId, currency: payment.currency, capturedAmountCents: payment.capturedAmountCents };
       const idDoPagamento = payment.id;
 
       const aplicado = await this.deps.prisma.$transaction(async (tx) => {
         // CAS sobre o VALOR, nao sobre o status: CAPTURED e terminal e nao muda
         // (decisao 9 da fase — reembolso e aritmetica, nao transicao).
         const aplicouOValor = await aplicarTotalDeReembolso(tx, {
-          paymentId: idDoPagamento,
+          payment: dadosDoPagamento,
           base: baseDoCas,
           total: evento.refundedAmountCents,
           providerRef: evento.providerRefundRef,

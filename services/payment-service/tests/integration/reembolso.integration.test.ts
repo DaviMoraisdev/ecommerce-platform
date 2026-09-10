@@ -546,4 +546,34 @@ describe('reembolsar', () => {
     });
     log.mockRestore();
   });
+
+  // R20: dois estornos parciais do MESMO pagamento. Com eventId derivado do
+  // paymentId, o segundo enqueue colidiria no @unique da outbox, a transacao
+  // do efeito abortaria junto e o reembolso falharia. Este caso e a prova de
+  // que a identidade escolhida (providerRefundRef) e a certa.
+  it('CASO R20: cada estorno gera SEU proprio evento na outbox', async () => {
+    const { service, userId, payment } = await pagamentoCapturado();
+    const parte = Math.floor(payment.capturedAmountCents / 4);
+
+    const a = await service.reembolsar(pedidoDeReembolso(userId, payment.id, parte));
+    const b = await service.reembolsar(pedidoDeReembolso(userId, payment.id, parte));
+    expect(a).toMatchObject({ tipo: 'aplicado' });
+    expect(b).toMatchObject({ tipo: 'aplicado' });
+
+    const eventos = await prisma.outboxEvent.findMany({
+      where: { routingKey: 'payment.refunded' },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(eventos).toHaveLength(2);
+    expect(new Set(eventos.map((e) => e.eventId)).size).toBe(2);
+
+    // Acumulado e delta sao numeros DIFERENTES, e o payload carrega os dois.
+    // Se o produtor confundisse um com o outro, o segundo evento diria que o
+    // pedido teve estornado `parte` no total, e nao `parte * 2`.
+    const payloads = eventos.map((e) => e.payload as unknown as Record<string, number>);
+    expect(payloads[0].refundAmountCents).toBe(parte);
+    expect(payloads[0].refundedAmountCents).toBe(parte);
+    expect(payloads[1].refundAmountCents).toBe(parte);
+    expect(payloads[1].refundedAmountCents).toBe(parte * 2);
+  });
 });
