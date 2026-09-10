@@ -13,6 +13,11 @@ enum OrderStatus {
   ENVIADO
   ENTREGUE
   CANCELADO
+
+  /// Bloco 7b. Estorno INTEGRAL do pagamento. Estorno parcial NAO transiciona:
+  /// reembolso parcial e atributo de VALOR, nao fase do pedido — mesma razao
+  /// pela qual o payment-service mantem CAPTURED (decisao 9 da fase).
+  REEMBOLSADO
 }
 
 model Order {
@@ -21,6 +26,20 @@ model Order {
   idempotencyKey String?
   status         OrderStatus          @default(PENDENTE)
   total          Decimal              @db.Decimal(12, 2)
+
+  /// Total ja estornado, ACUMULADO. Aplicado por compare-and-swap a partir do
+  /// `refundedAmountCents` do evento payment.refunded, que vem em centavos: a
+  /// conversao centavos -> Decimal(12,2) e EXATA, sem arredondamento.
+  ///
+  /// Decimal e nao centavos inteiros para nao misturar convencoes dentro do
+  /// mesmo modelo, onde `total - refundedTotal` seria escrito por alguem mais
+  /// cedo ou mais tarde. A decisao integral/parcial continua sendo feita com os
+  /// CENTAVOS do evento, entao as duas unidades nunca se encontram.
+  ///
+  /// CHECK `>= 0` via migration. NAO ha CHECK `<= total`: captura parcial e
+  /// cenario planejado (gatilho registrado na Fase 5) e total do pedido pode
+  /// legitimamente divergir do capturado.
+  refundedTotal  Decimal              @default(0) @db.Decimal(12, 2)
   items          OrderItem[]
   statusHistory  OrderStatusHistory[]
   createdAt      DateTime             @default(now())
