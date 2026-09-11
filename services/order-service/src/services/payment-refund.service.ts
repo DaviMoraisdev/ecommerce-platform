@@ -69,6 +69,23 @@ export async function aplicarReembolso(ev: ReembolsoEvent): Promise<ResultadoApl
         throw new SemEfeito({ tipo: 'moeda-divergente', esperada: MOEDA, recebida: ev.currency });
       }
 
+      // MESMA guarda do aplicarExpiracao, e pela mesma razao que o comentario
+      // dele registra: um evento cujo valor nao bate com o pedido pode ser de
+      // OUTRO pedido, e agir nele e pior que nao agir.
+      //
+      // Achado 3.1 da revisao. Eu usei aquele arquivo como molde e decidi NAO
+      // copiar esta checagem, argumentando que a transicao era menos destrutiva
+      // que o cancelamento. Errado: ela LIBERA ESTOQUE, que e exatamente o
+      // efeito que a guarda protege la.
+      const esperadoCents = order.total.mul(100).toNumber();
+      if (esperadoCents !== ev.capturedAmountCents) {
+        throw new SemEfeito({
+          tipo: 'valor-divergente',
+          esperadoCents,
+          recebidoCents: ev.capturedAmountCents,
+        });
+      }
+
       // Atualizacao MONOTONICA, nao compare-and-swap sobre uma base lida.
       //
       // O evento carrega o total ACUMULADO, e o inbox ja impede reentrega do

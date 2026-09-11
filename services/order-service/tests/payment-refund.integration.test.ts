@@ -1,7 +1,11 @@
 import { OrderStatus } from '@prisma/client';
 import { prisma } from '../src/config/database';
 import { assertTestDatabase } from './helpers/testDbGuard';
-import { MOTIVO_LIBERACAO_PENDENTE } from '../src/services/order.service';
+import {
+  MOTIVO_LIBERACAO_PENDENTE,
+  MOTIVO_LIBERACAO_PENDENTE_LEGADO,
+  concluirLiberacao,
+} from '../src/services/order.service';
 import { aplicarReembolso } from '../src/services/payment-refund.service';
 import { ReembolsoEvent } from '../src/events/payment-events';
 import * as inventoryClient from '../src/clients/inventory.client';
@@ -165,5 +169,58 @@ describe('aplicarReembolso — representacao do estorno no pedido', () => {
     expect(atual.status).toBe(OrderStatus.CANCELADO);
     expect(release).not.toHaveBeenCalled();
     expect(await prisma.pendingCompensation.count({ where: { orderId: o.id } })).toBe(0);
+  });
+
+  // R7: o achado 3.1. Um evento cujo capturado nao bate com o total do pedido
+  // pode ser de OUTRO pedido, e a transicao LIBERA estoque.
+  it('CASO R7: capturado divergente do total do pedido nao produz efeito', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+
+    const r = await aplicarReembolso(
+      evento(o.id, { capturedAmountCents: 9999, refundedAmountCents: 9999, refundAmountCents: 9999 }),
+    );
+    expect(r).toMatchObject({ tipo: 'valor-divergente' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.refundedTotal.toNumber()).toBe(0);
+    expect(atual.status).toBe(OrderStatus.PAGO);
+    expect(release).not.toHaveBeenCalled();
+    // Sem efeito proprio, a marca do inbox NAO pode ficar: a reentrega leria
+    // como duplicata um evento que nunca produziu nada.
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(0);
+  });
+
+  // R8: o achado 6.4. A intencao e gravada ANTES do release; se ele falhar, a
+  // pendencia fica ABERTA e o efeito ja commitado permanece.
+  it('CASO R8: falha do release mantem a pendencia aberta sem desfazer a transicao', async () => {
+    release.mockRejectedValue(new Error('inventory indisponivel'));
+    const o = await pedido(OrderStatus.PAGO);
+
+    await expect(aplicarReembolso(evento(o.id, INTEGRAL))).resolves.toEqual({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.status).toBe(OrderStatus.REEMBOLSADO);
+    expect(atual.refundedTotal.toNumber()).toBe(100);
+
+    const pend = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pend).toHaveLength(1);
+    expect(pend[0].resolvedAt).toBeNull();
+  });
+
+  // R9: o achado 4.1. O prefixo persistido mudou no 7b; reconhecer o antigo e
+  // o que impede uma reserva legada de ficar presa. Usa o LITERAL de propósito:
+  // afirmar pela constante faria o teste seguir qualquer renomeacao futura e
+  // deixar de detectar quebra do valor gravado.
+  it('CASO R9: pendencia com o prefixo LEGADO ainda e resolvida', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+    await prisma.pendingCompensation.create({
+      data: { orderId: o.id, reason: 'expiracao_release_pendente:pay_legado' },
+    });
+
+    await concluirLiberacao(o.id);
+
+    const pend = await prisma.pendingCompensation.findFirstOrThrow({ where: { orderId: o.id } });
+    expect(pend.resolvedAt).not.toBeNull();
+    expect(MOTIVO_LIBERACAO_PENDENTE_LEGADO).toBe('expiracao_release_pendente:');
   });
 });

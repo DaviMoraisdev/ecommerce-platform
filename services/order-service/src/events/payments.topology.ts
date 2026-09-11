@@ -39,11 +39,16 @@ export const BINDING_PAYMENT_EXPIRED = 'payment.expired';
 // porque a alternativa hoje seria triplicar DLQ, classificacao de erro, teto de
 // tentativas e sanitizacao de log.
 //
-// A ROTA que produz este evento esta DESLIGADA no payment-service ate o fim
-// deste bloco (PAYMENT_REFUND_ENABLED). O binding entra ANTES de ela ligar, e
-// nao depois: o publisher usa mandatory + basic.return, entao evento publicado
-// sem binding volta como nao roteavel. Foi a licao do 6f, onde a expiracao
-// ficou desligada justamente por isso.
+// O binding tem de existir ANTES de o produtor publicar: o publisher usa
+// mandatory + basic.return, entao evento emitido sem binding volta como nao
+// roteavel e fica PENDING na outbox. Licao do 6f, onde a expiracao ficou
+// desligada por exatamente isso.
+//
+// Ate o Bloco 7b a garantia era por CODIGO: a PAYMENT_REFUND_ENABLED mantinha
+// a rota inexistente. Ela foi REMOVIDA no proprio 7b, quando este consumidor
+// passou a existir. A ordem virou PROCEDIMENTO, registrado no TECH_DEBT em
+// "Decisoes e procedimentos documentados": order-service primeiro, com os tres
+// bindings e topologia validada; payment depois.
 export const BINDING_PAYMENT_REFUNDED = 'payment.refunded';
 
 export const QUEUE_PAGAMENTOS = 'orders.payments';
