@@ -60,6 +60,7 @@ export function construirApp(config: AppConfig, nucleo?: NucleoDoServico): Expre
     authMiddleware: criarAuthMiddleware(config.jwtSecret),
     controller: criarPaymentController(service),
     exigirAdmin: exigirRole('ADMIN'),
+    reembolsoHabilitado: config.reembolsoHabilitado,
   });
 
   // O provider e o MESMO objeto usado para criar cobranca: verifyWebhook

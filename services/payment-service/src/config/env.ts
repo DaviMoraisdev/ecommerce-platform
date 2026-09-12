@@ -50,6 +50,7 @@ export interface AppConfig {
    * age sobre dinheiro no provedor.
    */
   expiracaoHabilitada: boolean;
+  reembolsoHabilitado: boolean;
   /** Derivado da flag. Ver `varredurasPorCiclo`. */
   varredurasPorCiclo: number;
   webhookMaxAttempts: number;
@@ -496,6 +497,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   // muito antes da proxima reconciliacao.
   // A folga tem de refletir as varreduras EFETIVAMENTE habilitadas.
   const expiracaoHabilitada = source.PAYMENT_EXPIRATION_ENABLED === 'true';
+  const reembolsoHabilitado = source.PAYMENT_REFUND_ENABLED === 'true';
   const porCiclo = varredurasPorCiclo(expiracaoHabilitada);
   const minutosDePoll = Math.ceil(jobsPollIntervalMs / 60_000);
   const minutosDeCiclo = Math.ceil((jobsVarreduraTimeoutMs * porCiclo) / 60_000);
@@ -535,6 +537,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     paymentWindowMinutes,
     webhookQuarantineMinutes,
     expiracaoHabilitada,
+    reembolsoHabilitado,
     varredurasPorCiclo: porCiclo,
     webhookMaxAttempts: parseTentativas(source.WEBHOOK_MAX_ATTEMPTS, 'WEBHOOK_MAX_ATTEMPTS', 5),
     jobsPollIntervalMs,
