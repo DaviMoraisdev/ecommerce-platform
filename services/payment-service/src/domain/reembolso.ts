@@ -1,4 +1,6 @@
 import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
+import { enqueue } from '../events/outbox.repository';
+import { montarEventoDeReembolso } from '../events/payment.events';
 
 /**
  * Aplica um novo TOTAL reembolsado sobre o pagamento, com compare-and-swap.
@@ -23,7 +25,12 @@ import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
  * dele, um estouro viraria erro de constraint em vez de recusa de dominio.
  */
 export interface EntradaDoReembolso {
-  paymentId: string;
+  /**
+   * O pagamento, e nao so o id: o evento precisa de orderId, currency e do
+   * capturado. Tipo estrutural estreito documenta o que o evento consome e
+   * dispensa fabricar um modelo inteiro nos testes.
+   */
+  payment: { id: string; orderId: string; currency: string; capturedAmountCents: number };
   /** Total reembolsado que o chamador LEU. Condicao do compare-and-swap. */
   base: number;
   /** Novo total. A linha da trilha registra `total - base`. */
@@ -36,7 +43,7 @@ export async function aplicarTotalDeReembolso(
   entrada: EntradaDoReembolso,
 ): Promise<boolean> {
   const { count } = await tx.payment.updateMany({
-    where: { id: entrada.paymentId, refundedAmountCents: entrada.base },
+    where: { id: entrada.payment.id, refundedAmountCents: entrada.base },
     data: { refundedAmountCents: entrada.total },
   });
   if (count === 0) return false;
@@ -45,13 +52,35 @@ export async function aplicarTotalDeReembolso(
   // no Payment, e somar as linhas tem de dar o mesmo numero.
   await tx.paymentTransaction.create({
     data: {
-      paymentId: entrada.paymentId,
+      paymentId: entrada.payment.id,
       type: TransactionType.REFUND,
       status: TransactionStatus.SUCCEEDED,
       amountCents: entrada.total - entrada.base,
       providerRef: entrada.providerRef,
     },
   });
+
+  // Evento na MESMA transacao do efeito — e AQUI, nao nos chamadores. Os dois
+  // caminhos podem aplicar o estorno, mas o indice unico parcial garante que
+  // so UM vence. Emitir no helper da exatamente um evento por estorno
+  // contabilizado, quem quer que tenha ganho a corrida. Emitir nos dois
+  // chamadores exigiria coordena-los — e coordenar dois escritores foi o
+  // defeito que o Bloco 7 inteiro corrigiu.
+  await enqueue(
+    tx,
+    montarEventoDeReembolso(
+      {
+        paymentId: entrada.payment.id,
+        orderId: entrada.payment.orderId,
+        currency: entrada.payment.currency,
+        capturedAmountCents: entrada.payment.capturedAmountCents,
+        refundedAmountCents: entrada.total,
+        refundAmountCents: entrada.total - entrada.base,
+        providerRefundRef: entrada.providerRef,
+      },
+      new Date(),
+    ),
+  );
 
   return true;
 }

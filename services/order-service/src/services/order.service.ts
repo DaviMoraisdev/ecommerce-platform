@@ -308,7 +308,24 @@ async function compensar(orderId: string, erroOriginal: unknown): Promise<void> 
 }
 
 const MAX_REASON = 500;
-export const MOTIVO_LIBERACAO_PENDENTE = 'expiracao_release_pendente:';
+// Prefixo NEUTRO desde o Bloco 7b: dois fluxos gravam esta pendencia — a
+// expiracao da janela e o estorno integral. O valor anterior dizia
+// "expiracao", e um reembolso passaria a gravar pendencia rotulada com a
+// causa errada, para ser lida por quem faz triagem.
+export const MOTIVO_LIBERACAO_PENDENTE = 'liberacao_release_pendente:';
+
+/**
+ * Prefixo ANTERIOR ao Bloco 7b, reconhecido durante a transicao.
+ *
+ * Renomear o valor foi mudanca em DISCRIMINADOR PERSISTIDO, nao cosmetica —
+ * apontado no achado 4.1 da revisao. Verificado no banco de desenvolvimento:
+ * 0 linhas com o prefixo antigo, abertas ou fechadas. Ainda assim reconhecer
+ * os dois custa uma linha e elimina a classe de risco.
+ *
+ * GATILHO DE REMOCAO: quando o motivo deixar de ser texto livre e virar campo
+ * tipado (achado 5.1, registrado no TECH_DEBT).
+ */
+export const MOTIVO_LIBERACAO_PENDENTE_LEGADO = 'expiracao_release_pendente:';
 
 /**
  * Registra um incidente na pendencia do pedido, DENTRO da transacao de quem chama.
@@ -378,7 +395,14 @@ export async function concluirLiberacao(orderId: string): Promise<void> {
   }
 
   await prisma.pendingCompensation.updateMany({
-    where: { orderId, resolvedAt: null, reason: { startsWith: MOTIVO_LIBERACAO_PENDENTE } },
+    where: {
+      orderId,
+      resolvedAt: null,
+      OR: [
+        { reason: { startsWith: MOTIVO_LIBERACAO_PENDENTE } },
+        { reason: { startsWith: MOTIVO_LIBERACAO_PENDENTE_LEGADO } },
+      ],
+    },
     data: { resolvedAt: new Date() },
   });
 }

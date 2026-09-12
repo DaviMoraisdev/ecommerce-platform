@@ -1,6 +1,7 @@
 import { OrderStatus } from '@prisma/client';
 import { prisma } from '../src/config/database';
 import { assertTestDatabase } from './helpers/testDbGuard';
+import { MOTIVO_LIBERACAO_PENDENTE } from '../src/services/order.service';
 import { aplicarExpiracao } from '../src/services/payment-expiration.service';
 import { ExpiracaoEvent } from '../src/events/payment-events';
 import * as inventoryClient from '../src/clients/inventory.client';
@@ -75,7 +76,7 @@ describe('aplicarExpiracao — compensacao da saga', () => {
     // A intencao e gravada ANTES do release e RESOLVIDA depois dele.
     const pendencias = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
     expect(pendencias).toHaveLength(1);
-    expect(pendencias[0].reason).toContain('expiracao_release_pendente');
+    expect(pendencias[0].reason).toContain(MOTIVO_LIBERACAO_PENDENTE);
     expect(pendencias[0].resolvedAt).not.toBeNull();
   });
 
@@ -150,7 +151,7 @@ describe('aplicarExpiracao — compensacao da saga', () => {
 
     const pendencias = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
     expect(pendencias).toHaveLength(1);
-    expect(pendencias[0].reason).toContain('expiracao_release_pendente');
+    expect(pendencias[0].reason).toContain(MOTIVO_LIBERACAO_PENDENTE);
     // Segue ABERTA: e o que o job de reconciliacao da saga vai reexecutar.
     expect(pendencias[0].resolvedAt).toBeNull();
   });
@@ -193,7 +194,7 @@ describe('aplicarExpiracao — compensacao da saga', () => {
     const pendencias = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
     expect(pendencias).toHaveLength(1);
     expect(pendencias[0].reason).toContain('incidente_anterior');
-    expect(pendencias[0].reason).toContain('expiracao_release_pendente');
+    expect(pendencias[0].reason).toContain(MOTIVO_LIBERACAO_PENDENTE);
     // NAO resolvida: o motivo nao comeca com o nosso prefixo, e fechar a
     // pendencia de outro fluxo esconderia o problema dele.
     expect(pendencias[0].resolvedAt).toBeNull();

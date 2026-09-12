@@ -3,8 +3,10 @@ import type { OutboxInput } from './outbox.repository';
 import {
   ROUTING_PAYMENT_CAPTURED,
   ROUTING_PAYMENT_EXPIRED,
+  ROUTING_PAYMENT_REFUNDED,
   eventIdDeCaptura,
   eventIdDeExpiracao,
+  eventIdDeReembolso,
 } from './topology';
 
 /**
@@ -101,6 +103,70 @@ export function montarEventoDeExpiracao(
   return {
     eventId,
     routingKey: ROUTING_PAYMENT_EXPIRED,
+    payload: payload as unknown as Prisma.InputJsonValue,
+  };
+}
+
+
+/**
+ * Entrada do evento de REEMBOLSO (Bloco 7b).
+ *
+ * Carrega TRES numeros, e a redundancia e deliberada:
+ *   - `capturedAmountCents`: base para o consumidor decidir se o estorno foi
+ *     INTEGRAL. A regra de transicao e do pedido, entao mandamos os numeros e
+ *     nao um booleano ja calculado — booleano derivado congela no payload a
+ *     regra de quem o emitiu.
+ *   - `refundedAmountCents`: total ACUMULADO. E o que o consumidor aplica por
+ *     compare-and-swap, o que o torna idempotente sob reentrega e imune a
+ *     ordem de chegada.
+ *   - `refundAmountCents`: o delta DESTA movimentacao, para a trilha do pedido.
+ *     Sem ele o consumidor calcularia o delta a partir do proprio estado, e uma
+ *     reentrega fora de ordem produziria delta errado.
+ */
+export interface ReembolsoConfirmado {
+  paymentId: string;
+  orderId: string;
+  currency: string;
+  capturedAmountCents: number;
+  refundedAmountCents: number;
+  refundAmountCents: number;
+  providerRefundRef: string;
+}
+
+/** Contrato que ATRAVESSA A REDE. Fechado, como os dois acima. */
+export interface PayloadDeReembolso {
+  eventId: string;
+  paymentId: string;
+  orderId: string;
+  providerRefundRef: string;
+  capturedAmountCents: number;
+  refundedAmountCents: number;
+  refundAmountCents: number;
+  currency: string;
+  occurredAt: string;
+}
+
+export function montarEventoDeReembolso(
+  reembolso: ReembolsoConfirmado,
+  agora: Date,
+): OutboxInput {
+  const eventId = eventIdDeReembolso(reembolso.providerRefundRef);
+
+  const payload: PayloadDeReembolso = {
+    eventId,
+    paymentId: reembolso.paymentId,
+    orderId: reembolso.orderId,
+    providerRefundRef: reembolso.providerRefundRef,
+    capturedAmountCents: reembolso.capturedAmountCents,
+    refundedAmountCents: reembolso.refundedAmountCents,
+    refundAmountCents: reembolso.refundAmountCents,
+    currency: reembolso.currency,
+    occurredAt: agora.toISOString(),
+  };
+
+  return {
+    eventId,
+    routingKey: ROUTING_PAYMENT_REFUNDED,
     payload: payload as unknown as Prisma.InputJsonValue,
   };
 }

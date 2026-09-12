@@ -546,4 +546,79 @@ describe('reembolsar', () => {
     });
     log.mockRestore();
   });
+
+  // R20: dois estornos parciais do MESMO pagamento. Com eventId derivado do
+  // paymentId, o segundo enqueue colidiria no @unique da outbox, a transacao
+  // do efeito abortaria junto e o reembolso falharia. Este caso e a prova de
+  // que a identidade escolhida (providerRefundRef) e a certa.
+  it('CASO R20: cada estorno gera SEU proprio evento na outbox', async () => {
+    const { service, userId, payment } = await pagamentoCapturado();
+    const parte = Math.floor(payment.capturedAmountCents / 4);
+
+    const a = await service.reembolsar(pedidoDeReembolso(userId, payment.id, parte));
+    const b = await service.reembolsar(pedidoDeReembolso(userId, payment.id, parte));
+    expect(a).toMatchObject({ tipo: 'aplicado' });
+    expect(b).toMatchObject({ tipo: 'aplicado' });
+
+    const eventos = await prisma.outboxEvent.findMany({
+      where: { routingKey: 'payment.refunded' },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(eventos).toHaveLength(2);
+    expect(new Set(eventos.map((e) => e.eventId)).size).toBe(2);
+
+    // Acumulado e delta sao numeros DIFERENTES, e o payload carrega os dois.
+    // Se o produtor confundisse um com o outro, o segundo evento diria que o
+    // pedido teve estornado `parte` no total, e nao `parte * 2`.
+    const payloads = eventos.map((e) => e.payload as unknown as Record<string, number>);
+    expect(payloads[0].refundAmountCents).toBe(parte);
+    expect(payloads[0].refundedAmountCents).toBe(parte);
+    expect(payloads[1].refundAmountCents).toBe(parte);
+    expect(payloads[1].refundedAmountCents).toBe(parte * 2);
+  });
+
+  // R21: o achado 6.5 da revisao do 7b. O R20 prova que os eventos SAO
+  // gravados; nao prova que uma FALHA no enqueue desfaz o dinheiro. Sem este
+  // caso, "evento no mesmo commit do efeito" e comentario, nao garantia.
+  //
+  // A falha e forcada pelo mecanismo REAL — colisao no @unique do eventId —
+  // e nao por excecao injetada: o que se quer provar e o comportamento do
+  // banco, nao o do duble.
+  it('CASO R21: falha ao gravar o evento desfaz o efeito financeiro', async () => {
+    const REF = 're_colide';
+    const real = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const provedor = new Proxy(real, {
+      get(alvo, prop, receiver) {
+        if (prop !== 'refund') {
+          const valor = Reflect.get(alvo, prop, receiver);
+          return typeof valor === 'function' ? valor.bind(alvo) : valor;
+        }
+        return async (entrada: Parameters<PaymentProvider['refund']>[0]) => {
+          const r = await alvo.refund(entrada);
+          return { ...r, providerRefundRef: REF };
+        };
+      },
+    }) as PaymentProvider;
+
+    const ctx = cenario(FAKE_TOKENS.SUCCESS, provedor);
+    await ctx.service.criarPagamento(ctx.input);
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { orderId: ctx.orderId } });
+
+    // A linha que vai colidir. O eventId do reembolso deriva da referencia do
+    // estorno, entao gravar esta antes garante o choque.
+    await prisma.outboxEvent.create({
+      data: { eventId: 'payment.refunded:' + REF, routingKey: 'payment.refunded', payload: {} },
+    });
+
+    const valor = Math.floor(payment.capturedAmountCents / 3);
+    await expect(
+      ctx.service.reembolsar(pedidoDeReembolso(ctx.userId, payment.id, valor)),
+    ).rejects.toThrow();
+
+    // O dinheiro se moveu NO PROVEDOR (limite conhecido e registrado), mas a
+    // contabilidade local ficou intacta: nem total, nem trilha.
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(0);
+    expect(await linhasDeReembolso(payment.id)).toHaveLength(0);
+  });
 });

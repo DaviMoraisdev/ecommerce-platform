@@ -29,7 +29,15 @@ export function criarPaymentRouter(deps: PaymentRouterDeps): Router {
   //
   // A rota NAO e registrada, em vez de registrada com guarda: com a flag off a
   // funcionalidade nao existe, e 404 e a verdade. 503 prometeria que ela volta
-  // sozinha, e quem a traz de volta e o 7b. Esta flag TEM data de morte.
+  // sozinha. Esta flag TEM data de morte, e o gatilho esta no .env.example.
+  //
+  // HISTORICO: removida ao fim do Bloco 7b e RESTAURADA na 3a rodada de review
+  // do PR #63. O motivo ORIGINAL ("payment.refunded nao tem produtor nem
+  // consumidor") foi cumprido pelo 7b. O motivo ATUAL sao dois debitos que
+  // protegem dinheiro: sem reconciliacao, um estorno confirmado no provedor com
+  // commit local falho fica sem representacao (CASO R21); e sem associacao
+  // autoritativa pagamento->pedido, um payment.refunded dirigido a outro pedido
+  // de mesmo total e aceito.
   if (deps.reembolsoHabilitado) {
     // Plural: um pagamento pode ter varios reembolsos parciais, e POST na
     // colecao e o verbo de criar mais um. PATCH sugeriria editar um campo.
@@ -39,7 +47,8 @@ export function criarPaymentRouter(deps: PaymentRouterDeps): Router {
   } else {
     console.info(
       '[payment-service] rota de REEMBOLSO desativada (PAYMENT_REFUND_ENABLED != true). ' +
-        'Ative apenas depois que payment.refunded tiver produtor e consumidor (Bloco 7b).',
+        'Ative apenas depois da reconciliacao de reembolso e da associacao ' +
+        'autoritativa pagamento->pedido. Runbook em .env.example.',
     );
   }
 

@@ -13,6 +13,11 @@ enum OrderStatus {
   ENVIADO
   ENTREGUE
   CANCELADO
+
+  /// Bloco 7b. Estorno INTEGRAL do pagamento. Estorno parcial NAO transiciona:
+  /// reembolso parcial e atributo de VALOR, nao fase do pedido — mesma razao
+  /// pela qual o payment-service mantem CAPTURED (decisao 9 da fase).
+  REEMBOLSADO
 }
 
 model Order {
@@ -21,6 +26,38 @@ model Order {
   idempotencyKey String?
   status         OrderStatus          @default(PENDENTE)
   total          Decimal              @db.Decimal(12, 2)
+
+  /// Total ja estornado, ACUMULADO. Aplicado por compare-and-swap a partir do
+  /// `refundedAmountCents` do evento payment.refunded, que vem em centavos: a
+  /// conversao centavos -> Decimal(12,2) e EXATA, sem arredondamento.
+  ///
+  /// Decimal e nao centavos inteiros para nao misturar convencoes dentro do
+  /// mesmo modelo, onde `total - refundedTotal` seria escrito por alguem mais
+  /// cedo ou mais tarde. A decisao integral/parcial continua sendo feita com os
+  /// CENTAVOS do evento, entao as duas unidades nunca se encontram.
+  ///
+  /// CHECK `>= 0` via migration. NAO ha CHECK `<= total`, e a razao NAO e que a
+  /// divergencia seja aceita hoje — a versao anterior deste comentario afirmava
+  /// isso e estava errada (achado 4.2 da 2a rodada do PR #63). A migration
+  /// 20260910135858 carrega a mesma frase errada e e IMUTAVEL (checksum): este
+  /// comentario e a correcao, o texto de la fica.
+  ///
+  /// Hoje `total` e o capturado COINCIDEM SEMPRE, e isso e IMPOSTO, nao suposto:
+  /// captura parcial e recusada para a DLQ no consumo de `payment.captured`
+  /// (ramo `captura-parcial`, CASOS C17 e G10), entao nenhum pedido chega a PAGO
+  /// com capturado menor que o total. Por isso a guarda
+  /// `order.total * 100 !== capturedAmountCents` do reembolso nao contradiz
+  /// nada: ela recusa o que ja seria impossivel produzir.
+  ///
+  /// O CHECK fica de fora porque a comparacao CORRETA e contra o CAPTURADO, e o
+  /// order nao guarda o capturado (achado 3.1 — associacao autoritativa
+  /// pagamento<->pedido, Fase 7). Um CHECK contra `total` congelaria a
+  /// coincidencia atual como regra de banco.
+  ///
+  /// Gatilho "captura em duas fases" (TECH_DEBT, fora da Fase 5): no dia em que
+  /// captura parcial for suportada, TRES guardas caem juntas — captura,
+  /// expiracao e reembolso.
+  refundedTotal  Decimal              @default(0) @db.Decimal(12, 2)
   items          OrderItem[]
   statusHistory  OrderStatusHistory[]
   createdAt      DateTime             @default(now())

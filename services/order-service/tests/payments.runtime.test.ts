@@ -6,6 +6,7 @@ import {
   DLQ_PAGAMENTOS,
   BINDING_PAYMENT_CAPTURED,
   BINDING_PAYMENT_EXPIRED,
+  BINDING_PAYMENT_REFUNDED,
 } from '../src/events/payments.topology';
 
 function canalFalso() {
@@ -82,7 +83,12 @@ describe('montarTopologia', () => {
       .map((c) => c[2])
       .sort();
 
-    expect(chaves).toEqual([BINDING_PAYMENT_CAPTURED, BINDING_PAYMENT_EXPIRED].sort());
+    // Bloco 7b: terceiro binding. Esta asercao e o que impede binding novo de
+    // entrar sem ninguem se posicionar sobre ele — e binding largo de voltar
+    // pela porta dos fundos.
+    expect(chaves).toEqual(
+      [BINDING_PAYMENT_CAPTURED, BINDING_PAYMENT_EXPIRED, BINDING_PAYMENT_REFUNDED].sort(),
+    );
   });
 
 

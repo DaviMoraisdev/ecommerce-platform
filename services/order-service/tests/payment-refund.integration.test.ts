@@ -1,0 +1,264 @@
+import { OrderStatus } from '@prisma/client';
+import { prisma } from '../src/config/database';
+import { assertTestDatabase } from './helpers/testDbGuard';
+import {
+  MOTIVO_LIBERACAO_PENDENTE,
+  MOTIVO_LIBERACAO_PENDENTE_LEGADO,
+  concluirLiberacao,
+} from '../src/services/order.service';
+import { aplicarReembolso } from '../src/services/payment-refund.service';
+import { ReembolsoEvent } from '../src/events/payment-events';
+import * as inventoryClient from '../src/clients/inventory.client';
+
+// Mesmo motivo do arquivo da expiracao: sem mock, o release cai no catch e cria
+// pendencia em TODO caso, mascarando exatamente o que o R1 quer provar.
+jest.mock('../src/clients/inventory.client');
+const release = inventoryClient.release as jest.MockedFunction<typeof inventoryClient.release>;
+
+/**
+ * Representacao do estorno no pedido (Bloco 7b).
+ *
+ * O que este arquivo prova e o unitario nao alcanca: que o VALOR e a TRANSICAO
+ * seguem regras diferentes, que a escrita e monotonica sob eventos fora de
+ * ordem, e que so o caminho que transicionou devolve estoque.
+ */
+
+beforeAll(() => assertTestDatabase());
+
+beforeEach(() => {
+  release.mockReset();
+  release.mockResolvedValue(undefined as never);
+});
+
+afterEach(async () => {
+  await prisma.inboxEvent.deleteMany();
+  await prisma.pendingCompensation.deleteMany();
+  await prisma.outboxEvent.deleteMany();
+  await prisma.order.deleteMany();
+});
+
+afterAll(async () => {
+  await prisma.$disconnect();
+});
+
+async function pedido(status: OrderStatus = OrderStatus.PAGO, total = 100) {
+  return prisma.order.create({ data: { userId: 'u1', status, total } });
+}
+
+function evento(orderId: string, over: Partial<ReembolsoEvent> = {}): ReembolsoEvent {
+  const providerRefundRef = over.providerRefundRef ?? 're_1';
+  return {
+    eventId: 'payment.refunded:' + providerRefundRef,
+    paymentId: 'pay_1',
+    orderId,
+    providerRefundRef,
+    capturedAmountCents: 10000,
+    refundedAmountCents: 4000,
+    refundAmountCents: 4000,
+    currency: 'BRL',
+    occurredAt: '2026-09-10T12:00:00.000Z',
+    ...over,
+  };
+}
+
+const INTEGRAL = { refundedAmountCents: 10000, refundAmountCents: 10000 };
+
+describe('aplicarReembolso — representacao do estorno no pedido', () => {
+  it('CASO R1: estorno PARCIAL move o valor, nao muda o status e NAO libera estoque', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+
+    await expect(aplicarReembolso(evento(o.id))).resolves.toEqual({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.refundedTotal.toNumber()).toBe(40);
+    // Reembolso e atributo de VALOR, nao fase do pedido.
+    expect(atual.status).toBe(OrderStatus.PAGO);
+    expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(0);
+
+    // A asercao mais importante do arquivo. `concluirLiberacao` chama o release
+    // INCONDICIONALMENTE, entao gatear pelo desfecho publico devolveria a reserva
+    // de um pedido ainda PAGO, com mercadoria a expedir.
+    expect(release).not.toHaveBeenCalled();
+    expect(await prisma.pendingCompensation.count({ where: { orderId: o.id } })).toBe(0);
+  });
+
+  it('CASO R2: estorno INTEGRAL de pedido PAGO transiciona e devolve a reserva', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+
+    await expect(aplicarReembolso(evento(o.id, INTEGRAL))).resolves.toEqual({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.refundedTotal.toNumber()).toBe(100);
+    expect(atual.status).toBe(OrderStatus.REEMBOLSADO);
+
+    const trilha = await prisma.orderStatusHistory.findMany({ where: { orderId: o.id } });
+    expect(trilha).toHaveLength(1);
+    expect(trilha[0].fromStatus).toBe(OrderStatus.PAGO);
+    expect(trilha[0].toStatus).toBe(OrderStatus.REEMBOLSADO);
+    // Autoria vem do contexto, nunca do payload.
+    expect(trilha[0].changedBy).toBe('payment-service');
+
+    // Dinheiro voltou inteiro e a mercadoria nunca saiu: segurar a reserva
+    // deixaria o pedido pendurado, a classe de bug do Bloco 6.
+    expect(release).toHaveBeenCalledWith(o.id);
+    const pend = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pend).toHaveLength(1);
+    expect(pend[0].reason).toContain(MOTIVO_LIBERACAO_PENDENTE);
+    expect(pend[0].resolvedAt).not.toBeNull();
+  });
+
+  it('CASO R3: evento com total MENOR chegando depois e no-op, nao regressao', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+
+    // O acumulado MAIOR chega primeiro; o menor, depois. Num broker isso
+    // acontece, e o inbox nao ajuda: sao eventos DIFERENTES.
+    await aplicarReembolso(
+      evento(o.id, { providerRefundRef: 're_2', refundedAmountCents: 7000, refundAmountCents: 3000 }),
+    );
+    await expect(
+      aplicarReembolso(evento(o.id, { providerRefundRef: 're_1' })),
+    ).resolves.toEqual({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    // Sem o `lt` no where, o segundo evento levaria o total de 70 de volta a 40.
+    expect(atual.refundedTotal.toNumber()).toBe(70);
+    // Os dois sao eventos legitimos e distintos: ambos marcam o inbox.
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(2);
+  });
+
+  it('CASO R4: reentrega do MESMO evento e duplicata, sem segundo efeito', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+    const ev = evento(o.id);
+
+    await expect(aplicarReembolso(ev)).resolves.toEqual({ tipo: 'aplicado' });
+    await expect(aplicarReembolso(ev)).resolves.toEqual({ tipo: 'duplicata' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.refundedTotal.toNumber()).toBe(40);
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
+  });
+
+  it('CASO R5: estorno INTEGRAL de pedido ENVIADO registra pendencia e nao expede status', async () => {
+    const o = await pedido(OrderStatus.ENVIADO);
+
+    const r = await aplicarReembolso(evento(o.id, INTEGRAL));
+    expect(r).toMatchObject({ tipo: 'compensacao-registrada' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    // O VALOR se move mesmo assim: mercadoria na rua nao muda o fato de o
+    // dinheiro ter voltado.
+    expect(atual.refundedTotal.toNumber()).toBe(100);
+    expect(atual.status).toBe(OrderStatus.ENVIADO);
+
+    // Devolver unidade ao estoque sem ela ter voltado fisicamente e inventar
+    // inventario. Isto e devolucao, e exige gente.
+    expect(release).not.toHaveBeenCalled();
+    const pend = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pend).toHaveLength(1);
+    expect(pend[0].reason).toContain('estorno_integral_para_pedido_enviado');
+  });
+
+  it('CASO R6: estorno INTEGRAL de pedido CANCELADO move o valor sem forcar transicao', async () => {
+    const o = await pedido(OrderStatus.CANCELADO);
+
+    await expect(aplicarReembolso(evento(o.id, INTEGRAL))).resolves.toEqual({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.refundedTotal.toNumber()).toBe(100);
+    // Forcar REEMBOLSADO apagaria a razao real do fim do pedido.
+    expect(atual.status).toBe(OrderStatus.CANCELADO);
+    expect(release).not.toHaveBeenCalled();
+    expect(await prisma.pendingCompensation.count({ where: { orderId: o.id } })).toBe(0);
+  });
+
+  // R7: o achado 3.1. Um evento cujo capturado nao bate com o total do pedido
+  // pode ser de OUTRO pedido, e a transicao LIBERA estoque.
+  it('CASO R7: capturado divergente do total do pedido nao produz efeito', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+
+    const r = await aplicarReembolso(
+      evento(o.id, { capturedAmountCents: 9999, refundedAmountCents: 9999, refundAmountCents: 9999 }),
+    );
+    expect(r).toMatchObject({ tipo: 'valor-divergente' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.refundedTotal.toNumber()).toBe(0);
+    expect(atual.status).toBe(OrderStatus.PAGO);
+    expect(release).not.toHaveBeenCalled();
+    // Sem efeito proprio, a marca do inbox NAO pode ficar: a reentrega leria
+    // como duplicata um evento que nunca produziu nada.
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(0);
+  });
+
+  // R8: o achado 6.4. A intencao e gravada ANTES do release; se ele falhar, a
+  // pendencia fica ABERTA e o efeito ja commitado permanece.
+  it('CASO R8: falha do release mantem a pendencia aberta sem desfazer a transicao', async () => {
+    release.mockRejectedValue(new Error('inventory indisponivel'));
+    const o = await pedido(OrderStatus.PAGO);
+
+    await expect(aplicarReembolso(evento(o.id, INTEGRAL))).resolves.toEqual({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.status).toBe(OrderStatus.REEMBOLSADO);
+    expect(atual.refundedTotal.toNumber()).toBe(100);
+
+    const pend = await prisma.pendingCompensation.findMany({ where: { orderId: o.id } });
+    expect(pend).toHaveLength(1);
+    expect(pend[0].resolvedAt).toBeNull();
+  });
+
+  // R9: o achado 4.1. O prefixo persistido mudou no 7b; reconhecer o antigo e
+  // o que impede uma reserva legada de ficar presa. Usa o LITERAL de propósito:
+  // afirmar pela constante faria o teste seguir qualquer renomeacao futura e
+  // deixar de detectar quebra do valor gravado.
+  it('CASO R9: pendencia com o prefixo LEGADO ainda e resolvida', async () => {
+    const o = await pedido(OrderStatus.PAGO);
+    await prisma.pendingCompensation.create({
+      data: { orderId: o.id, reason: 'expiracao_release_pendente:pay_legado' },
+    });
+
+    await concluirLiberacao(o.id);
+
+    const pend = await prisma.pendingCompensation.findFirstOrThrow({ where: { orderId: o.id } });
+    expect(pend.resolvedAt).not.toBeNull();
+    expect(MOTIVO_LIBERACAO_PENDENTE_LEGADO).toBe('expiracao_release_pendente:');
+  });
+
+  // R10: achado 4.3 da 3a rodada do review. A decisao do ramo usava o
+  // `order.status` lido ANTES da escrita monetaria, e o `updateMany` do
+  // refundedTotal nao condiciona em status — entre as duas coisas uma captura
+  // concorrente pode commitar.
+  //
+  // O interleave aqui e FORCADO, nao sorteado: essa e a licao do teste de
+  // corrida que foi descartado por depender do agendador. Uma transacao externa
+  // leva o pedido a PAGO e SEGURA o lock da linha; o reembolso comeca nesse
+  // intervalo, sua leitura inicial ve PENDENTE, e seu updateMany trava. Quando
+  // o lock cai, a releitura TEM de enxergar PAGO. Sem a correcao o ramo decide
+  // com PENDENTE e registra pendencia para um pedido que ja estava pago —
+  // dinheiro devolvido, sem transicao, estoque preso.
+  it('CASO R10: o ramo de status usa o estado corrente, nao a leitura anterior a escrita monetaria', async () => {
+    const o = await pedido(OrderStatus.PENDENTE);
+    const esperar = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    let reembolso!: ReturnType<typeof aplicarReembolso>;
+    await prisma.$transaction(async (tx) => {
+      await tx.order.update({ where: { id: o.id }, data: { status: OrderStatus.PAGO } });
+      reembolso = aplicarReembolso(evento(o.id, INTEGRAL));
+      await esperar(300);
+    });
+
+    expect(await reembolso).toMatchObject({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.status).toBe(OrderStatus.REEMBOLSADO);
+    expect(atual.refundedTotal.toNumber()).toBe(100);
+    expect(release).toHaveBeenCalledTimes(1);
+
+    // A pendencia de TRIAGEM nao pode existir. A de LIBERACAO pode e deve.
+    expect(
+      await prisma.pendingCompensation.count({
+        where: { orderId: o.id, reason: { startsWith: 'estorno_integral_para_pedido_' } },
+      }),
+    ).toBe(0);
+  });
+});

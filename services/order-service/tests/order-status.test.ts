@@ -18,6 +18,9 @@ const VALIDAS: Array<[OrderStatus, OrderStatus]> = [
   [OrderStatus.PENDENTE, OrderStatus.CANCELADO],
   [OrderStatus.PAGO, OrderStatus.ENVIADO],
   [OrderStatus.PAGO, OrderStatus.CANCELADO],
+  // Bloco 7b: UNICA aresta nova. ENVIADO e ENTREGUE nao entram — estorno de
+  // pedido expedido e devolucao, com logistica que o sistema nao modela.
+  [OrderStatus.PAGO, OrderStatus.REEMBOLSADO],
   [OrderStatus.ENVIADO, OrderStatus.ENTREGUE],
 ];
 
@@ -26,7 +29,7 @@ function ehValida(from: OrderStatus, to: OrderStatus): boolean {
 }
 
 describe('maquina de estados do pedido', () => {
-  it('cobre a matriz 5x5 completa (25 combinacoes)', () => {
+  it('cobre a matriz 6x6 completa (36 combinacoes)', () => {
     for (const from of TODOS) {
       for (const to of TODOS) {
         expect([from, to, canTransition(from, to)]).toEqual([

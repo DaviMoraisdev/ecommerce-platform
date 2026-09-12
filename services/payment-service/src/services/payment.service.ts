@@ -970,7 +970,7 @@ export class PaymentService {
       try {
         aplicado = await this.deps.prisma.$transaction(async (tx) => {
           const moveu = await aplicarTotalDeReembolso(tx, {
-            paymentId,
+            payment,
             base: payment.refundedAmountCents,
             total: alvo,
             providerRef: resultado.providerRefundRef,

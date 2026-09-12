@@ -56,21 +56,29 @@ interface CamposComuns {
   eventId: string;
   paymentId: string;
   orderId: string;
-  amountCents: number;
   currency: string;
   occurredAt?: string;
 }
 
 function validarComuns(
   o: Record<string, unknown>,
-  esperado: (paymentId: string) => string,
+  /**
+   * De qual identificador o eventId daquele evento deriva.
+   *
+   * Recebe o `paymentId` JA validado e o objeto cru: captura e expiracao
+   * derivam do pagamento e ignoram o segundo argumento; reembolso deriva do
+   * `providerRefundRef`, porque ha MUITOS reembolsos por pagamento. Devolve
+   * null quando o identificador de origem nao e valido.
+   */
+  esperado: (paymentId: string, o: Record<string, unknown>) => string | null,
 ): CamposComuns | null {
   if (!idValido(o.eventId)) return null;
   if (!idValido(o.paymentId)) return null;
   if (!idValido(o.orderId)) return null;
-  if (!centavosValidos(o.amountCents)) return null;
   if (typeof o.currency !== 'string' || !/^[A-Z]{3}$/.test(o.currency)) return null;
-  if (o.eventId !== esperado(o.paymentId)) return null;
+  const eventIdEsperadoDeste = esperado(o.paymentId, o);
+  if (eventIdEsperadoDeste === null) return null;
+  if (o.eventId !== eventIdEsperadoDeste) return null;
   // Achado 4.5: antes bastava ser string — vazia, com CR/LF ou com dezenas de
   // KB passava. O produtor SEMPRE envia, entao aceitar lixo aqui e aceitar
   // mensagem fora do contrato publicado. Continua opcional para nao apertar o
@@ -86,7 +94,6 @@ function validarComuns(
     eventId: o.eventId,
     paymentId: o.paymentId,
     orderId: o.orderId,
-    amountCents: o.amountCents,
     currency: o.currency,
     occurredAt: o.occurredAt as string | undefined,
   };
@@ -112,9 +119,10 @@ export function parseCaptura(raw: string): CapturaEvent | null {
   const comuns = validarComuns(o, eventIdEsperado);
   if (comuns === null) return null;
 
+  if (!centavosValidos(o.amountCents)) return null;
   if (!centavosValidos(o.capturedAmountCents)) return null;
 
-  return { ...comuns, capturedAmountCents: o.capturedAmountCents };
+  return { ...comuns, amountCents: o.amountCents, capturedAmountCents: o.capturedAmountCents };
 }
 
 /**
@@ -125,7 +133,9 @@ export function parseCaptura(raw: string): CapturaEvent | null {
  * antes de cancelar — cancelar pedido a partir de um evento cujo valor nao bate
  * seria agir sobre o pedido errado.
  */
-export interface ExpiracaoEvent extends CamposComuns {}
+export interface ExpiracaoEvent extends CamposComuns {
+  amountCents: number;
+}
 
 export function eventIdEsperadoDeExpiracao(paymentId: string): string {
   return 'payment.expired:' + paymentId;
@@ -135,5 +145,75 @@ export function parseExpiracao(raw: string): ExpiracaoEvent | null {
   const o = comoObjeto(raw);
   if (o === null) return null;
 
-  return validarComuns(o, eventIdEsperadoDeExpiracao);
+  const comuns = validarComuns(o, eventIdEsperadoDeExpiracao);
+  if (comuns === null) return null;
+
+  if (!centavosValidos(o.amountCents)) return null;
+
+  return { ...comuns, amountCents: o.amountCents };
+}
+
+
+/**
+ * Contrato do evento payment.refunded (Bloco 7b).
+ *
+ * NAO tem `amountCents`: o numero relevante aqui nao e o valor do pagamento,
+ * e sim quanto ja voltou. Tres numeros, e a redundancia e do produtor:
+ * `refundedAmountCents` e o ACUMULADO (aplicado por compare-and-swap, imune a
+ * ordem de chegada), `refundAmountCents` e o delta DESTA movimentacao (a
+ * trilha do pedido), e `capturedAmountCents` e a base para decidir se o
+ * estorno foi INTEGRAL — decisao que e do pedido, nao do pagamento.
+ */
+export interface ReembolsoEvent extends CamposComuns {
+  providerRefundRef: string;
+  capturedAmountCents: number;
+  refundedAmountCents: number;
+  refundAmountCents: number;
+}
+
+/**
+ * Deriva do ESTORNO, nao do pagamento — diferente dos outros dois.
+ *
+ * Ha no maximo uma captura e uma expiracao por pagamento, entao o paymentId
+ * basta la. Reembolsos sao MUITOS por pagamento: amarrar o eventId ao
+ * pagamento faria dois estornos parciais compartilharem chave de idempotencia,
+ * e o segundo seria descartado como duplicata — dinheiro que voltou e que o
+ * pedido nunca registraria.
+ */
+export function eventIdEsperadoDeReembolso(providerRefundRef: string): string {
+  return 'payment.refunded:' + providerRefundRef;
+}
+
+export function parseReembolso(raw: string): ReembolsoEvent | null {
+  const o = comoObjeto(raw);
+  if (o === null) return null;
+
+  const comuns = validarComuns(o, (_paymentId, cru) =>
+    idValido(cru.providerRefundRef)
+      ? eventIdEsperadoDeReembolso(cru.providerRefundRef)
+      : null,
+  );
+  if (comuns === null) return null;
+  if (!idValido(o.providerRefundRef)) return null;
+
+  if (!centavosValidos(o.capturedAmountCents)) return null;
+  if (!centavosValidos(o.refundedAmountCents)) return null;
+  if (!centavosValidos(o.refundAmountCents)) return null;
+
+  // Coerencia entre os tres, fail-closed. O produtor e nosso, mas o consumidor
+  // nao pode depender disso: mensagem em fila e superficie de ataque, e a
+  // alternativa a recusar aqui e mover dinheiro no pedido com numeros que nao
+  // fecham. Mesma disciplina do handler de webhook no payment-service.
+  if (o.capturedAmountCents === 0) return null;
+  if (o.refundAmountCents === 0) return null;
+  if (o.refundedAmountCents > o.capturedAmountCents) return null;
+  if (o.refundAmountCents > o.refundedAmountCents) return null;
+
+  return {
+    ...comuns,
+    providerRefundRef: o.providerRefundRef,
+    capturedAmountCents: o.capturedAmountCents,
+    refundedAmountCents: o.refundedAmountCents,
+    refundAmountCents: o.refundAmountCents,
+  };
 }
