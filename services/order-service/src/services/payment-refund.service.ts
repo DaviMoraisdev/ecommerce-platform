@@ -110,19 +110,32 @@ export async function aplicarReembolso(ev: ReembolsoEvent): Promise<ResultadoApl
       const integral = ev.refundedAmountCents >= ev.capturedAmountCents;
       if (!integral) return { publico: { tipo: 'aplicado' }, liberar: false };
 
-      if (order.status === OrderStatus.CANCELADO) {
+      // Achado 4.3 da 3a rodada do review. O `order` acima foi lido ANTES da
+      // escrita monetaria, e o `updateMany` nao condiciona em status: entre as
+      // duas coisas uma captura concorrente pode ter commitado. Decidir o ramo
+      // com a leitura antiga registra pendencia para um pedido que JA e PAGO —
+      // dinheiro devolvido, sem transicao, e estoque preso ate triagem humana.
+      //
+      // A releitura e barata e e FRESCA: o `updateMany` acima ja tomou o lock
+      // da linha, entao sob READ COMMITTED este SELECT enxerga tudo que
+      // commitou antes dele. O caminho DESTRUTIVO ja estava protegido —
+      // `aplicarTransicao` faz leitura e compare-and-swap proprios. O que nao
+      // estava protegido era a ESCOLHA DO RAMO, que e o achado.
+      const atual = await tx.order.findUniqueOrThrow({ where: { id: ev.orderId } });
+
+      if (atual.status === OrderStatus.CANCELADO) {
         // Terminal por outro caminho. O valor se moveu acima; nao ha transicao
         // a fazer, e forcar REEMBOLSADO apagaria a razao real do fim do pedido.
         return { publico: { tipo: 'aplicado' }, liberar: false };
       }
 
-      if (order.status !== OrderStatus.PAGO) {
+      if (atual.status !== OrderStatus.PAGO) {
         // PENDENTE e contradicao (dinheiro estornado de pedido que nunca foi
         // pago). ENVIADO e ENTREGUE sao DEVOLUCAO: ha mercadoria na rua, e
         // logistica reversa nao e coisa que este servico saiba conduzir.
         // Registra para triagem humana e NAO toca no estado nem no estoque.
         const motivo =
-          'estorno_integral_para_pedido_' + order.status.toLowerCase() + ':' + ev.paymentId;
+          'estorno_integral_para_pedido_' + atual.status.toLowerCase() + ':' + ev.paymentId;
         await registrarPendencia(tx, ev.orderId, motivo);
         return { publico: { tipo: 'compensacao-registrada', motivo }, liberar: false };
       }

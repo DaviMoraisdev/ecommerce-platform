@@ -223,4 +223,42 @@ describe('aplicarReembolso — representacao do estorno no pedido', () => {
     expect(pend.resolvedAt).not.toBeNull();
     expect(MOTIVO_LIBERACAO_PENDENTE_LEGADO).toBe('expiracao_release_pendente:');
   });
+
+  // R10: achado 4.3 da 3a rodada do review. A decisao do ramo usava o
+  // `order.status` lido ANTES da escrita monetaria, e o `updateMany` do
+  // refundedTotal nao condiciona em status — entre as duas coisas uma captura
+  // concorrente pode commitar.
+  //
+  // O interleave aqui e FORCADO, nao sorteado: essa e a licao do teste de
+  // corrida que foi descartado por depender do agendador. Uma transacao externa
+  // leva o pedido a PAGO e SEGURA o lock da linha; o reembolso comeca nesse
+  // intervalo, sua leitura inicial ve PENDENTE, e seu updateMany trava. Quando
+  // o lock cai, a releitura TEM de enxergar PAGO. Sem a correcao o ramo decide
+  // com PENDENTE e registra pendencia para um pedido que ja estava pago —
+  // dinheiro devolvido, sem transicao, estoque preso.
+  it('CASO R10: o ramo de status usa o estado corrente, nao a leitura anterior a escrita monetaria', async () => {
+    const o = await pedido(OrderStatus.PENDENTE);
+    const esperar = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    let reembolso!: ReturnType<typeof aplicarReembolso>;
+    await prisma.$transaction(async (tx) => {
+      await tx.order.update({ where: { id: o.id }, data: { status: OrderStatus.PAGO } });
+      reembolso = aplicarReembolso(evento(o.id, INTEGRAL));
+      await esperar(300);
+    });
+
+    expect(await reembolso).toMatchObject({ tipo: 'aplicado' });
+
+    const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
+    expect(atual.status).toBe(OrderStatus.REEMBOLSADO);
+    expect(atual.refundedTotal.toNumber()).toBe(100);
+    expect(release).toHaveBeenCalledTimes(1);
+
+    // A pendencia de TRIAGEM nao pode existir. A de LIBERACAO pode e deve.
+    expect(
+      await prisma.pendingCompensation.count({
+        where: { orderId: o.id, reason: { startsWith: 'estorno_integral_para_pedido_' } },
+      }),
+    ).toBe(0);
+  });
 });
