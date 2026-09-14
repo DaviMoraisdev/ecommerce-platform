@@ -98,6 +98,8 @@ describe('limpeza dos bancos descartaveis', () => {
 
   const ok: ResultadoDeComando = { status: 0, stdout: '', stderr: '' };
   const falha: ResultadoDeComando = { status: 1, stdout: '', stderr: 'erro simulado' };
+  // Injetada: o teste nao pode depender do .env (nao versionado) existir.
+  const URL_DE_TESTE = new URL('postgresql://usuario:senha@127.0.0.1:5432/payment_db');
 
   function dropsEmitidos(chamadas: Chamada[]): string[] {
     return chamadas
@@ -118,7 +120,7 @@ describe('limpeza dos bancos descartaveis', () => {
       c.entrada?.includes('CREATE DATABASE') ? falha : ok,
     );
 
-    expect(verificar(executor)).toBe(1);
+    expect(verificar({ executor, urlBase: URL_DE_TESTE })).toBe(1);
     expect(chamadas.some((c) => c.entrada?.includes('CREATE DATABASE'))).toBe(true);
     expect(dropsEmitidos(chamadas)).toEqual([]);
   });
@@ -130,7 +132,7 @@ describe('limpeza dos bancos descartaveis', () => {
       c.comando === 'npx' ? falha : ok,
     );
 
-    expect(verificar(executor)).toBe(1);
+    expect(verificar({ executor, urlBase: URL_DE_TESTE })).toBe(1);
 
     const drops = dropsEmitidos(chamadas);
     expect(drops).toHaveLength(1);
