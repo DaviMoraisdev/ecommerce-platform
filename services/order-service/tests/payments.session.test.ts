@@ -19,12 +19,36 @@ type Handler = (...a: unknown[]) => unknown;
  * precisa de um registro limpo, entao tudo e recarregado apos resetModules —
  * o que tambem recria o mock do amqplib, e por isso o connect vem daqui.
  */
+// Instancia carregada por ULTIMO. Com resetModules por caso, cada instancia
+// tem seus proprios timers e sua propria abertura em voo; nada global alcanca
+// uma instancia antiga. O afterEach drena a atual — o caso que a criou e o dono.
+let instanciaAtual: Runtime | null = null;
+
 function carregar(): { mod: Runtime; connect: jest.Mock } {
   jest.resetModules();
   const amqpMod = require('amqplib') as { connect: jest.Mock };
   amqpMod.connect.mockReset();
   const mod = require('../src/events/payments.runtime') as Runtime;
+  instanciaAtual = mod;
   return { mod, connect: amqpMod.connect };
+}
+
+/**
+ * Encerra e ESPERA a abertura em voo terminar.
+ *
+ * pararConsumidorPagamentos nao espera a abertura de proposito (shutdown com
+ * duracao limitada). Aqui a espera e obrigatoria: uma abertura que termina
+ * depois do fim do arquivo loga com o ambiente ja desmontado, e o Jest reprova
+ * a run inteira com todos os testes verdes (exit 1 herdado, TECH_DEBT).
+ *
+ * A segunda chamada nao abre nada: e single-flight. Se ha abertura em voo,
+ * iniciar devolve a MESMA promise; se nao ha, abrirSessao ve `encerrando` e
+ * retorna na hora. E um ponto de espera sem exportar estado interno do modulo.
+ */
+async function drenar(mod: Runtime | null): Promise<void> {
+  if (!mod) return;
+  await mod.pararConsumidorPagamentos();
+  await mod.iniciarConsumidorPagamentos().catch(() => undefined);
 }
 
 function canalFalso(over: Record<string, unknown> = {}) {
@@ -65,7 +89,11 @@ beforeEach(() => {
   jest.spyOn(console, 'error').mockImplementation(() => undefined);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Drenar ANTES de restaurar os spies: o log da abertura que termina aqui
+  // ainda cai no console.error espiado, nao no console real.
+  await drenar(instanciaAtual);
+  instanciaAtual = null;
   jest.restoreAllMocks();
 });
 
@@ -197,6 +225,12 @@ describe('sessao do consumidor — resultado tardio e disposicao', () => {
     expect(cx.createChannel).not.toHaveBeenCalled();
     expect(cx.close).toHaveBeenCalled();
     expect(mod.estaConsumindo()).toBe(false);
+
+    // Este caso NAO encerra durante o teste (ele prova o resultado tardio SEM
+    // shutdown), entao o catch do deadline agenda reconexao, que pendura de
+    // novo, e o laco sobrevivia ao fim do caso — origem do exit 1 herdado.
+    // Quem criou a abertura encerra; o afterEach drena o que restar.
+    await mod.pararConsumidorPagamentos();
   }, 5_000);
 
   it('CASO C39: falha ao dispor da mensagem invalida a sessao', async () => {
