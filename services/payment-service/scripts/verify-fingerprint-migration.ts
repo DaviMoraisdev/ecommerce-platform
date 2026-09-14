@@ -242,9 +242,26 @@ VALUES ('rec-quebrada','usr-1','chave-quebrada','pay-inexistente','COMPLETED', n
   assertIgual('nenhuma claim foi apagada', consulta(ctx, banco, 'SELECT count(*) FROM "idempotency_records";'), '4');
 }
 
-export function verificar(executor: Executor = executorPadrao): number {
+/**
+ * Le o alvo do `.env` do servico. Separado de `verificar` para que o teste de
+ * unidade injete a URL: a suite reprovava em ambiente limpo (CI) porque
+ * `verificar` lia um arquivo NAO versionado — dependencia oculta da maquina do
+ * desenvolvedor, invisivel em 770 testes verdes locais.
+ */
+export function lerUrlDoEnv(): URL {
   const arquivo = dotenv.parse(readFileSync(path.join(RAIZ, '.env'), 'utf8'));
-  const urlBase = new URL(arquivo.DATABASE_URL as string);
+  return new URL(arquivo.DATABASE_URL as string);
+}
+
+export interface OpcoesDeVerificacao {
+  executor?: Executor;
+  /** Alvo base. Default: DATABASE_URL do `.env` do servico. */
+  urlBase?: URL;
+}
+
+export function verificar(opcoes: OpcoesDeVerificacao = {}): number {
+  const executor = opcoes.executor ?? executorPadrao;
+  const urlBase = opcoes.urlBase ?? lerUrlDoEnv();
 
   // decodeURIComponent: senha com @ ou : precisa vir percent-encoded na URL, e o
   // psql espera o valor cru. Sem isto, a autenticacao falharia com mensagem
