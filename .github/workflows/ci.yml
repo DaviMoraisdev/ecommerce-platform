@@ -1,0 +1,80 @@
+name: CI
+
+# Bloco 8b. Dois servicos da Fase 5; os demais entram numa segunda onda.
+# Sem filtro por caminho, de proposito: `paths` e por workflow, nao por job,
+# e um check ausente trava PR quando a protecao da main passar a exigi-lo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  servico:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Um servico vermelho nao cancela o outro: o PR precisa ver os dois.
+      fail-fast: false
+      matrix:
+        include:
+          - service: order-service
+            db: order_test_db
+          - service: payment-service
+            db: payment_test_db
+
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+
+    services:
+      postgres:
+        image: postgres:15
+        # Mesmas credenciais do .env.test.example versionado, e o banco ja nasce
+        # com o nome exato que a guarda exige — nada depende de o Prisma criar.
+        env:
+          POSTGRES_USER: usuario
+          POSTGRES_PASSWORD: senha
+          POSTGRES_DB: ${{ matrix.db }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U usuario -d ${{ matrix.db }}"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+
+      - run: npm ci
+
+      - name: Ambiente de teste a partir do exemplo versionado
+        # migrate:test e setup.ts leem o ARQUIVO .env.test; variaveis de
+        # processo nao contam (validacao deliberada sobre o conteudo do arquivo).
+        # Segredos gerados no runner: nada de valor fixo em repositorio publico.
+        run: |
+          cp .env.test.example .env.test
+          sed -i -E "s/^(JWT_SECRET)=$/\1=$(openssl rand -hex 32)/" .env.test
+          sed -i -E "s/^(PAYMENT_WEBHOOK_SECRET)=$/\1=$(openssl rand -hex 32)/" .env.test
+          if grep -qE '^[A-Z_]+=$' .env.test; then
+            echo "variavel obrigatoria sem valor no .env.test:"; grep -E '^[A-Z_]+=$' .env.test; exit 1
+          fi
+
+      - run: npx prisma generate
+
+      - name: Migrations no banco de teste (quatro barreiras)
+        run: npm run migrate:test
+
+      # Steps SEPARADOS. `verify && verify:integration` curto-circuita e a
+      # saida faltante ja foi lida como truncamento de terminal duas vezes.
+      - name: Unit, typecheck e build
+        run: npm run verify
+
+      - name: Integracao contra Postgres
+        run: npm run verify:integration
