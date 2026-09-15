@@ -223,9 +223,9 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     // travam no updateMany; so o CAS decide.
     const o = await pedido(OrderStatus.PENDENTE, 100);
 
-    const { resultados: r, bloqueados } = await disputarComLinhaTravada(o.id, () => [
-      aplicarCaptura(evento(o.id, { paymentId: 'pay_a' })),
-      aplicarCaptura(evento(o.id, { paymentId: 'pay_b' })),
+    const { resultados: r, bloqueados } = await disputarComLinhaTravada(o.id, [
+      () => aplicarCaptura(evento(o.id, { paymentId: 'pay_a' })),
+      () => aplicarCaptura(evento(o.id, { paymentId: 'pay_b' })),
     ]);
     expect(bloqueados).toBe(2);
 

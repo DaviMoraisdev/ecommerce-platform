@@ -87,8 +87,9 @@ describe('updateOrderStatus', () => {
     // serializavam, a matriz recusava PAGO->PAGO e o caso creditava o
     // resultado ao compare-and-swap. Com a barreira, os cinco leem PENDENTE
     // antes de qualquer escrita e a matriz aprova todos; so o CAS pode recusar.
-    const { resultados, bloqueados } = await disputarComLinhaTravada(order.id, () =>
-      Array.from({ length: 5 }, (_, i) =>
+    const { resultados, bloqueados } = await disputarComLinhaTravada(
+      order.id,
+      Array.from({ length: 5 }, (_, i) => () =>
         updateOrderStatus(order.id, OrderStatus.PAGO, 'u' + i),
       ),
     );
@@ -201,8 +202,9 @@ describe('aplicarTransicao sob concorrencia', () => {
     // caso detectava a sabotagem S2 em 4 de 4 execucoes — evidencia, nao
     // garantia: se as cinco serializassem, a matriz recusaria e o historico
     // teria uma linha sem o CAS ter participado.
-    const { resultados, bloqueados } = await disputarComLinhaTravada(order.id, () =>
-      Array.from({ length: 5 }, () =>
+    const { resultados, bloqueados } = await disputarComLinhaTravada(
+      order.id,
+      Array.from({ length: 5 }, () => () =>
         updateOrderStatus(order.id, OrderStatus.ENVIADO, 'admin-concorrente'),
       ),
     );

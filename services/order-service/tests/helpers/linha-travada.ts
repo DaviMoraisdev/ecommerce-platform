@@ -33,7 +33,12 @@ export interface ResultadoDaDisputa<T> {
  */
 export async function disputarComLinhaTravada<T>(
   orderId: string,
-  disputantes: () => Promise<T>[],
+  // Fabricas, nao promises: criar a promise E iniciar o trabalho, e a ordem de
+  // inicio decide quem vence — a fila de lock do Postgres e FIFO. Cada
+  // disputante so e disparado depois de o anterior estar ESPERANDO, entao o
+  // vencedor e o primeiro da lista, nao um sorteio. (Ver o CASO 44 do
+  // payment-service, onde o sorteio mascarava a sabotagem em metade das vezes.)
+  disputantes: Array<() => Promise<T>>,
   opcoes: { timeoutMs?: number } = {},
 ): Promise<ResultadoDaDisputa<T>> {
   const timeoutMs = opcoes.timeoutMs ?? 3_000;
@@ -43,14 +48,23 @@ export async function disputarComLinhaTravada<T>(
   await prisma.$transaction(
     async (tx) => {
       // Parametrizado pelo tagged template: nunca interpolar o id na string.
-      await tx.$queryRaw`SELECT id FROM orders WHERE id = ${orderId} FOR UPDATE`;
-      const promessas = disputantes();
+      // FOR NO KEY UPDATE, nao FOR UPDATE: um INSERT com FK para `orders` (o
+      // inbox, o historico) toma KEY SHARE, que FOR UPDATE bloquearia — os
+      // disputantes parariam no insert, cedo demais, e correriam de novo. NO
+      // KEY UPDATE deixa o insert passar e bloqueia exatamente o UPDATE de
+      // coluna nao-chave do CAS.
+      await tx.$queryRaw`SELECT id FROM orders WHERE id = ${orderId} FOR NO KEY UPDATE`;
+      const promessas: Promise<T>[] = [];
+      for (const iniciar of disputantes) {
+        // Promise.resolve acorda thenables preguicosos (supertest).
+        promessas.push(Promise.resolve(iniciar()));
+        bloqueados = await esperarBloqueados(promessas.length, timeoutMs);
+      }
       emVoo = Promise.allSettled(promessas);
-      bloqueados = await esperarBloqueados(promessas.length, timeoutMs);
     },
     // Acima do teto da barreira: o default (5 s) abortaria a transacao do lock
     // no mesmo instante em que a espera desiste, mascarando o motivo real.
-    { timeout: timeoutMs + 5_000 },
+    { timeout: timeoutMs * disputantes.length + 5_000 },
   );
 
   return { resultados: await emVoo, bloqueados };
