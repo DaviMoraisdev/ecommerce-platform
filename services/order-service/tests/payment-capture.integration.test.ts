@@ -3,6 +3,7 @@ import { prisma } from '../src/config/database';
 import { assertTestDatabase } from './helpers/testDbGuard';
 import { aplicarCaptura } from '../src/services/payment-capture.service';
 import { CapturaEvent } from '../src/events/payment-events';
+import { disputarComLinhaTravada } from './helpers/linha-travada';
 
 /**
  * O que ESTE arquivo prova e o unitario NAO pode provar:
@@ -214,24 +215,19 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
   });
 
   it('CASO G11: duas capturas disparadas juntas produzem UMA transicao', async () => {
-    // O QUE ESTE TESTE PROVA: qualquer que seja o entrelacamento, o desfecho e
-    // um so — uma transicao, uma trilha, uma marca no inbox.
-    //
-    // O QUE ELE NAO PROVA: que houve disputa. A sabotagem V7 (remover o CAS do
-    // aplicarTransicao) NAO o derrubou, o que indica que as duas transacoes
-    // acabam serializadas e a segunda ja le o pedido PAGO, caindo no ramo de
-    // compensacao sem nunca disputar. Quem cobre o CAS de verdade e o teste
-    // 'updateOrderStatus > concorrencia: a MESMA transicao aplicada 2x so vale
-    // uma vez', em order.integration.test.ts — foi ele que a V7 derrubou.
-    // Forcar entrelacamento deterministico exigiria controlar o agendamento das
-    // transacoes; sem isso, o teste ficaria intermitente. Registrado no
-    // TECH_DEBT como nao coberto.
+    // Bloco 8c: sobreposicao FORCADA por lock externo (helper linha-travada).
+    // Antes, este caso detectava a sabotagem S2 (CAS removido) em 1 de 4: as
+    // duas capturas serializavam, a segunda lia PAGO e caia no ramo de
+    // compensacao sem disputar. Com a barreira, as duas leem PENDENTE (o inbox
+    // de cada uma tem eventId proprio e nao conflita), passam pela matriz e
+    // travam no updateMany; so o CAS decide.
     const o = await pedido(OrderStatus.PENDENTE, 100);
 
-    const r = await Promise.allSettled([
+    const { resultados: r, bloqueados } = await disputarComLinhaTravada(o.id, () => [
       aplicarCaptura(evento(o.id, { paymentId: 'pay_a' })),
       aplicarCaptura(evento(o.id, { paymentId: 'pay_b' })),
     ]);
+    expect(bloqueados).toBe(2);
 
     const aplicadas = r.filter(
       (x) => x.status === 'fulfilled' && (x.value as { tipo: string }).tipo === 'aplicado',
