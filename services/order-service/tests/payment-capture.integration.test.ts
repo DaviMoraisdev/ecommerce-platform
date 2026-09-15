@@ -234,17 +234,24 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
     );
     expect(aplicadas).toHaveLength(1);
 
+    // A perdedora leu PENDENTE (barreira), passou pela matriz e perdeu o CAS:
+    // rejeita com CONFLITO_DE_ESTADO — o catch do servico so trata SemEfeito e
+    // P2002, e concorrencia e sinal de requeue, nao de duplicata.
+    const recusadas = r.filter((x) => x.status === 'rejected');
+    expect(recusadas).toHaveLength(1);
+    expect((recusadas[0] as PromiseRejectedResult).reason).toMatchObject({
+      code: 'CONFLITO_DE_ESTADO',
+    });
+
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
     expect(atual.status).toBe(OrderStatus.PAGO);
     expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(1);
 
-    // Invariante do inbox sob QUALQUER entrelacamento: uma marca por chamada que
-    // commitou, nenhuma pela que abortou. A versao anterior deste teste fixava
-    // 1 e era INTERMITENTE — ela presumia que houve disputa. Com serializacao,
-    // a segunda captura le o pedido ja PAGO, registra compensacao e commita:
-    // duas linhas, e correto. Amarrar a contagem ao desfecho observado vale
-    // para os dois casos e ainda testa a invariante que importa.
-    const commitadas = r.filter((x) => x.status === 'fulfilled').length;
-    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(commitadas);
+    // Invariante do inbox (5b): linha existe <=> o efeito aconteceu. A perdedora
+    // gravou a marca DENTRO da transacao que o CONFLITO desfez, entao sobra
+    // exatamente uma. Uma versao anterior amarrava a contagem ao numero de
+    // commits porque a serializacao era possivel (a segunda lia PAGO e commitava
+    // compensacao); com a barreira esse ramo nao existe mais.
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
   });
 });
