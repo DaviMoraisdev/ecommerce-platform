@@ -3,6 +3,7 @@ import { prisma } from '../src/config/database';
 import { assertTestDatabase } from './helpers/testDbGuard';
 import { aplicarCaptura } from '../src/services/payment-capture.service';
 import { CapturaEvent } from '../src/events/payment-events';
+import { disputarComLinhaTravada } from './helpers/linha-travada';
 
 /**
  * O que ESTE arquivo prova e o unitario NAO pode provar:
@@ -214,41 +215,43 @@ describe('aplicarCaptura — efeito e marca no mesmo commit', () => {
   });
 
   it('CASO G11: duas capturas disparadas juntas produzem UMA transicao', async () => {
-    // O QUE ESTE TESTE PROVA: qualquer que seja o entrelacamento, o desfecho e
-    // um so — uma transicao, uma trilha, uma marca no inbox.
-    //
-    // O QUE ELE NAO PROVA: que houve disputa. A sabotagem V7 (remover o CAS do
-    // aplicarTransicao) NAO o derrubou, o que indica que as duas transacoes
-    // acabam serializadas e a segunda ja le o pedido PAGO, caindo no ramo de
-    // compensacao sem nunca disputar. Quem cobre o CAS de verdade e o teste
-    // 'updateOrderStatus > concorrencia: a MESMA transicao aplicada 2x so vale
-    // uma vez', em order.integration.test.ts — foi ele que a V7 derrubou.
-    // Forcar entrelacamento deterministico exigiria controlar o agendamento das
-    // transacoes; sem isso, o teste ficaria intermitente. Registrado no
-    // TECH_DEBT como nao coberto.
+    // Bloco 8c: sobreposicao FORCADA por lock externo (helper linha-travada).
+    // Antes, este caso detectava a sabotagem S2 (CAS removido) em 1 de 4: as
+    // duas capturas serializavam, a segunda lia PAGO e caia no ramo de
+    // compensacao sem disputar. Com a barreira, as duas leem PENDENTE (o inbox
+    // de cada uma tem eventId proprio e nao conflita), passam pela matriz e
+    // travam no updateMany; so o CAS decide.
     const o = await pedido(OrderStatus.PENDENTE, 100);
 
-    const r = await Promise.allSettled([
-      aplicarCaptura(evento(o.id, { paymentId: 'pay_a' })),
-      aplicarCaptura(evento(o.id, { paymentId: 'pay_b' })),
+    const { resultados: r, bloqueados } = await disputarComLinhaTravada(o.id, [
+      () => aplicarCaptura(evento(o.id, { paymentId: 'pay_a' })),
+      () => aplicarCaptura(evento(o.id, { paymentId: 'pay_b' })),
     ]);
+    expect(bloqueados).toBe(2);
 
     const aplicadas = r.filter(
       (x) => x.status === 'fulfilled' && (x.value as { tipo: string }).tipo === 'aplicado',
     );
     expect(aplicadas).toHaveLength(1);
 
+    // A perdedora leu PENDENTE (barreira), passou pela matriz e perdeu o CAS:
+    // rejeita com CONFLITO_DE_ESTADO — o catch do servico so trata SemEfeito e
+    // P2002, e concorrencia e sinal de requeue, nao de duplicata.
+    const recusadas = r.filter((x) => x.status === 'rejected');
+    expect(recusadas).toHaveLength(1);
+    expect((recusadas[0] as PromiseRejectedResult).reason).toMatchObject({
+      code: 'CONFLITO_DE_ESTADO',
+    });
+
     const atual = await prisma.order.findUniqueOrThrow({ where: { id: o.id } });
     expect(atual.status).toBe(OrderStatus.PAGO);
     expect(await prisma.orderStatusHistory.count({ where: { orderId: o.id } })).toBe(1);
 
-    // Invariante do inbox sob QUALQUER entrelacamento: uma marca por chamada que
-    // commitou, nenhuma pela que abortou. A versao anterior deste teste fixava
-    // 1 e era INTERMITENTE — ela presumia que houve disputa. Com serializacao,
-    // a segunda captura le o pedido ja PAGO, registra compensacao e commita:
-    // duas linhas, e correto. Amarrar a contagem ao desfecho observado vale
-    // para os dois casos e ainda testa a invariante que importa.
-    const commitadas = r.filter((x) => x.status === 'fulfilled').length;
-    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(commitadas);
+    // Invariante do inbox (5b): linha existe <=> o efeito aconteceu. A perdedora
+    // gravou a marca DENTRO da transacao que o CONFLITO desfez, entao sobra
+    // exatamente uma. Uma versao anterior amarrava a contagem ao numero de
+    // commits porque a serializacao era possivel (a segunda lia PAGO e commitava
+    // compensacao); com a barreira esse ramo nao existe mais.
+    expect(await prisma.inboxEvent.count({ where: { orderId: o.id } })).toBe(1);
   });
 });

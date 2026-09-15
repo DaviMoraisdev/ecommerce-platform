@@ -8,6 +8,7 @@ import { PaymentService } from '../../src/services/payment.service';
 import { assertTestDatabase } from '../helpers/testDbGuard';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { orderClientFalso, pedidoDeTeste } from '../helpers/prisma-fake';
+import { disputarComLinhaTravada } from '../helpers/linha-travada';
 import * as outboxRepo from '../../src/events/outbox.repository';
 
 /**
@@ -360,10 +361,17 @@ describe('review 4.1 — retentativas concorrentes sobre Payment existente', () 
       },
     });
 
-    const resultados = await Promise.allSettled([
-      service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
-      service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
+    // Bloco 8c: sobreposicao FORCADA (helper linha-travada). As duas leem
+    // PENDING com attemptCount = 1 e travam no claim `status + attemptCount`;
+    // o vencedor vai a PROCESSING e cobra, o perdedor casa 0 linhas. Sem a
+    // barreira, a serializacao fazia a segunda ler PROCESSING e recusar antes
+    // de o CAS participar.
+    const criado = await prisma.payment.findUniqueOrThrow({ where: { orderId } });
+    const { resultados, bloqueados } = await disputarComLinhaTravada(prisma, criado.id, [
+      () => service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
+      () => service.criarPagamento({ ...input, idempotencyKey: randomUUID() }),
     ]);
+    expect(bloqueados).toBe(2);
 
     const chaves = espiaoCharge.mock.calls.map((c) => c[0].idempotencyKey);
 

@@ -59,6 +59,7 @@ jobs:
         # processo nao contam (validacao deliberada sobre o conteudo do arquivo).
         # Segredos gerados no runner: nada de valor fixo em repositorio publico.
         run: |
+          echo "nproc=$(nproc)"
           cp .env.test.example .env.test
           sed -i -E "s/^(JWT_SECRET)=$/\1=$(openssl rand -hex 32)/" .env.test
           sed -i -E "s/^(PAYMENT_WEBHOOK_SECRET)=$/\1=$(openssl rand -hex 32)/" .env.test

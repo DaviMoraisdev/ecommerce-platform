@@ -3,6 +3,7 @@ import { prisma } from '../src/config/database';
 import { assertTestDatabase } from './helpers/testDbGuard';
 import { updateOrderStatus, getStatusHistory } from '../src/services/order.service';
 import { DomainError } from '../src/domain/errors';
+import { disputarComLinhaTravada } from './helpers/linha-travada';
 
 beforeAll(() => {
   assertTestDatabase();
@@ -78,36 +79,32 @@ describe('updateOrderStatus', () => {
     const order = await novoPedido();
     // Alvos iguais de proposito: PAGO e CANCELADO formariam uma cadeia valida
     // (PENDENTE->PAGO->CANCELADO) e elas passariam legitimamente. Disputando a
-    // MESMA transicao, so uma pode vencer:
-    //  - em paralelo real: o CAS da perdedora casa 0 linhas -> CONFLITO_DE_ESTADO
-    //  - se serializar: a perdedora le PAGO e tenta PAGO->PAGO -> TRANSICAO_INVALIDA
+    // MESMA transicao, so uma pode vencer.
     //
-    // CINCO disputantes, nao dois — e a razao esta na segunda linha acima. Com
-    // dois, o par SERIALIZA na maior parte das execucoes, a matriz recusa a
-    // segunda, e as assercoes abaixo passam SEM o CAS ter participado: o caso
-    // media a matriz e creditava o resultado ao compare-and-swap. Medido na
-    // sabotagem S2 (condicao apagada do `where` de `aplicarTransicao`): a versao
-    // com dois disputantes falhou em apenas 1 de 4 execucoes. Com CINCO sobe
-    // para 2 de 4 — melhor, e ainda NAO determinista: quando as cinco
-    // serializam, a matriz responde por todas as recusas e o CAS segue sem ser
-    // exercitado. Quem fecha o mecanismo de forma confiavel e o caso
-    // `aplicarTransicao sob concorrencia` (4 de 4), no fim deste arquivo.
-    // Achado 4.4 da 2a rodada do PR #63.
-    const resultados = await Promise.allSettled(
-      Array.from({ length: 5 }, (_, i) =>
+    // Bloco 8c: sobreposicao FORCADA por lock externo. Historico deste caso:
+    // com `Promise.allSettled` solto, dois disputantes detectavam a sabotagem
+    // S2 (CAS removido) em 1 de 4 execucoes e cinco em 2 de 4 — quando
+    // serializavam, a matriz recusava PAGO->PAGO e o caso creditava o
+    // resultado ao compare-and-swap. Com a barreira, os cinco leem PENDENTE
+    // antes de qualquer escrita e a matriz aprova todos; so o CAS pode recusar.
+    const { resultados, bloqueados } = await disputarComLinhaTravada(
+      order.id,
+      Array.from({ length: 5 }, (_, i) => () =>
         updateOrderStatus(order.id, OrderStatus.PAGO, 'u' + i),
       ),
     );
+    expect(bloqueados).toBe(5);
 
     const vencedores = resultados.filter((r) => r.status === 'fulfilled');
     const perdedores = resultados.filter((r) => r.status === 'rejected');
     expect(vencedores).toHaveLength(1);
     expect(perdedores).toHaveLength(4);
 
-    // O motivo de CADA rejeicao tem que ser um dos dois esperados (por CODIGO).
+    // Todas leram o MESMO estado: a unica recusa possivel e o CAS.
+    // TRANSICAO_INVALIDA aqui seria leitura apos o commit — barreira furada.
     for (const p of perdedores) {
       const motivo = (p as PromiseRejectedResult).reason;
-      expect(['CONFLITO_DE_ESTADO', 'TRANSICAO_INVALIDA']).toContain(motivo.code);
+      expect(motivo.code).toBe('CONFLITO_DE_ESTADO');
     }
 
     // Estado final e trilha coerentes com UMA unica transicao vencedora.
@@ -201,26 +198,30 @@ describe('aplicarTransicao sob concorrencia', () => {
     const order = await novoPedido();
     await updateOrderStatus(order.id, OrderStatus.PAGO, 'admin1');
 
-    const resultados = await Promise.allSettled(
-      Array.from({ length: 5 }, () =>
+    // Bloco 8c: sobreposicao FORCADA por lock externo (ver o helper). Antes, o
+    // caso detectava a sabotagem S2 em 4 de 4 execucoes — evidencia, nao
+    // garantia: se as cinco serializassem, a matriz recusaria e o historico
+    // teria uma linha sem o CAS ter participado.
+    const { resultados, bloqueados } = await disputarComLinhaTravada(
+      order.id,
+      Array.from({ length: 5 }, () => () =>
         updateOrderStatus(order.id, OrderStatus.ENVIADO, 'admin-concorrente'),
       ),
     );
+    // Barreira observada: os cinco leram PAGO e travaram no updateMany.
+    expect(bloqueados).toBe(5);
 
     const ok = resultados.filter((r) => r.status === 'fulfilled');
     expect(ok).toHaveLength(1);
 
-    // Toda recusa tem de ser de DOMINIO. `CONFLITO_DE_ESTADO` quando a
-    // transacao leu PAGO e perdeu o CAS; `TRANSICAO_INVALIDA` quando leu depois
-    // do commit do vencedor e ENVIADO->ENVIADO ja nao existe na matriz. Timeout
-    // de pool nao e nenhum dos dois, e aceitar um faria o caso passar sem ter
-    // medido concorrencia — a falha que este arquivo existe para nao repetir.
+    // Com todos tendo lido o MESMO estado antes de qualquer escrita, a matriz
+    // aprova os cinco; a UNICA recusa possivel e o CAS: `CONFLITO_DE_ESTADO`.
+    // `TRANSICAO_INVALIDA` aqui significaria leitura apos o commit do vencedor,
+    // ou seja, barreira furada. Timeout de pool tambem nao e aceito.
     for (const r of resultados) {
       if (r.status !== 'rejected') continue;
       expect(r.reason).toBeInstanceOf(DomainError);
-      expect(['CONFLITO_DE_ESTADO', 'TRANSICAO_INVALIDA']).toContain(
-        (r.reason as DomainError).code,
-      );
+      expect((r.reason as DomainError).code).toBe('CONFLITO_DE_ESTADO');
     }
 
     const depois = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
