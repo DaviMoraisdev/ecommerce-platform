@@ -55,23 +55,27 @@ export async function disputarComLinhaTravada<T>(
       // coluna nao-chave do CAS.
       await tx.$queryRaw`SELECT id FROM orders WHERE id = ${orderId} FOR NO KEY UPDATE`;
       const promessas: Promise<T>[] = [];
+      // Prazo TOTAL, nao por disputante: com prazo por disputante o pior caso e
+      // timeoutMs * N, que estoura o timeout do Jest e deixa o lock vivo depois
+      // de o caso ter sido abandonado — envenenando os casos seguintes (visto
+      // no CI). Aqui a barreira falha alto DENTRO do prazo, e o lock morre junto.
+      const prazo = Date.now() + timeoutMs;
       for (const iniciar of disputantes) {
         // Promise.resolve acorda thenables preguicosos (supertest).
         promessas.push(Promise.resolve(iniciar()));
-        bloqueados = await esperarBloqueados(promessas.length, timeoutMs);
+        bloqueados = await esperarBloqueados(promessas.length, prazo);
       }
       emVoo = Promise.allSettled(promessas);
     },
     // Acima do teto da barreira: o default (5 s) abortaria a transacao do lock
     // no mesmo instante em que a espera desiste, mascarando o motivo real.
-    { timeout: timeoutMs * disputantes.length + 5_000 },
+    { timeout: timeoutMs + 2_000 },
   );
 
   return { resultados: await emVoo, bloqueados };
 }
 
-async function esperarBloqueados(n: number, timeoutMs: number): Promise<number> {
-  const limite = Date.now() + timeoutMs;
+async function esperarBloqueados(n: number, limite: number): Promise<number> {
   let visto = 0;
   while (Date.now() < limite) {
     const linhas = await prisma.$queryRaw<{ n: number }[]>`
