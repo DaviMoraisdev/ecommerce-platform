@@ -18,6 +18,7 @@ import { criarWebhookRouter } from '../../src/routes/webhook.routes';
 import { quarentenarOrfaos } from '../../src/jobs/inbox.repository';
 import { WebhookService } from '../../src/services/webhook.service';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
+import { disputarComLinhaTravada } from '../helpers/linha-travada';
 import { assertTestDatabase } from '../helpers/testDbGuard';
 
 /**
@@ -736,7 +737,16 @@ describe('webhook — achados do review', () => {
 
     // Se o de 5000 vencer o CAS, o de 7000 NAO pode virar IGNORED com 200: o
     // provedor nao retenta e o banco ficaria abaixo do reembolso real.
-    await Promise.all([postar(app, evento(5000)), postar(app, evento(7000))]);
+    // Bloco 8c: sobreposicao FORCADA. Os dois leem refunded = 0 e travam no CAS
+    // aritmetico. Se 5000 vence, 7000 recarrega e grava delta 2000; se 7000
+    // vence, 5000 recarrega e e IGNORED. Sem o CAS, os dois gravam e a soma
+    // das linhas diverge do acumulado. Antes, detectava a remocao em 1/4.
+    const { resultados, bloqueados } = await disputarComLinhaTravada(prisma, payment.id, [
+      () => postar(app, evento(5000)),
+      () => postar(app, evento(7000)),
+    ]);
+    expect(bloqueados).toBe(2);
+    expect(resultados.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled']);
 
     const final = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(final.refundedAmountCents).toBe(7000);
@@ -763,6 +773,12 @@ describe('webhook — achados do review', () => {
     // O STATUS final da linha de inbox nao e afirmado aqui: sem claim de posse
     // a perdedora do CAS pode sobrescrever PROCESSED com IGNORED. Divida
     // registrada para o Bloco 6; o dinheiro e o que este caso protege.
+    //
+    // Bloco 8c, medido: este caso prova a CONSTRAINT (@unique de
+    // providerEventId). A segunda entrega trava no insert do inbox ate a
+    // primeira commitar, le CAPTURED e nunca chega ao CAS — remover o CAS de
+    // estado nao o derruba (0/4), e nao deveria. O CAS e provado pelo CASO 44,
+    // com sobreposicao forcada.
   });
 
   it('CASO 24: retomada de linha FAILED nao infla attempts', async () => {
@@ -1408,10 +1424,19 @@ describe('webhook — plausibilidade e concorrencia real (Bloco 6d)', () => {
     const idAntigo = `evt_${randomUUID()}`;
     const idNovo = `evt_${randomUUID()}`;
 
-    const [a, b] = await Promise.all([
-      postar(app, provider.assinarCorpo(corpo({ id: idAntigo, created_at: antigo.toISOString() }, { charge_ref: chargeRef }))),
-      postar(app, provider.assinarCorpo(corpo({ id: idNovo, created_at: novo.toISOString() }, { charge_ref: chargeRef }))),
+    // Bloco 8c: sobreposicao FORCADA. Sem a barreira o caso detectava a remocao
+    // do CAS em 4/4, mas pelo motivo errado: as duas aplicavam e a segunda
+    // caia no P2002 da outbox (divida do Bloco 9) como 500. Com os dois lendo
+    // PENDING e travando no updateMany, o detector passa a ser a trilha.
+    const { resultados, bloqueados } = await disputarComLinhaTravada(prisma, payment.id, [
+      () => postar(app, provider.assinarCorpo(corpo({ id: idAntigo, created_at: antigo.toISOString() }, { charge_ref: chargeRef }))),
+      () => postar(app, provider.assinarCorpo(corpo({ id: idNovo, created_at: novo.toISOString() }, { charge_ref: chargeRef }))),
     ]);
+    expect(bloqueados).toBe(2);
+    const [a, b] = resultados.map((r) => {
+      if (r.status !== 'fulfilled') throw r.reason;
+      return r.value;
+    });
 
     // Nenhuma das duas pede reentrega: uma aplicou, a outra e desfecho definitivo.
     expect(a.status).toBe(200);

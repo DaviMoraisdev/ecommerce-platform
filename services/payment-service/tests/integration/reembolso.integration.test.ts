@@ -10,6 +10,7 @@ import { WebhookService } from '../../src/services/webhook.service';
 import { assertTestDatabase } from '../helpers/testDbGuard';
 import { SEGREDO_WEBHOOK } from '../helpers/config';
 import { orderClientFalso, pedidoDeTeste } from '../helpers/prisma-fake';
+import { disputarComLinhaTravada } from '../helpers/linha-travada';
 
 /**
  * Reembolso INICIADO por nos (Bloco 7).
@@ -175,6 +176,37 @@ describe('reembolsar', () => {
     expect(atual.refundedAmountCents).toBe(parte);
     expect(atual.refundedAmountCents).toBeLessThanOrEqual(atual.capturedAmountCents);
     expect(await linhasDeReembolso(payment.id)).toHaveLength(1);
+  });
+
+  it('CASO R23: dois reembolsos concorrentes que CABEM somam, e o acumulado bate com a trilha', async () => {
+    // Complemento do R6. La quem separa os dois e o PROVEDOR (60% + 60% nao
+    // cabe) — medido: remover o CAS nao derruba o R6 (0/4), e nao deveria.
+    // Aqui os dois cabem (30% + 30%), o provedor aceita ambos, e o unico
+    // mecanismo entre eles e o CAS aritmetico de aplicarTotalDeReembolso: o
+    // perdedor recarrega e soma sobre o valor novo. Sem o CAS, o perdedor grava
+    // o total DELE (0 + parte) por cima do vencedor, e o acumulado deixa de
+    // bater com a soma das linhas.
+    //
+    // Sobreposicao FORCADA (helper linha-travada): os dois leem refunded = 0,
+    // chamam o provedor, e travam no updateMany.
+    const { service, userId, payment } = await pagamentoCapturado();
+    const parte = Math.floor(payment.capturedAmountCents * 0.3);
+
+    const { resultados, bloqueados } = await disputarComLinhaTravada(prisma, payment.id, [
+      () => service.reembolsar(pedidoDeReembolso(userId, payment.id, parte)),
+      () => service.reembolsar(pedidoDeReembolso(userId, payment.id, parte)),
+    ]);
+    expect(bloqueados).toBe(2);
+    for (const r of resultados) {
+      expect(r.status).toBe('fulfilled');
+      expect((r as PromiseFulfilledResult<{ tipo: string }>).value.tipo).toBe('aplicado');
+    }
+
+    const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(atual.refundedAmountCents).toBe(2 * parte);
+    const linhas = await linhasDeReembolso(payment.id);
+    expect(linhas).toHaveLength(2);
+    expect(linhas.reduce((acc, l) => acc + l.amountCents, 0)).toBe(atual.refundedAmountCents);
   });
 
   it('CASO R7: aceite ASSINCRONO nao move o total — quem confirma e o webhook', async () => {
