@@ -188,7 +188,7 @@ describe('outbox relay — ciclo de vida', () => {
     expect(d.markSent).toHaveBeenCalledTimes(1);
   });
 
-  it('CASO A13: tick PENDURADO nao segura o shutdown alem do teto — evento fica PENDING', async () => {
+  it('CASO A13: tick PENDURADO nao segura o shutdown alem do teto; se terminar depois, conclui SEM reagendar', async () => {
     // Politica declarada no stop: broker travado nao pode pendurar o
     // encerramento; o evento fica PENDING e sai no proximo boot (at-least-once).
     jest.useFakeTimers();
@@ -214,10 +214,18 @@ describe('outbox relay — ciclo de vida', () => {
     expect(d.markSent).not.toHaveBeenCalled();
     expect(d.markRetry).not.toHaveBeenCalled();
 
-    // Libera o tick pendurado para o afterEach nao esperar um teto que os fake
-    // timers nunca avancariam. Depois do stop, o tick que termina nao reagenda.
+    // DESTINO DO TRABALHO TARDIO (achado 4.1 do review do PR #67): o stop nao
+    // cancela o tick, apenas deixa de espera-lo. Se o broker confirmar depois,
+    // o tick termina o que comecou — a marca SENT e verdadeira, o evento FOI
+    // publicado — e NAO reagenda outro ciclo. "Fica PENDING" vale para o
+    // processo que morre antes da confirmacao, nao para o que sobrevive a ela.
+    const ciclosAntes = (d.fetchPending as jest.Mock).mock.calls.length;
     liberar(true);
     await jest.advanceTimersByTimeAsync(0);
+    expect(d.markSent).toHaveBeenCalledTimes(1);
+    expect(d.markRetry).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(5000);
+    expect((d.fetchPending as jest.Mock).mock.calls.length).toBe(ciclosAntes);
     aviso.mockRestore();
   });
 });

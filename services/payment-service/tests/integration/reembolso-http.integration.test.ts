@@ -98,6 +98,14 @@ async function linhasDeReembolso(paymentId: string) {
   return prisma.paymentTransaction.findMany({ where: { paymentId, type: TransactionType.REFUND } });
 }
 
+/** As tres invariantes de "nada aconteceu": acumulado, trilha e outbox. */
+async function semEfeito(paymentId: string) {
+  const atual = await prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
+  expect(atual.refundedAmountCents).toBe(0);
+  expect(await linhasDeReembolso(paymentId)).toHaveLength(0);
+  expect(await prisma.outboxEvent.count({ where: { routingKey: ROUTING_PAYMENT_REFUNDED } })).toBe(0);
+}
+
 describe('POST /payments/:id/refunds — costura ate o Postgres', () => {
   it('CASO H1: ADMIN reembolsa e o efeito chega ao banco e a outbox', async () => {
     const ctx = montar();
@@ -134,6 +142,8 @@ describe('POST /payments/:id/refunds — costura ate o Postgres', () => {
     const atual = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
     expect(atual.refundedAmountCents).toBe(parte);
     expect(await linhasDeReembolso(payment.id)).toHaveLength(1);
+    // Replay nao pode enfileirar um segundo evento: o consumidor aplicaria de novo.
+    expect(await prisma.outboxEvent.count({ where: { routingKey: ROUTING_PAYMENT_REFUNDED } })).toBe(1);
   });
 
   it('CASO H3: sem role ADMIN e 403 e o banco nao e tocado', async () => {
@@ -157,7 +167,7 @@ describe('POST /payments/:id/refunds — costura ate o Postgres', () => {
     const res = await reembolsar(ctx.app, payment.id, 100, { token: null });
 
     expect(res.status).toBe(401);
-    expect(await linhasDeReembolso(payment.id)).toHaveLength(0);
+    await semEfeito(payment.id);
   });
 
   it('CASO H5: com a flag desligada a rota NAO existe (404, nao 503)', async () => {
@@ -167,6 +177,6 @@ describe('POST /payments/:id/refunds — costura ate o Postgres', () => {
     const res = await reembolsar(ctx.app, payment.id, 100);
 
     expect(res.status).toBe(404);
-    expect(await linhasDeReembolso(payment.id)).toHaveLength(0);
+    await semEfeito(payment.id);
   });
 });

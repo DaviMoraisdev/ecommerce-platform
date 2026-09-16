@@ -537,7 +537,13 @@ describe('replay idempotente', () => {
  * a transacao for removida (sabotagem), o create precisa continuar falhando
  * para que o claim persistido fora dela seja o que denuncia.
  */
-function prismaQueFalhaNaTrilha(cliente: PrismaClient): PrismaClient {
+interface SondaDaFalha {
+  alcancada: boolean;
+  /** attemptCount lido DENTRO da transacao, no instante da falha injetada. */
+  attemptCountNaFalha: number | null;
+}
+
+function prismaQueFalhaNaTrilha(cliente: PrismaClient, sonda: SondaDaFalha): PrismaClient {
   const comFalha = <T extends object>(obj: T): T =>
     new Proxy(obj, {
       get(alvo, prop, receiver) {
@@ -545,7 +551,19 @@ function prismaQueFalhaNaTrilha(cliente: PrismaClient): PrismaClient {
           const delegate = Reflect.get(alvo, prop, receiver) as Record<string, unknown>;
           return new Proxy(delegate, {
             get(d, m, r) {
-              if (m === 'create') return async () => { throw new Error('falha injetada apos o claim'); };
+              if (m === 'create') {
+                return async (args: { data: { paymentId: string } }) => {
+                  // Achado 5.1 do review do PR #67: a sonda prova que a falha veio
+                  // DEPOIS do claim — le a linha pela MESMA transacao (ve o
+                  // incremento ainda nao commitado) antes de lancar.
+                  const linha = await (alvo as unknown as PrismaClient).payment.findUnique({
+                    where: { id: args.data.paymentId },
+                  });
+                  sonda.alcancada = true;
+                  sonda.attemptCountNaFalha = linha?.attemptCount ?? null;
+                  throw new Error('falha injetada apos o claim');
+                };
+              }
               return Reflect.get(d, m, r);
             },
           });
@@ -581,8 +599,9 @@ describe('persistirTentativa — atomicidade (Bloco 8d)', () => {
     const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
     const espiao = jest.spyOn(provider, 'createCharge');
     const pedido = pedidoDeTeste({ id: base.orderId, userId: base.userId });
+    const sonda: SondaDaFalha = { alcancada: false, attemptCountNaFalha: null };
     const service = new PaymentService({
-      prisma: prismaQueFalhaNaTrilha(prisma),
+      prisma: prismaQueFalhaNaTrilha(prisma, sonda),
       orderClient: orderClientFalso(jest.fn(async () => pedido)),
       provider,
       currency: 'BRL',
@@ -591,7 +610,12 @@ describe('persistirTentativa — atomicidade (Bloco 8d)', () => {
 
     await expect(
       service.criarPagamento({ ...base.input, idempotencyKey: randomUUID(), paymentMethodToken: FAKE_TOKENS.SUCCESS }),
-    ).rejects.toThrow();
+    ).rejects.toThrow('falha injetada apos o claim');
+
+    // A falha veio do ponto injetado, e o claim JA tinha rodado quando ela veio:
+    // dentro da transacao a linha mostrava 2.
+    expect(sonda.alcancada).toBe(true);
+    expect(sonda.attemptCountNaFalha).toBe(2);
 
     const depois = await prisma.payment.findUniqueOrThrow({ where: { id: antes.id } });
     // A assercao com dentes: o claim rodou (1 -> 2) e foi DESFEITO.
