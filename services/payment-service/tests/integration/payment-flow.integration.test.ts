@@ -529,3 +529,102 @@ describe('replay idempotente', () => {
     });
   });
 });
+
+/**
+ * Injecao de falha SEM seam em producao: o servico recebe `prisma` por
+ * dependencia, entao um Proxy intercepta `paymentTransaction.create` tanto no
+ * client quanto no `tx` que o $transaction entrega. Os dois niveis importam: se
+ * a transacao for removida (sabotagem), o create precisa continuar falhando
+ * para que o claim persistido fora dela seja o que denuncia.
+ */
+interface SondaDaFalha {
+  alcancada: boolean;
+  /** attemptCount lido DENTRO da transacao, no instante da falha injetada. */
+  attemptCountNaFalha: number | null;
+}
+
+function prismaQueFalhaNaTrilha(cliente: PrismaClient, sonda: SondaDaFalha): PrismaClient {
+  const comFalha = <T extends object>(obj: T): T =>
+    new Proxy(obj, {
+      get(alvo, prop, receiver) {
+        if (prop === 'paymentTransaction') {
+          const delegate = Reflect.get(alvo, prop, receiver) as Record<string, unknown>;
+          return new Proxy(delegate, {
+            get(d, m, r) {
+              if (m === 'create') {
+                return async (args: { data: { paymentId: string } }) => {
+                  // Achado 5.1 do review do PR #67: a sonda prova que a falha veio
+                  // DEPOIS do claim — le a linha pela MESMA transacao (ve o
+                  // incremento ainda nao commitado) antes de lancar.
+                  const linha = await (alvo as unknown as PrismaClient).payment.findUnique({
+                    where: { id: args.data.paymentId },
+                  });
+                  sonda.alcancada = true;
+                  sonda.attemptCountNaFalha = linha?.attemptCount ?? null;
+                  throw new Error('falha injetada apos o claim');
+                };
+              }
+              return Reflect.get(d, m, r);
+            },
+          });
+        }
+        if (prop === '$transaction') {
+          type Interativa = (fn: (tx: object) => Promise<unknown>, opts?: unknown) => Promise<unknown>;
+          const real = (Reflect.get(alvo, prop, receiver) as Interativa).bind(alvo);
+          return (fn: (tx: object) => Promise<unknown>, opts?: unknown) =>
+            real((tx) => fn(comFalha(tx)), opts);
+        }
+        const v = Reflect.get(alvo, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(alvo) : v;
+      },
+    });
+  return comFalha(cliente);
+}
+
+describe('persistirTentativa — atomicidade (Bloco 8d)', () => {
+  it('CASO T1: falha DEPOIS do claim de attemptCount desfaz o claim', async () => {
+    // O que ja era provado: ordem das operacoes (duble) e concorrencia real.
+    // O que NAO era: que uma falha depois de uma escrita bem-sucedida dentro da
+    // transacao desfaz a anterior — na corrida a falha vem no PRIMEIRO create,
+    // sem escrita previa para desfazer. Aqui o claim (attemptCount 1 -> 2)
+    // acontece de verdade e a trilha falha em seguida.
+    const base = cenario(FAKE_TOKENS.DECLINED_INSUFFICIENT_FUNDS);
+    const recusado = await base.service.criarPagamento(base.input);
+    expect(recusado.status).toBe(PaymentStatus.FAILED);
+    const antes = await prisma.payment.findUniqueOrThrow({ where: { orderId: base.orderId } });
+    expect(antes.attemptCount).toBe(1);
+    const linhasAntes = await prisma.paymentTransaction.count({ where: { paymentId: antes.id } });
+    const registrosAntes = await prisma.idempotencyRecord.count({ where: { paymentId: antes.id } });
+
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiao = jest.spyOn(provider, 'createCharge');
+    const pedido = pedidoDeTeste({ id: base.orderId, userId: base.userId });
+    const sonda: SondaDaFalha = { alcancada: false, attemptCountNaFalha: null };
+    const service = new PaymentService({
+      prisma: prismaQueFalhaNaTrilha(prisma, sonda),
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+
+    await expect(
+      service.criarPagamento({ ...base.input, idempotencyKey: randomUUID(), paymentMethodToken: FAKE_TOKENS.SUCCESS }),
+    ).rejects.toThrow('falha injetada apos o claim');
+
+    // A falha veio do ponto injetado, e o claim JA tinha rodado quando ela veio:
+    // dentro da transacao a linha mostrava 2.
+    expect(sonda.alcancada).toBe(true);
+    expect(sonda.attemptCountNaFalha).toBe(2);
+
+    const depois = await prisma.payment.findUniqueOrThrow({ where: { id: antes.id } });
+    // A assercao com dentes: o claim rodou (1 -> 2) e foi DESFEITO.
+    expect(depois.attemptCount).toBe(1);
+    expect(depois.status).toBe(PaymentStatus.FAILED);
+    expect(await prisma.paymentTransaction.count({ where: { paymentId: antes.id } })).toBe(linhasAntes);
+    // O vinculo chave -> pagamento e a ultima escrita da transacao; tambem desfeito.
+    expect(await prisma.idempotencyRecord.count({ where: { paymentId: antes.id } })).toBe(registrosAntes);
+    // Nada chegou ao provedor: a falha veio antes do efeito externo.
+    expect(espiao).not.toHaveBeenCalled();
+  });
+});

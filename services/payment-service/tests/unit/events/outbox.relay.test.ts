@@ -146,4 +146,86 @@ describe('outbox relay — ciclo de vida', () => {
     await jest.advanceTimersByTimeAsync(5000);
     expect((d.fetchPending as jest.Mock).mock.calls.length).toBe(antes);
   });
+
+  it('CASO A11: dois start seguidos criam UM laco, nao dois', async () => {
+    // Uma reconexao agendada coincidindo com um start manual chamaria start
+    // duas vezes. Sem a guarda `iniciado`, cada chamada agenda o proprio timer e
+    // o relay passa a rodar dois ciclos por intervalo — cada um publicando o
+    // mesmo lote (o tick concorrente e no-op, mas so dentro do MESMO ciclo).
+    jest.useFakeTimers();
+    const d = deps({ fetchPending: jest.fn(async () => []) });
+
+    startOutboxRelay(d);
+    startOutboxRelay(d);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(d.fetchPending).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(d.fetchPending).toHaveBeenCalledTimes(2);
+  });
+
+  it('CASO A12: stop AGUARDA o ciclo em voo terminar antes de resolver', async () => {
+    // Encerrar no meio de uma publicacao deixaria o evento SENT sem confirm
+    // (ou confirmado sem marca). O stop precisa esperar o tick que ja comecou.
+    jest.useFakeTimers();
+    let liberar!: (ok: boolean) => void;
+    const d = deps({
+      publish: jest.fn(() => new Promise<boolean>((r) => { liberar = r; })),
+    });
+
+    startOutboxRelay(d);
+    await jest.advanceTimersByTimeAsync(0); // tick em voo, parado no publish
+
+    let parou = false;
+    const parada = stopOutboxRelay().then(() => { parou = true; });
+    await jest.advanceTimersByTimeAsync(1000); // abaixo do teto de 5000
+    expect(parou).toBe(false);
+    expect(d.markSent).not.toHaveBeenCalled();
+
+    liberar(true);
+    await parada;
+    expect(parou).toBe(true);
+    expect(d.markSent).toHaveBeenCalledTimes(1);
+  });
+
+  it('CASO A13: tick PENDURADO nao segura o shutdown alem do teto; se terminar depois, conclui SEM reagendar', async () => {
+    // Politica declarada no stop: broker travado nao pode pendurar o
+    // encerramento; o evento fica PENDING e sai no proximo boot (at-least-once).
+    jest.useFakeTimers();
+    const aviso = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    let liberar!: (ok: boolean) => void;
+    const d = deps({
+      publish: jest.fn(() => new Promise<boolean>((r) => { liberar = r; })),
+    });
+
+    startOutboxRelay(d);
+    await jest.advanceTimersByTimeAsync(0);
+
+    let parou = false;
+    const parada = stopOutboxRelay().then(() => { parou = true; });
+    await jest.advanceTimersByTimeAsync(4999);
+    expect(parou).toBe(false);
+    await jest.advanceTimersByTimeAsync(1); // STOP_TIMEOUT_MS = 5000 (default, lido no import)
+    await parada;
+
+    expect(parou).toBe(true);
+    expect(aviso).toHaveBeenCalledWith(expect.stringContaining('nao terminou em 5000ms'));
+    // Nenhuma marca: o evento segue PENDING para o proximo boot.
+    expect(d.markSent).not.toHaveBeenCalled();
+    expect(d.markRetry).not.toHaveBeenCalled();
+
+    // DESTINO DO TRABALHO TARDIO (achado 4.1 do review do PR #67): o stop nao
+    // cancela o tick, apenas deixa de espera-lo. Se o broker confirmar depois,
+    // o tick termina o que comecou — a marca SENT e verdadeira, o evento FOI
+    // publicado — e NAO reagenda outro ciclo. "Fica PENDING" vale para o
+    // processo que morre antes da confirmacao, nao para o que sobrevive a ela.
+    const ciclosAntes = (d.fetchPending as jest.Mock).mock.calls.length;
+    liberar(true);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(d.markSent).toHaveBeenCalledTimes(1);
+    expect(d.markRetry).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(5000);
+    expect((d.fetchPending as jest.Mock).mock.calls.length).toBe(ciclosAntes);
+    aviso.mockRestore();
+  });
 });
