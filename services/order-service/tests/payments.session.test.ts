@@ -217,9 +217,13 @@ describe('sessao do consumidor — resultado tardio e disposicao', () => {
     );
 
     const emVoo = mod.iniciarConsumidorPagamentos().catch(() => undefined);
-    await new Promise((r) => setTimeout(r, 300)); // deixa o deadline de 200ms vencer
-    liberar(cx);
+    // Espera a PROPRIA rejeicao do deadline (200 ms), nao um timer paralelo de
+    // 300 ms. Com dois timers, a reconexao (deadline + 100 ms) podia disparar
+    // antes do de 300 ms num runner lento; `liberar` passava a apontar para o
+    // connect da RECONEXAO, liberar(cx) abria uma sessao valida e createChannel
+    // era chamado — falhou no CI (run 35110887242). Um evento ordena o outro.
     await emVoo;
+    liberar(cx);
     await new Promise((r) => setTimeout(r, 20));
 
     expect(cx.createChannel).not.toHaveBeenCalled();
