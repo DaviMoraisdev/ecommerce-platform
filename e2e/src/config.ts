@@ -33,13 +33,24 @@ export function assertLocalTarget(url: string, allowDestructive: boolean): strin
 
 export interface E2eConfig {
   secret: string;
-  urls: { product: string; inventory: string; cart: string; order: string; auth: string; redis: string };
+  /** Segredo do HMAC dos webhooks do payment-service (Bloco 8f). */
+  webhookSecret: string;
+  urls: {
+    product: string;
+    inventory: string;
+    cart: string;
+    order: string;
+    auth: string;
+    redis: string;
+    payment: string;
+  };
   httpTimeoutMs: number;
 }
 
 export function resolveConfig(env: NodeJS.ProcessEnv = process.env): E2eConfig {
   const allow = env.E2E_ALLOW_DESTRUCTIVE === 'true';
   const secret = requireEnv(env, 'JWT_SECRET');
+  const webhookSecret = requireEnv(env, 'PAYMENT_WEBHOOK_SECRET');
   if (secret === 'troque_este_segredo') {
     throw new Error('e2e: JWT_SECRET e o placeholder; use o segredo real dos servicos no .env');
   }
@@ -54,7 +65,9 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): E2eConfig {
       order: t('ORDER_URL'),
       auth: t('AUTH_URL'),
       redis: t('REDIS_URL'),
+      payment: t('PAYMENT_URL'),
     },
+    webhookSecret,
     httpTimeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 8000,
   };
 }

@@ -8,6 +8,8 @@ const baseEnv = {
   ORDER_URL: 'http://localhost:3006',
   AUTH_URL: 'http://localhost:3001',
   REDIS_URL: 'redis://:senha@127.0.0.1:6379',
+  PAYMENT_URL: 'http://localhost:3007',
+  PAYMENT_WEBHOOK_SECRET: 'segredo-webhook-de-teste',
 } as NodeJS.ProcessEnv;
 
 describe('config e2e (trava e validacao)', () => {
