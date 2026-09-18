@@ -1,7 +1,7 @@
 import {
   mintToken, key, seedProduct, cleanupProduct, setStock, getStock,
-  addToCart, createOrder, createPayment, getOrder, waitForOrderStatus,
-  signWebhook, postWebhook, fakeWebhookBody, request, health, PAYMENT_URL,
+  addToCart, createOrder, createPayment, getOrderStatus, waitForOrderStatus, waitUntil,
+  signWebhook, postWebhook, fakeWebhookBody, request, health, paymentUrl,
 } from '../src/helpers';
 
 /**
@@ -46,7 +46,7 @@ async function pedidoPendente(token: string, productId: string): Promise<string>
 
 beforeAll(async () => {
   const h = await health();
-  h.payment = (await request('GET', PAYMENT_URL + '/health')).status;
+  h.payment = (await request('GET', paymentUrl() + '/health')).status;
   const down = Object.entries(h).filter(([, s]) => s !== 200);
   if (down.length) throw new Error('stack incompleto: ' + JSON.stringify(h));
 });
@@ -82,15 +82,32 @@ describe('e2e - pagamento ponta a ponta (payment -> broker -> order)', () => {
     expect(aceito.body).toMatchObject({ orderId, status: 'PROCESSING' });
 
     // Janela (1 min) + poll da varredura + relay + consumidor. Teto generoso,
-    // mas o caso termina assim que o status chegar.
-    const status = await waitForOrderStatus(token, orderId, 'CANCELADO', PAYMENT_WINDOW_MS + 60_000, 1_000);
-    expect(status).toBe('CANCELADO');
-    expect((await getStock(productId)).reserved).toBe(0);
+    // mas o caso termina assim que AS DUAS condicoes valerem.
+    //
+    // Pedido e estoque vivem em servicos diferentes: esperar so o status e ler
+    // o estoque uma vez tornava o caso intermitente se a liberacao ficasse
+    // visivel depois da transicao (achado 4.2 do review do PR #69). A espera
+    // conjunta tambem faz a mensagem de falha mostrar os dois lados.
+    const estado = await waitUntil(
+      async () => ({
+        status: await getOrderStatus(token, orderId),
+        reserved: (await getStock(productId)).reserved,
+      }),
+      (e) => e.status === 'CANCELADO' && e.reserved === 0,
+      PAYMENT_WINDOW_MS + 60_000,
+      1_000,
+    );
+    expect(estado).toEqual({ status: 'CANCELADO', reserved: 0 });
   }, 150_000);
 });
 
 describe('e2e - webhook do provedor (rota real, sem broker)', () => {
-  it('P3: assinatura invalida -> 401 e nada e gravado', async () => {
+  it('P3: assinatura invalida e recusada com 401', async () => {
+    // O que este caso prova: a rota recusa bytes nao autenticados. Que NADA e
+    // gravado no inbox antes da autenticacao esta provado contra Postgres na
+    // integracao do payment (Bloco 4) — aqui nao ha como observar persistencia
+    // sem trazer um cliente de banco para a suite, e um nome que afirmasse isso
+    // seria mais forte que a assercao (achado 3 do review do PR #69).
     const forjado = signWebhook(fakeWebhookBody(), { secret: 'segredo-errado-' + key() });
     const r = await postWebhook(forjado);
     expect(r.status).toBe(401);
@@ -98,22 +115,28 @@ describe('e2e - webhook do provedor (rota real, sem broker)', () => {
   });
 
   it('P4: evento autentico para cobranca DESCONHECIDA -> 503 retentavel', async () => {
-    // Contrato do write-ahead (Bloco 4): providerRef desconhecido nao e erro
-    // terminal; a linha nasce no inbox e o provedor deve reentregar.
+    // O que este caso prova: o contrato HTTP do write-ahead (Bloco 4) —
+    // providerRef desconhecido nao e erro terminal, e o provedor deve
+    // reentregar. Que a linha nasce no inbox e provado na integracao; daqui so
+    // se observa o codigo de resposta (achado 6.1 do review do PR #69).
     const r = await postWebhook(signWebhook(fakeWebhookBody()));
     expect(r.status).toBe(503);
     expect(r.body).toMatchObject({ code: 'EVENTO_AINDA_NAO_APLICAVEL' });
   });
 
-  it('P5: um pedido PAGO nao e alterado por webhook forjado', async () => {
-    const token = mintToken('u-' + key(), 'USER');
-    const productId = await newProduct(50, 3);
-    const orderId = await pedidoPendente(token, productId);
-    expect((await createPayment(token, orderId, TOK_SUCCESS, key('pay'))).status).toBe(201);
-    expect(await waitForOrderStatus(token, orderId, 'PAGO', 15_000)).toBe('PAGO');
-
-    const forjado = signWebhook(fakeWebhookBody({ type: 'payment.canceled' }), { secret: 'x' + key() });
-    expect((await postWebhook(forjado)).status).toBe(401);
-    expect((await getOrder(token, orderId)).body.status).toBe('PAGO');
-  }, 30_000);
+  it('P5: assinatura valida FORA da janela de tolerancia -> 401', async () => {
+    // Discrimina em par com o P4: MESMO corpo, MESMA assinatura valida — muda
+    // so o timestamp. Com o atual, 503 (P4); com 600 s de idade, 401. Como a
+    // assinatura confere, a unica recusa possivel e a verificacao de frescor
+    // (tolerancia de 300 s no provedor). Substitui o caso anterior, que enviava
+    // webhook forjado para uma cobranca inexistente e afirmava que um pedido
+    // pago nao mudava: a rejeicao vinha da assinatura, entao o vinculo com o
+    // pedido nunca era exercitado (achado 6.2 do review do PR #69).
+    const velho = signWebhook(fakeWebhookBody(), {
+      timestampSeconds: Math.floor(Date.now() / 1000) - 600,
+    });
+    const r = await postWebhook(velho);
+    expect(r.status).toBe(401);
+    expect(r.body).toMatchObject({ code: 'ASSINATURA_INVALIDA' });
+  });
 });

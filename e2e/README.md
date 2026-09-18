@@ -48,7 +48,7 @@ Cria dados reais e usa JWT -> por seguranca, so roda contra localhost por padrao
 Cobertura: pago ponta a ponta (outbox -> relay -> RabbitMQ -> pedido PAGO); expiracao +
 compensacao (pedido CANCELADO, reserva liberada — o caso espera a janela real, ~1-2 min);
 webhook com assinatura invalida (401); webhook autentico para cobranca desconhecida (503
-retentavel). Duplicado, fora de ordem e valor divergente ficam na integracao do payment:
+retentavel); assinatura valida fora da janela de tolerancia (401). Duplicado, fora de ordem e valor divergente ficam na integracao do payment:
 o e2e nao tem a referencia da cobranca e a rota nao distingue os desfechos pelo corpo.
 
 ## Futuro (TECH_DEBT, Fase 7)

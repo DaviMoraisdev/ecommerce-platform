@@ -33,24 +33,32 @@ export function assertLocalTarget(url: string, allowDestructive: boolean): strin
 
 export interface E2eConfig {
   secret: string;
-  /** Segredo do HMAC dos webhooks do payment-service (Bloco 8f). */
-  webhookSecret: string;
-  urls: {
-    product: string;
-    inventory: string;
-    cart: string;
-    order: string;
-    auth: string;
-    redis: string;
-    payment: string;
-  };
+  urls: { product: string; inventory: string; cart: string; order: string; auth: string; redis: string };
   httpTimeoutMs: number;
+}
+
+/**
+ * Configuracao do payment-service, SEPARADA da comum (achado 4.1 do review do
+ * PR #69). Exigi-la em resolveConfig tornava PAYMENT_URL e
+ * PAYMENT_WEBHOOK_SECRET obrigatorias para as suites que nao tocam pagamento,
+ * porque todas importam o mesmo modulo de helpers.
+ */
+export interface PaymentConfig {
+  url: string;
+  webhookSecret: string;
+}
+
+export function resolvePaymentConfig(env: NodeJS.ProcessEnv = process.env): PaymentConfig {
+  const allow = env.E2E_ALLOW_DESTRUCTIVE === 'true';
+  return {
+    url: assertLocalTarget(requireEnv(env, 'PAYMENT_URL'), allow),
+    webhookSecret: requireEnv(env, 'PAYMENT_WEBHOOK_SECRET'),
+  };
 }
 
 export function resolveConfig(env: NodeJS.ProcessEnv = process.env): E2eConfig {
   const allow = env.E2E_ALLOW_DESTRUCTIVE === 'true';
   const secret = requireEnv(env, 'JWT_SECRET');
-  const webhookSecret = requireEnv(env, 'PAYMENT_WEBHOOK_SECRET');
   if (secret === 'troque_este_segredo') {
     throw new Error('e2e: JWT_SECRET e o placeholder; use o segredo real dos servicos no .env');
   }
@@ -65,9 +73,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): E2eConfig {
       order: t('ORDER_URL'),
       auth: t('AUTH_URL'),
       redis: t('REDIS_URL'),
-      payment: t('PAYMENT_URL'),
     },
-    webhookSecret,
     httpTimeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 8000,
   };
 }

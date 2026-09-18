@@ -1,4 +1,4 @@
-import { resolveConfig, assertLocalTarget, redactUrl } from '../src/config';
+import { resolveConfig, resolvePaymentConfig, assertLocalTarget, redactUrl } from '../src/config';
 
 const baseEnv = {
   JWT_SECRET: 'segredo-real-de-teste',
@@ -8,9 +8,38 @@ const baseEnv = {
   ORDER_URL: 'http://localhost:3006',
   AUTH_URL: 'http://localhost:3001',
   REDIS_URL: 'redis://:senha@127.0.0.1:6379',
+} as NodeJS.ProcessEnv;
+
+const paymentEnv = {
+  ...baseEnv,
   PAYMENT_URL: 'http://localhost:3007',
   PAYMENT_WEBHOOK_SECRET: 'segredo-webhook-de-teste',
 } as NodeJS.ProcessEnv;
+
+describe('config de pagamento (Bloco 8f, separada da comum)', () => {
+  it('a configuracao COMUM resolve sem as variaveis de pagamento', () => {
+    // Regressao do achado 4.1: exigi-las aqui quebrava as suites anteriores.
+    expect(() => resolveConfig(baseEnv)).not.toThrow();
+  });
+
+  it('resolvePaymentConfig devolve url e segredo', () => {
+    const cfg = resolvePaymentConfig(paymentEnv);
+    expect(cfg.url).toBe('http://localhost:3007');
+    expect(cfg.webhookSecret).toBe('segredo-webhook-de-teste');
+  });
+
+  it('PAYMENT_URL remoto e bloqueado pela mesma trava das demais', () => {
+    expect(() =>
+      resolvePaymentConfig({ ...paymentEnv, PAYMENT_URL: 'http://pagamentos.exemplo.com' }),
+    ).toThrow(/BLOQUEADO/);
+  });
+
+  it('segredo de webhook ausente e recusado', () => {
+    const sem: NodeJS.ProcessEnv = { ...paymentEnv };
+    delete sem.PAYMENT_WEBHOOK_SECRET;
+    expect(() => resolvePaymentConfig(sem)).toThrow(/PAYMENT_WEBHOOK_SECRET/);
+  });
+});
 
 describe('config e2e (trava e validacao)', () => {
   it('aceita alvos locais e o segredo real', () => {
