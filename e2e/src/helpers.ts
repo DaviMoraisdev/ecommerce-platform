@@ -1,8 +1,9 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
+import { createHmac } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import Redis from 'ioredis';
-import { resolveConfig, redactUrl } from './config';
+import { resolveConfig, resolvePaymentConfig, redactUrl, type PaymentConfig } from './config';
 
 const cfg = resolveConfig();
 const SECRET = cfg.secret;
@@ -14,6 +15,17 @@ export const URLS = {
 };
 const AUTH = cfg.urls.auth;
 const REDIS = cfg.urls.redis;
+// Resolvida SOB DEMANDA: este modulo e importado por TODAS as suites, e
+// resolver pagamento no import tornava suas variaveis obrigatorias para quem
+// nao usa pagamento (achado 4.1 do review do PR #69).
+let paymentCache: PaymentConfig | null = null;
+function paymentCfg(): PaymentConfig {
+  if (paymentCache === null) paymentCache = resolvePaymentConfig();
+  return paymentCache;
+}
+export function paymentUrl(): string {
+  return paymentCfg().url;
+}
 const HTTP_TIMEOUT_MS = cfg.httpTimeoutMs;
 
 export function mintToken(id: string, role = 'ADMIN', expiresIn: string | number = '1h'): string {
@@ -37,12 +49,25 @@ function trunc(v: unknown): string {
 export async function request(
   method: string,
   url: string,
-  opts: { token?: string; body?: unknown; idempotencyKey?: string } = {}
+  opts: {
+    token?: string;
+    body?: unknown;
+    idempotencyKey?: string;
+    /** Cabecalhos extras (assinatura de webhook). */
+    headers?: Record<string, string>;
+    /** Corpo JA serializado: um webhook assinado tem de ir byte a byte. */
+    rawBody?: string;
+  } = {}
 ): Promise<HttpResult> {
+  if (opts.body !== undefined && opts.rawBody !== undefined) {
+    // Assinar um conteudo e enviar outro e defeito silencioso: falhar alto.
+    throw new Error('request: body e rawBody sao mutuamente exclusivos');
+  }
   const headers: Record<string, string> = {};
   if (opts.token) headers['Authorization'] = 'Bearer ' + opts.token;
-  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+  if (opts.body !== undefined || opts.rawBody !== undefined) headers['Content-Type'] = 'application/json';
   if (opts.idempotencyKey) headers['Idempotency-Key'] = opts.idempotencyKey;
+  if (opts.headers) Object.assign(headers, opts.headers);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
@@ -50,7 +75,7 @@ export async function request(
     const res = await fetch(url, {
       method,
       headers,
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      body: opts.rawBody ?? (opts.body !== undefined ? JSON.stringify(opts.body) : undefined),
       signal: controller.signal,
     });
     const text = await res.text();
@@ -176,4 +201,111 @@ export async function health(): Promise<Record<string, number>> {
     }
   }
   return out;
+}
+
+// ===================== payment-service (Bloco 8f) =====================
+
+export async function createPayment(
+  token: string,
+  orderId: string,
+  paymentMethodToken: string,
+  idempotencyKey: string
+): Promise<HttpResult> {
+  return request('POST', paymentUrl() + '/payments', {
+    token,
+    body: { orderId, paymentMethodToken },
+    idempotencyKey,
+  });
+}
+
+export async function getOrder(token: string, orderId: string): Promise<HttpResult> {
+  return request('GET', URLS.order + '/orders/' + orderId, { token });
+}
+
+/**
+ * Status do pedido, exigindo 200. Uma resposta de erro nao pode virar polling
+ * cego ate o teto (achado 4.3 do review do PR #69): 401/404/500 sao defeito de
+ * pre-requisito, nao "ainda nao chegou", e a causa tem de aparecer na hora.
+ */
+export async function getOrderStatus(token: string, orderId: string): Promise<string> {
+  const r = await getOrder(token, orderId);
+  if (r.status !== 200) {
+    throw new Error('GET /orders/' + orderId + ' respondeu ' + r.status + ': ' + trunc(r.body));
+  }
+  return String(r.body?.status);
+}
+
+/**
+ * Espera uma condicao por polling com teto. Nunca `sleep` fixo: o caminho passa
+ * por outbox -> relay -> broker -> consumidor, e o tempo varia. Devolve o ultimo
+ * valor OBSERVADO — e ele que aparece na mensagem de falha do caso.
+ */
+export async function waitUntil<T>(
+  observar: () => Promise<T>,
+  satisfeita: (valor: T) => boolean,
+  timeoutMs: number,
+  intervalMs = 500
+): Promise<T> {
+  const limite = Date.now() + timeoutMs;
+  let visto = await observar();
+  while (!satisfeita(visto) && Date.now() < limite) {
+    await new Promise((res) => setTimeout(res, intervalMs));
+    visto = await observar();
+  }
+  return visto;
+}
+
+export async function waitForOrderStatus(
+  token: string,
+  orderId: string,
+  status: string,
+  timeoutMs: number,
+  intervalMs = 500
+): Promise<string> {
+  return waitUntil(() => getOrderStatus(token, orderId), (s) => s === status, timeoutMs, intervalMs);
+}
+
+/**
+ * Assina como o FakeProvider verifica: header `x-fake-signature: t=<s>,v1=<hex>`,
+ * HMAC-SHA256 sobre `"<t>." + corpo`.
+ *
+ * O timestamp entra no material assinado para que NAO possa ser trocado sem
+ * invalidar a assinatura; quem limita replay e a verificacao de frescor do
+ * receptor (tolerancia de 300 s) somada a deduplicacao do inbox. Dizer
+ * "anti-replay" so pela assinatura era impreciso (achado 5.3, review do PR #69).
+ */
+export function signWebhook(
+  body: unknown,
+  opts: { secret?: string; timestampSeconds?: number } = {}
+): { rawBody: string; header: string } {
+  const rawBody = JSON.stringify(body);
+  const t = opts.timestampSeconds ?? Math.floor(Date.now() / 1000);
+  const v1 = createHmac('sha256', opts.secret ?? paymentCfg().webhookSecret)
+    .update(Buffer.concat([Buffer.from(t + '.', 'utf8'), Buffer.from(rawBody, 'utf8')]))
+    .digest('hex');
+  return { rawBody, header: 't=' + t + ',v1=' + v1 };
+}
+
+export async function postWebhook(signed: { rawBody: string; header: string }): Promise<HttpResult> {
+  return request('POST', paymentUrl() + '/webhooks/fake', {
+    rawBody: signed.rawBody,
+    headers: { 'x-fake-signature': signed.header },
+  });
+}
+
+/** Corpo minimo que passa no envelope e na estrutura de cobranca do fake.wire. */
+export function fakeWebhookBody(overrides: Partial<{ id: string; type: string; charge_ref: string }> = {}) {
+  return {
+    id: overrides.id ?? 'evt_' + key(),
+    type: overrides.type ?? 'payment.succeeded',
+    created_at: new Date().toISOString(),
+    data: {
+      charge_ref: overrides.charge_ref ?? 'ch_inexistente_' + key(),
+      state: 'SUCCEEDED',
+      captured_amount_cents: 1000,
+      refunded_amount_cents: 0,
+      refund_ref: null,
+      decline_code: null,
+    },
+  };
 }

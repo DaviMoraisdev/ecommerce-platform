@@ -37,6 +37,25 @@ export interface E2eConfig {
   httpTimeoutMs: number;
 }
 
+/**
+ * Configuracao do payment-service, SEPARADA da comum (achado 4.1 do review do
+ * PR #69). Exigi-la em resolveConfig tornava PAYMENT_URL e
+ * PAYMENT_WEBHOOK_SECRET obrigatorias para as suites que nao tocam pagamento,
+ * porque todas importam o mesmo modulo de helpers.
+ */
+export interface PaymentConfig {
+  url: string;
+  webhookSecret: string;
+}
+
+export function resolvePaymentConfig(env: NodeJS.ProcessEnv = process.env): PaymentConfig {
+  const allow = env.E2E_ALLOW_DESTRUCTIVE === 'true';
+  return {
+    url: assertLocalTarget(requireEnv(env, 'PAYMENT_URL'), allow),
+    webhookSecret: requireEnv(env, 'PAYMENT_WEBHOOK_SECRET'),
+  };
+}
+
 export function resolveConfig(env: NodeJS.ProcessEnv = process.env): E2eConfig {
   const allow = env.E2E_ALLOW_DESTRUCTIVE === 'true';
   const secret = requireEnv(env, 'JWT_SECRET');
