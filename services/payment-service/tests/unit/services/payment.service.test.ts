@@ -971,11 +971,16 @@ describe('criarPagamento — evento de captura na outbox', () => {
 
     await service.criarPagamento(entrada());
 
-    expect(falso.outboxEvent.create).toHaveBeenCalledTimes(1);
-    const args = falso.outboxEvent.create.mock.calls[0][0] as {
-      data: { eventId: string; routingKey: string; payload: Record<string, unknown> };
+    expect(falso.outboxEvent.createMany).toHaveBeenCalledTimes(1);
+    const args = falso.outboxEvent.createMany.mock.calls[0][0] as {
+      data: Array<{ eventId: string; routingKey: string; payload: Record<string, unknown> }>;
+      skipDuplicates: boolean;
     };
-    expect(args.data.routingKey).toBe('payment.captured');
-    expect(args.data.eventId).toBe('payment.captured:' + String(args.data.payload.paymentId));
+    // Um evento por chamada, e a insercao que NAO envenena a transacao (9a-1).
+    expect(args.data).toHaveLength(1);
+    expect(args.skipDuplicates).toBe(true);
+    const [ev] = args.data;
+    expect(ev.routingKey).toBe('payment.captured');
+    expect(ev.eventId).toBe('payment.captured:' + String(ev.payload.paymentId));
   });
 });
