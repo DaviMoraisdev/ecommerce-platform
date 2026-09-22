@@ -14,7 +14,9 @@ describe('mesmoFato — o que conta como duplicata do mesmo evento', () => {
   it('O-U2: a ordem das chaves nao importa (o jsonb reordena ao gravar)', () => {
     const reordenado = {
       routingKey: 'payment.captured',
-      payload: { occurredAt: 'x', currency: 'BRL', amountCents: 1000, orderId: 'ord_1', paymentId: 'pay_1' },
+      // MESMO occurredAt da base: o caso varia so a ordem. Com 'x' ele variava
+      // duas coisas e so passava porque occurredAt e ignorado (sabotagem S3).
+      payload: { occurredAt: '2026-09-22T10:00:00.000Z', currency: 'BRL', amountCents: 1000, orderId: 'ord_1', paymentId: 'pay_1' },
     };
     expect(mesmoFato(base, reordenado)).toBe(true);
   });
