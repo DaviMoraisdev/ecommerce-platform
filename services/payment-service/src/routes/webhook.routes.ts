@@ -19,6 +19,23 @@ export interface WebhookRouterDeps {
   service: WebhookService;
 }
 
+/**
+ * Bloco 9a-2: uma linha por recusa de 400/401. Antes, assinatura forjada e
+ * segredo errado em producao eram recusados em SILENCIO.
+ *
+ * Campos FECHADOS — codigo e tamanho do corpo. Nada que venha de quem chama
+ * entra como texto: nem o corpo, nem o cabecalho de assinatura, nem
+ * req.params.provider (CR/LF forjaria linhas no log), nem a mensagem do erro
+ * (ProviderInvalidRequestError pode citar o payload). O 404 fica de fora de
+ * proposito: e o que qualquer scanner de URL gera, ruido sem sinal.
+ */
+function registrarRecusa(code: string, corpo: unknown): void {
+  console.warn('[payment-service] webhook recusado', {
+    code,
+    bytes: Buffer.isBuffer(corpo) ? corpo.length : null,
+  });
+}
+
 export function criarWebhookRouter(deps: WebhookRouterDeps): Router {
   const router = Router();
 
@@ -33,6 +50,7 @@ export function criarWebhookRouter(deps: WebhookRouterDeps): Router {
         // req.body como {}. Sem esta guarda, a verificacao rodaria sobre um
         // objeto vazio e o comportamento seria imprevisivel.
         if (!Buffer.isBuffer(req.body)) {
+          registrarRecusa('CORPO_INVALIDO', req.body);
           res.status(400).json({
             code: 'CORPO_INVALIDO',
             error: 'Corpo do webhook deve ser enviado como application/json',
@@ -55,6 +73,7 @@ export function criarWebhookRouter(deps: WebhookRouterDeps): Router {
           // Assinatura invalida NAO grava no inbox: gravar antes de autenticar
           // transformaria a rota em escrita nao autenticada em banco.
           if (erro instanceof WebhookSignatureError) {
+            registrarRecusa('ASSINATURA_INVALIDA', req.body);
             res.status(401).json({
               code: 'ASSINATURA_INVALIDA',
               error: 'Assinatura do webhook invalida',
@@ -64,6 +83,7 @@ export function criarWebhookRouter(deps: WebhookRouterDeps): Router {
           // Origem confiavel, conteudo invalido. Sem providerEventId valido nao
           // ha chave para gravar no inbox.
           if (erro instanceof ProviderInvalidRequestError) {
+            registrarRecusa('EVENTO_INVALIDO', req.body);
             res.status(400).json({
               code: 'EVENTO_INVALIDO',
               error: 'Evento do webhook invalido',
