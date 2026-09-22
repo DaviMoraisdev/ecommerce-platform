@@ -627,4 +627,55 @@ describe('persistirTentativa — atomicidade (Bloco 8d)', () => {
     // Nada chegou ao provedor: a falha veio antes do efeito externo.
     expect(espiao).not.toHaveBeenCalled();
   });
+
+  it('CASO T2 (9a-2): falha de infraestrutura pre-efeito LIBERA a chave, e o retry com a MESMA chave conclui', async () => {
+    // Mesmo cenario do T1: tentativa recusada antes, para a falha vir depois
+    // de uma escrita real dentro da transacao.
+    const base = cenario(FAKE_TOKENS.DECLINED_INSUFFICIENT_FUNDS);
+    await base.service.criarPagamento(base.input);
+    const antes = await prisma.payment.findUniqueOrThrow({ where: { orderId: base.orderId } });
+
+    const pedido = pedidoDeTeste({ id: base.orderId, userId: base.userId });
+    const chave = randomUUID();
+    const entrada = { ...base.input, idempotencyKey: chave, paymentMethodToken: FAKE_TOKENS.SUCCESS };
+
+    // 1a chamada: erro que NAO e de dominio (o Proxy lanca Error cru), vindo
+    // depois do claim da chave e antes do provedor.
+    const providerFalho = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiaoFalho = jest.spyOn(providerFalho, 'createCharge');
+    const sonda: SondaDaFalha = { alcancada: false, attemptCountNaFalha: null };
+    const comFalha = new PaymentService({
+      prisma: prismaQueFalhaNaTrilha(prisma, sonda),
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider: providerFalho,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+    await expect(comFalha.criarPagamento(entrada)).rejects.toThrow('falha injetada apos o claim');
+    expect(sonda.alcancada).toBe(true);
+    expect(espiaoFalho).not.toHaveBeenCalled();
+
+    // A assercao com dentes: a chave foi LIBERADA (registro apagado), nao
+    // queimada. Na politica antiga aqui havia uma linha FAILED.
+    expect(await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } })).toBe(0);
+
+    // 2a chamada, MESMA chave, sem falha: chega ao provedor uma vez e conclui.
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiao = jest.spyOn(provider, 'createCharge');
+    const normal = new PaymentService({
+      prisma,
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+    const criado = await normal.criarPagamento(entrada);
+    expect(espiao).toHaveBeenCalledTimes(1);
+    expect(criado.status).toBe(PaymentStatus.CAPTURED);
+    const registro = await prisma.idempotencyRecord.findUniqueOrThrow({
+      where: { userId_key: { userId: base.userId, key: chave } },
+    });
+    expect(registro.status).toBe('COMPLETED');
+    expect(registro.paymentId).toBe(antes.id);
+  });
 });
