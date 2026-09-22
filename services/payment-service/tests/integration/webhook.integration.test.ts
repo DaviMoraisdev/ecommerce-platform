@@ -1004,6 +1004,9 @@ describe('webhook — gravacao na outbox', () => {
 
     // Ocupa o eventId de proposito: a gravacao do evento passa a falhar DENTRO
     // da transacao do efeito. Ou os dois commitam, ou nenhum.
+    // Desde o Bloco 9a-1 o payload pre-gravado TEM de diferir do fato real:
+    // duplicata do mesmo fato virou no-op (enqueue idempotente), e so o
+    // CONFLITO — mesmo eventId, outro conteudo — ainda falha e desfaz tudo.
     await prisma.outboxEvent.create({
       data: {
         eventId: `payment.captured:${payment.id}`,

@@ -60,8 +60,35 @@ export interface PrismaFalso {
     updateMany: jest.Mock;
   };
   paymentTransaction: { create: jest.Mock; update: jest.Mock };
-  outboxEvent: { create: jest.Mock };
+  outboxEvent: { createMany: jest.Mock; findUnique: jest.Mock };
   $transaction: jest.Mock;
+}
+
+type LinhaDeOutbox = { eventId: string; routingKey: string; payload: unknown };
+
+/**
+ * Outbox falsa COM ESTADO (Bloco 9a-1). O `enqueue` grava com createMany
+ * (skipDuplicates) e, quando nada e gravado, le a linha existente. Um duble que
+ * devolvesse sempre `count: 1` deixaria a suite verde sem nunca exercitar o
+ * caminho de duplicata — leitura e escrita precisam estar ligadas, como no banco.
+ *
+ * Criada POR INSTANCIA do duble: um mapa no escopo do modulo faria um caso
+ * herdar as gravacoes do anterior.
+ */
+function outboxFalsa(): { createMany: jest.Mock; findUnique: jest.Mock } {
+  const linhas = new Map<string, LinhaDeOutbox>();
+  return {
+    createMany: jest.fn(async ({ data }: { data: LinhaDeOutbox[] }) => {
+      let count = 0;
+      for (const linha of data) {
+        if (linhas.has(linha.eventId)) continue;
+        linhas.set(linha.eventId, linha);
+        count++;
+      }
+      return { count };
+    }),
+    findUnique: jest.fn(async ({ where }: { where: { eventId: string } }) => linhas.get(where.eventId) ?? null),
+  };
 }
 
 /**
@@ -119,8 +146,8 @@ export function prismaFalso(): PrismaFalso {
     },
     // Sob captura automatica, registrarDesfecho tambem enfileira o evento na
     // MESMA transacao. Como o $transaction daqui entrega o proprio duble como
-    // tx, este create serve aos dois lados.
-    outboxEvent: { create: jest.fn(async () => ({ id: 'out_1' })) },
+    // tx, esta outbox serve aos dois lados.
+    outboxEvent: outboxFalsa(),
     $transaction: jest.fn(),
   };
 

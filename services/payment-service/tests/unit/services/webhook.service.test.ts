@@ -116,7 +116,7 @@ function montar(
   const filtros: Record<string, unknown>[] = [];
   // Dois espioes com o MESMO nome de operacao, em clientes diferentes: e a
   // unica forma de distinguir "gravou dentro da transacao" de "gravou fora".
-  const outboxNoTx = jest.fn(async () => ({}));
+  const outboxNoTx = jest.fn(async () => ({ count: 1 }));
   const outboxForaDaTx = jest.fn(async () => ({}));
   let iLeitura = 0;
   let iCas = 0;
@@ -130,7 +130,12 @@ function montar(
     webhookEvent: {
       update: jest.fn(async ({ data }: { data: Record<string, unknown> }) => { inbox.push(data); return data; }),
     },
-    outboxEvent: { create: outboxNoTx },
+    // findUnique so roda no caminho de duplicata, que nenhum caso deste arquivo
+    // produz: se algum passar a produzir, deve quebrar alto e nao seguir mudo.
+    outboxEvent: {
+      createMany: outboxNoTx,
+      findUnique: jest.fn(async () => { throw new Error('duble: duplicata inesperada na outbox'); }),
+    },
   };
 
   let tentativas = tentativasIniciais;
@@ -170,7 +175,8 @@ function montar(
       findUnique: jest.fn(async () => ({ status: WebhookStatus.RECEIVED })),
     },
     paymentTransaction: { findFirst: jest.fn(async () => transacao) },
-    outboxEvent: { create: outboxForaDaTx },
+    // Os DOIS acessos fora da transacao contam como violacao do R6.
+    outboxEvent: { createMany: outboxForaDaTx, findUnique: outboxForaDaTx },
     payment: {
       findUniqueOrThrow: jest.fn(async () =>
         leituras[Math.min(iLeitura++, leituras.length - 1)],
