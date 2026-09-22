@@ -914,6 +914,26 @@ describe('review 4.5 — falha RETENTAVEL do order nao pode queimar a chave', ()
   });
 });
 
+describe('9a-2 — erro que NAO e de dominio libera a chave (pre-efeito)', () => {
+  it('erro cru do order-client sobe intacto e LIBERA a claim', async () => {
+    // Quinta classe, fora da tabela de traducao: traduzirErroDoOrder devolve o
+    // erro desconhecido sem traduzir (ex.: falha de rede do fetch). O cliente
+    // recebe 500; a chave nao pode ficar queimada por uma tentativa que nunca
+    // chegou ao provedor. Na politica antiga, este caso marcava FAILED.
+    const cru = new Error('ECONNRESET');
+    const { service, falso } = montar({
+      buscarPedido: jest.fn(async () => {
+        throw cru;
+      }),
+    });
+
+    await expect(service.criarPagamento(entrada())).rejects.toBe(cru);
+
+    expect(falso.idempotencyRecord.delete).toHaveBeenCalledWith({ where: { id: 'rec_1' } });
+    expect(chaveMarcadaFalhada(falso)).toBe(false);
+  });
+});
+
 // ============================================================
 // Traducao dos erros do order-service
 // ============================================================
