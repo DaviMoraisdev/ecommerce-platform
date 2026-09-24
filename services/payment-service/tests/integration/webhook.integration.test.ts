@@ -1641,3 +1641,129 @@ describe('webhook — o portao de plausibilidade guarda SO o marcador (Bloco 6d)
     expect(linha.lastError).toBeNull();
   });
 });
+
+describe('9a-2 — recusa do webhook deixa rastro SEM vazar dado de quem chamou', () => {
+  const LINHA = '[payment-service] webhook recusado';
+  const MARCA_ASSINATURA = 'MARCA-ASSINATURA-9a2';
+  const MARCA_CORPO = 'MARCA-CORPO-9a2';
+
+  it('W-LOG1: assinatura forjada -> 401 ASSINATURA_INVALIDA, uma linha com codigo e bytes, sem cabecalho nem corpo', async () => {
+    const { app } = montarApp();
+    const espiao = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const corpo = JSON.stringify({ id: 'evt_forjado', marca: MARCA_CORPO });
+    try {
+      const resposta = await request(app)
+        .post('/webhooks/fake')
+        .set('content-type', 'application/json')
+        .set('x-fake-signature', `t=1,v1=${MARCA_ASSINATURA}`)
+        .send(corpo);
+
+      expect(resposta.status).toBe(401);
+      expect(resposta.body.code).toBe('ASSINATURA_INVALIDA');
+      const linhas = espiao.mock.calls.filter((c) => c[0] === LINHA);
+      expect(linhas).toHaveLength(1);
+      // toEqual EXATO: campo novo no log derruba o caso — os campos sao fechados.
+      expect(linhas[0][1]).toEqual({ code: 'ASSINATURA_INVALIDA', bytes: Buffer.byteLength(corpo) });
+      const tudo = JSON.stringify(espiao.mock.calls);
+      expect(tudo).not.toContain(MARCA_ASSINATURA);
+      expect(tudo).not.toContain(MARCA_CORPO);
+      // Recusa ANTES do inbox: nada gravado.
+      expect(await prisma.webhookEvent.count()).toBe(0);
+    } finally {
+      espiao.mockRestore();
+    }
+  });
+
+  it('W-LOG2: content-type errado -> 400 CORPO_INVALIDO, uma linha com bytes null', async () => {
+    const { app } = montarApp();
+    const espiao = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const resposta = await request(app)
+        .post('/webhooks/fake')
+        .set('content-type', 'text/plain')
+        .send(MARCA_CORPO);
+
+      expect(resposta.status).toBe(400);
+      expect(resposta.body.code).toBe('CORPO_INVALIDO');
+      const linhas = espiao.mock.calls.filter((c) => c[0] === LINHA);
+      expect(linhas).toHaveLength(1);
+      expect(linhas[0][1]).toEqual({ code: 'CORPO_INVALIDO', bytes: null });
+      expect(JSON.stringify(espiao.mock.calls)).not.toContain(MARCA_CORPO);
+    } finally {
+      espiao.mockRestore();
+    }
+  });
+
+  it('W-LOG3: assinatura valida, evento invalido -> 400 EVENTO_INVALIDO, uma linha, sem corpo nem mensagem do erro', async () => {
+    const { app, provider } = montarApp();
+    const espiao = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      // Bytes autenticos (segredo certo), conteudo sem envelope: o fake.wire
+      // lanca ProviderInvalidRequestError com uma mensagem que cita o conteudo.
+      const req = provider.assinarCorpo({ marca: MARCA_CORPO });
+      const resposta = await postar(app, req);
+
+      expect(resposta.status).toBe(400);
+      expect(resposta.body.code).toBe('EVENTO_INVALIDO');
+      const linhas = espiao.mock.calls.filter((c) => c[0] === LINHA);
+      expect(linhas).toHaveLength(1);
+      expect(linhas[0][1]).toEqual({ code: 'EVENTO_INVALIDO', bytes: req.rawBody.length });
+      expect(JSON.stringify(espiao.mock.calls)).not.toContain(MARCA_CORPO);
+      expect(await prisma.webhookEvent.count()).toBe(0);
+    } finally {
+      espiao.mockRestore();
+    }
+  });
+
+  it('W-LOG4: provedor desconhecido -> 404 e NENHUMA linha de log (decisao deliberada)', async () => {
+    // O 404 e o que qualquer scanner de URL gera. Logar seria ruido sem sinal.
+    // Travado em teste para que a decisao nao se perca numa refatoracao.
+    const { app } = montarApp();
+    const espiao = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const resposta = await request(app)
+        .post('/webhooks/inexistente')
+        .set('content-type', 'application/json')
+        .send(JSON.stringify({ marca: MARCA_CORPO }));
+
+      expect(resposta.status).toBe(404);
+      expect(resposta.body.code).toBe('PROVEDOR_DESCONHECIDO');
+      expect(espiao.mock.calls.filter((c) => c[0] === LINHA)).toHaveLength(0);
+    } finally {
+      espiao.mockRestore();
+    }
+  });
+
+  it('W-LOG5: rajada emite UMA linha por janela e reporta as suprimidas na proxima', async () => {
+    // Achados 3.1 e 6.2 da rodada 3 do review. Relogio injetado: a janela e
+    // atravessada sem esperar 60s reais.
+    let agora = 1_000_000;
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const service = new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 });
+    const app = createApp({
+      payments: express.Router(),
+      webhooks: criarWebhookRouter({ provider, service, agora: () => agora }),
+    });
+    const espiao = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        const r = await request(app).post('/webhooks/fake').set('content-type', 'text/plain').send('x');
+        // O teto e do LOG: a rota continua recusando todas.
+        expect(r.status).toBe(400);
+      }
+      expect(espiao.mock.calls.filter((c) => c[0] === LINHA)).toHaveLength(1);
+      expect(espiao.mock.calls.filter((c) => c[0] === LINHA)[0][1]).toEqual({
+        code: 'CORPO_INVALIDO',
+        bytes: null,
+      });
+
+      agora += 60_000;
+      await request(app).post('/webhooks/fake').set('content-type', 'text/plain').send('x');
+      const linhas = espiao.mock.calls.filter((c) => c[0] === LINHA);
+      expect(linhas).toHaveLength(2);
+      expect(linhas[1][1]).toEqual({ code: 'CORPO_INVALIDO', bytes: null, suprimidas: 4 });
+    } finally {
+      espiao.mockRestore();
+    }
+  });
+});

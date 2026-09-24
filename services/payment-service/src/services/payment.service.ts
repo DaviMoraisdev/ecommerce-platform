@@ -1614,13 +1614,22 @@ export class PaymentService {
    *
    * Falha definitiva continua queimando: repetir a mesma requisicao nunca vai
    * funcionar, e liberar so gastaria carga do servico.
+   *
+   * Bloco 9a-2: a condicao foi INVERTIDA. Antes so o erro de dominio retentavel
+   * liberava, e um erro que nao e de dominio — queda do banco, timeout do pool —
+   * caia em marcarChaveFalhada: a chave de algo que nunca chegou ao provedor
+   * ficava queimada. Agora so o erro de dominio DEFINITIVO queima; retentavel e
+   * desconhecido liberam. Seguro porque os tres chamadores (buscarPedido,
+   * validarValor, persistirTentativa) rodam ANTES do provedor: o CASO T1 afirma
+   * que createCharge nao foi chamado, e o CASO T2 prova que o retry com a mesma
+   * chave conclui.
    */
   private async encerrarClaimPreEfeito(registroId: string, erro: unknown): Promise<void> {
-    if (erro instanceof PaymentDomainError && erro.retryable) {
-      await this.liberarChave(registroId);
+    if (erro instanceof PaymentDomainError && !erro.retryable) {
+      await this.marcarChaveFalhada(registroId);
       return;
     }
-    await this.marcarChaveFalhada(registroId);
+    await this.liberarChave(registroId);
   }
 
   private async liberarChave(registroId: string): Promise<void> {

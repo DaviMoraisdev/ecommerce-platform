@@ -627,4 +627,216 @@ describe('persistirTentativa — atomicidade (Bloco 8d)', () => {
     // Nada chegou ao provedor: a falha veio antes do efeito externo.
     expect(espiao).not.toHaveBeenCalled();
   });
+
+  it('CASO T2 (9a-2): falha de infraestrutura pre-efeito LIBERA a chave, e o retry com a MESMA chave conclui', async () => {
+    // Mesmo cenario do T1: tentativa recusada antes, para a falha vir depois
+    // de uma escrita real dentro da transacao.
+    const base = cenario(FAKE_TOKENS.DECLINED_INSUFFICIENT_FUNDS);
+    await base.service.criarPagamento(base.input);
+    const antes = await prisma.payment.findUniqueOrThrow({ where: { orderId: base.orderId } });
+
+    const pedido = pedidoDeTeste({ id: base.orderId, userId: base.userId });
+    const chave = randomUUID();
+    const entrada = { ...base.input, idempotencyKey: chave, paymentMethodToken: FAKE_TOKENS.SUCCESS };
+
+    // 1a chamada: erro que NAO e de dominio (o Proxy lanca Error cru), vindo
+    // depois do claim da chave e antes do provedor.
+    const providerFalho = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiaoFalho = jest.spyOn(providerFalho, 'createCharge');
+    const sonda: SondaDaFalha = { alcancada: false, attemptCountNaFalha: null };
+    const comFalha = new PaymentService({
+      prisma: prismaQueFalhaNaTrilha(prisma, sonda),
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider: providerFalho,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+    await expect(comFalha.criarPagamento(entrada)).rejects.toThrow('falha injetada apos o claim');
+    expect(sonda.alcancada).toBe(true);
+    expect(espiaoFalho).not.toHaveBeenCalled();
+
+    // A assercao com dentes: a chave foi LIBERADA (registro apagado), nao
+    // queimada. Na politica antiga aqui havia uma linha FAILED.
+    expect(await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } })).toBe(0);
+
+    // 2a chamada, MESMA chave, sem falha: chega ao provedor uma vez e conclui.
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiao = jest.spyOn(provider, 'createCharge');
+    const normal = new PaymentService({
+      prisma,
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+    const criado = await normal.criarPagamento(entrada);
+    expect(espiao).toHaveBeenCalledTimes(1);
+    expect(criado.status).toBe(PaymentStatus.CAPTURED);
+    const registro = await prisma.idempotencyRecord.findUniqueOrThrow({
+      where: { userId_key: { userId: base.userId, key: chave } },
+    });
+    expect(registro.status).toBe('COMPLETED');
+    expect(registro.paymentId).toBe(antes.id);
+  });
+
+  it('CASO T3 (9a-2): erro DEPOIS do commit libera a chave e o retry bate na guarda, sem segunda chamada ao provedor', async () => {
+    // Commit ambiguo: a transacao GRAVOU e o cliente recebeu erro. Era o
+    // cenario do achado 4.1 do review do PR #71, sustentado por inferencia.
+    const base = cenario(FAKE_TOKENS.DECLINED_INSUFFICIENT_FUNDS);
+    await base.service.criarPagamento(base.input);
+    const antes = await prisma.payment.findUniqueOrThrow({ where: { orderId: base.orderId } });
+    const linhasAntes = await prisma.paymentTransaction.count({ where: { paymentId: antes.id } });
+
+    const pedido = pedidoDeTeste({ id: base.orderId, userId: base.userId });
+    const chave = randomUUID();
+    const entrada = { ...base.input, idempotencyKey: chave, paymentMethodToken: FAKE_TOKENS.SUCCESS };
+
+    // Deixa a PRIMEIRA transacao commitar de verdade e lanca depois dela.
+    let jaLancou = false;
+    const prismaQuePerdeAResposta = new Proxy(prisma, {
+      get(alvo, prop, receiver) {
+        if (prop === '$transaction') {
+          type Interativa = (fn: (tx: object) => Promise<unknown>, opts?: unknown) => Promise<unknown>;
+          const real = (Reflect.get(alvo, prop, receiver) as Interativa).bind(alvo);
+          return async (fn: (tx: object) => Promise<unknown>, opts?: unknown) => {
+            const resultado = await real(fn, opts);
+            if (jaLancou) return resultado;
+            jaLancou = true;
+            throw new Error('falha injetada apos o commit');
+          };
+        }
+        const v = Reflect.get(alvo, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(alvo) : v;
+      },
+    }) as unknown as PrismaClient;
+
+    const providerAmbiguo = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiaoAmbiguo = jest.spyOn(providerAmbiguo, 'createCharge');
+    const ambiguo = new PaymentService({
+      prisma: prismaQuePerdeAResposta,
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider: providerAmbiguo,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+
+    await expect(ambiguo.criarPagamento(entrada)).rejects.toThrow('falha injetada apos o commit');
+    expect(jaLancou).toBe(true);
+    expect(espiaoAmbiguo).not.toHaveBeenCalled();
+
+    // O COMMIT aconteceu: contador movido, tentativa gravada, PROCESSING.
+    const depois = await prisma.payment.findUniqueOrThrow({ where: { id: antes.id } });
+    expect(depois.attemptCount).toBe(antes.attemptCount + 1);
+    expect(depois.status).toBe(PaymentStatus.PROCESSING);
+    expect(await prisma.paymentTransaction.count({ where: { paymentId: antes.id } })).toBe(linhasAntes + 1);
+
+    // E a chave foi LIBERADA mesmo com o commit tendo gravado.
+    expect(await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } })).toBe(0);
+
+    // O retry com a MESMA chave bate na guarda de PROCESSING e NAO chega ao
+    // provedor: e isso que impede cobranca dupla, nao a chave queimada.
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiao = jest.spyOn(provider, 'createCharge');
+    const normal = new PaymentService({
+      prisma,
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+    await expect(normal.criarPagamento(entrada)).rejects.toMatchObject({
+      code: 'TENTATIVA_EM_ANDAMENTO',
+      retryable: true,
+    });
+    expect(espiao).not.toHaveBeenCalled();
+    // Retentavel: a claim do retry tambem e liberada.
+    expect(await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } })).toBe(0);
+
+    // Pos-condicoes do banco DEPOIS do retry (achado 6.3 da rodada 3): a guarda
+    // recusa ANTES de qualquer escrita, entao nada mudou desde o commit ambiguo.
+    const aposRetry = await prisma.payment.findUniqueOrThrow({ where: { id: antes.id } });
+    expect(aposRetry.attemptCount).toBe(antes.attemptCount + 1);
+    expect(aposRetry.status).toBe(PaymentStatus.PROCESSING);
+    expect(await prisma.paymentTransaction.count({ where: { paymentId: antes.id } })).toBe(linhasAntes + 1);
+  });
+
+  it('CASO T4 (9a-2): falha ao LIBERAR a chave deixa a claim PRESA — comportamento real, nao desejado', async () => {
+    // Achado 4.1 da rodada 3 do review do PR #71. O unitario provava erro e log;
+    // faltava o estado persistido e o retry. O desfecho e PIOR que FAILED: nao
+    // existe expiracao nem varredura de idempotencyRecord no servico, e o
+    // reivindicar devolve IDEMPOTENCIA_EM_ANDAMENTO com retryable true, ou seja,
+    // um 'repita' que nunca vai funcionar. Registrado como divida no TECH_DEBT.
+    const base = cenario(FAKE_TOKENS.SUCCESS);
+    const chave = randomUUID();
+    const entrada = { ...base.input, idempotencyKey: chave };
+
+    const prismaQueNaoApagaAClaim = new Proxy(prisma, {
+      get(alvo, prop, receiver) {
+        if (prop === 'idempotencyRecord') {
+          // `as unknown as` e obrigatorio aqui: o alvo do Proxy e o prisma
+          // CONCRETO, entao Reflect.get devolve IdempotencyRecordDelegate, e o
+          // TS2352 recusa a conversao direta. No helper do T1 o alvo e generico,
+          // e por isso la o cast simples compila.
+          const delegate = Reflect.get(alvo, prop, receiver) as unknown as Record<string, unknown>;
+          return new Proxy(delegate, {
+            get(d, m, r) {
+              if (m === 'delete') {
+                return async () => {
+                  throw new Error('banco fora na limpeza');
+                };
+              }
+              const v = Reflect.get(d, m, r);
+              return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(delegate) : v;
+            },
+          });
+        }
+        const v = Reflect.get(alvo, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(alvo) : v;
+      },
+    }) as unknown as PrismaClient;
+
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiao = jest.spyOn(provider, 'createCharge');
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const service = new PaymentService({
+        prisma: prismaQueNaoApagaAClaim,
+        // Erro que NAO e de dominio: cai no ramo que libera a chave.
+        orderClient: orderClientFalso(jest.fn(async () => {
+          throw new Error('ECONNRESET');
+        })),
+        provider,
+        currency: 'BRL',
+        windowMinutes: 15,
+      });
+
+      // O erro ORIGINAL sobe, e nao o da limpeza.
+      await expect(service.criarPagamento(entrada)).rejects.toThrow('ECONNRESET');
+      expect(espiao).not.toHaveBeenCalled();
+      expect(
+        log.mock.calls.filter(
+          (c) => c[0] === '[payment-service] falha ao liberar claim de idempotencia',
+        ),
+      ).toHaveLength(1);
+
+      // A claim CONTINUA la, em PROCESSING e sem pagamento.
+      const presa = await prisma.idempotencyRecord.findUniqueOrThrow({
+        where: { userId_key: { userId: base.userId, key: chave } },
+      });
+      expect(presa.status).toBe('PROCESSING');
+      expect(presa.paymentId).toBeNull();
+
+      // Retry com a MESMA chave, agora com tudo funcionando: nao passa.
+      await expect(base.service.criarPagamento(entrada)).rejects.toMatchObject({
+        code: 'IDEMPOTENCIA_EM_ANDAMENTO',
+        retryable: true,
+      });
+      expect(base.espiaoCharge).not.toHaveBeenCalled();
+      expect(
+        await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } }),
+      ).toBe(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
