@@ -1714,4 +1714,23 @@ describe('9a-2 — recusa do webhook deixa rastro SEM vazar dado de quem chamou'
       espiao.mockRestore();
     }
   });
+
+  it('W-LOG4: provedor desconhecido -> 404 e NENHUMA linha de log (decisao deliberada)', async () => {
+    // O 404 e o que qualquer scanner de URL gera. Logar seria ruido sem sinal.
+    // Travado em teste para que a decisao nao se perca numa refatoracao.
+    const { app } = montarApp();
+    const espiao = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const resposta = await request(app)
+        .post('/webhooks/inexistente')
+        .set('content-type', 'application/json')
+        .send(JSON.stringify({ marca: MARCA_CORPO }));
+
+      expect(resposta.status).toBe(404);
+      expect(resposta.body.code).toBe('PROVEDOR_DESCONHECIDO');
+      expect(espiao.mock.calls.filter((c) => c[0] === LINHA)).toHaveLength(0);
+    } finally {
+      espiao.mockRestore();
+    }
+  });
 });

@@ -678,4 +678,78 @@ describe('persistirTentativa — atomicidade (Bloco 8d)', () => {
     expect(registro.status).toBe('COMPLETED');
     expect(registro.paymentId).toBe(antes.id);
   });
+
+  it('CASO T3 (9a-2): erro DEPOIS do commit libera a chave e o retry bate na guarda, sem segunda chamada ao provedor', async () => {
+    // Commit ambiguo: a transacao GRAVOU e o cliente recebeu erro. Era o
+    // cenario do achado 4.1 do review do PR #71, sustentado por inferencia.
+    const base = cenario(FAKE_TOKENS.DECLINED_INSUFFICIENT_FUNDS);
+    await base.service.criarPagamento(base.input);
+    const antes = await prisma.payment.findUniqueOrThrow({ where: { orderId: base.orderId } });
+    const linhasAntes = await prisma.paymentTransaction.count({ where: { paymentId: antes.id } });
+
+    const pedido = pedidoDeTeste({ id: base.orderId, userId: base.userId });
+    const chave = randomUUID();
+    const entrada = { ...base.input, idempotencyKey: chave, paymentMethodToken: FAKE_TOKENS.SUCCESS };
+
+    // Deixa a PRIMEIRA transacao commitar de verdade e lanca depois dela.
+    let jaLancou = false;
+    const prismaQuePerdeAResposta = new Proxy(prisma, {
+      get(alvo, prop, receiver) {
+        if (prop === '$transaction') {
+          type Interativa = (fn: (tx: object) => Promise<unknown>, opts?: unknown) => Promise<unknown>;
+          const real = (Reflect.get(alvo, prop, receiver) as Interativa).bind(alvo);
+          return async (fn: (tx: object) => Promise<unknown>, opts?: unknown) => {
+            const resultado = await real(fn, opts);
+            if (jaLancou) return resultado;
+            jaLancou = true;
+            throw new Error('falha injetada apos o commit');
+          };
+        }
+        const v = Reflect.get(alvo, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(alvo) : v;
+      },
+    }) as unknown as PrismaClient;
+
+    const providerAmbiguo = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiaoAmbiguo = jest.spyOn(providerAmbiguo, 'createCharge');
+    const ambiguo = new PaymentService({
+      prisma: prismaQuePerdeAResposta,
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider: providerAmbiguo,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+
+    await expect(ambiguo.criarPagamento(entrada)).rejects.toThrow('falha injetada apos o commit');
+    expect(jaLancou).toBe(true);
+    expect(espiaoAmbiguo).not.toHaveBeenCalled();
+
+    // O COMMIT aconteceu: contador movido, tentativa gravada, PROCESSING.
+    const depois = await prisma.payment.findUniqueOrThrow({ where: { id: antes.id } });
+    expect(depois.attemptCount).toBe(antes.attemptCount + 1);
+    expect(depois.status).toBe(PaymentStatus.PROCESSING);
+    expect(await prisma.paymentTransaction.count({ where: { paymentId: antes.id } })).toBe(linhasAntes + 1);
+
+    // E a chave foi LIBERADA mesmo com o commit tendo gravado.
+    expect(await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } })).toBe(0);
+
+    // O retry com a MESMA chave bate na guarda de PROCESSING e NAO chega ao
+    // provedor: e isso que impede cobranca dupla, nao a chave queimada.
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiao = jest.spyOn(provider, 'createCharge');
+    const normal = new PaymentService({
+      prisma,
+      orderClient: orderClientFalso(jest.fn(async () => pedido)),
+      provider,
+      currency: 'BRL',
+      windowMinutes: 15,
+    });
+    await expect(normal.criarPagamento(entrada)).rejects.toMatchObject({
+      code: 'TENTATIVA_EM_ANDAMENTO',
+      retryable: true,
+    });
+    expect(espiao).not.toHaveBeenCalled();
+    // Retentavel: a claim do retry tambem e liberada.
+    expect(await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } })).toBe(0);
+  });
 });

@@ -932,6 +932,34 @@ describe('9a-2 — erro que NAO e de dominio libera a chave (pre-efeito)', () =>
     expect(falso.idempotencyRecord.delete).toHaveBeenCalledWith({ where: { id: 'rec_1' } });
     expect(chaveMarcadaFalhada(falso)).toBe(false);
   });
+
+  it('falha ao LIBERAR a chave nao substitui o erro original e deixa evidencia no log', async () => {
+    // Achado 6.3 do review do PR #71. O catch de liberarChave existe para nao
+    // perder o erro original; sem teste, alguem poderia deixar a falha da
+    // limpeza subir e o cliente receberia 'banco fora' em vez da causa real.
+    const { service, falso } = montar({
+      buscarPedido: jest.fn(async () => {
+        throw new OrderIndisponivelError('HTTP 503');
+      }),
+    });
+    falso.idempotencyRecord.delete.mockRejectedValue(new Error('banco fora'));
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      await expect(service.criarPagamento(entrada())).rejects.toMatchObject({
+        code: 'DEPENDENCIA_INDISPONIVEL',
+        retryable: true,
+      });
+
+      const linhas = log.mock.calls.filter(
+        (c) => c[0] === '[payment-service] falha ao liberar claim de idempotencia',
+      );
+      expect(linhas).toHaveLength(1);
+      expect(linhas[0][1]).toMatchObject({ registroId: 'rec_1', causa: 'banco fora' });
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
 
 // ============================================================
