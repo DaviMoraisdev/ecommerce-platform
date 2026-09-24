@@ -29,7 +29,9 @@ export interface WebhookRouterDeps {
  * (ProviderInvalidRequestError pode citar o payload). O 404 fica de fora de
  * proposito: e o que qualquer scanner de URL gera, ruido sem sinal.
  */
-function registrarRecusa(code: string, corpo: unknown): void {
+type CodigoDeRecusa = 'CORPO_INVALIDO' | 'ASSINATURA_INVALIDA' | 'EVENTO_INVALIDO';
+
+function registrarRecusa(code: CodigoDeRecusa, corpo: unknown): void {
   console.warn('[payment-service] webhook recusado', {
     code,
     bytes: Buffer.isBuffer(corpo) ? corpo.length : null,
