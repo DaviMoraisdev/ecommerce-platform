@@ -751,5 +751,92 @@ describe('persistirTentativa — atomicidade (Bloco 8d)', () => {
     expect(espiao).not.toHaveBeenCalled();
     // Retentavel: a claim do retry tambem e liberada.
     expect(await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } })).toBe(0);
+
+    // Pos-condicoes do banco DEPOIS do retry (achado 6.3 da rodada 3): a guarda
+    // recusa ANTES de qualquer escrita, entao nada mudou desde o commit ambiguo.
+    const aposRetry = await prisma.payment.findUniqueOrThrow({ where: { id: antes.id } });
+    expect(aposRetry.attemptCount).toBe(antes.attemptCount + 1);
+    expect(aposRetry.status).toBe(PaymentStatus.PROCESSING);
+    expect(await prisma.paymentTransaction.count({ where: { paymentId: antes.id } })).toBe(linhasAntes + 1);
+  });
+
+  it('CASO T4 (9a-2): falha ao LIBERAR a chave deixa a claim PRESA — comportamento real, nao desejado', async () => {
+    // Achado 4.1 da rodada 3 do review do PR #71. O unitario provava erro e log;
+    // faltava o estado persistido e o retry. O desfecho e PIOR que FAILED: nao
+    // existe expiracao nem varredura de idempotencyRecord no servico, e o
+    // reivindicar devolve IDEMPOTENCIA_EM_ANDAMENTO com retryable true, ou seja,
+    // um 'repita' que nunca vai funcionar. Registrado como divida no TECH_DEBT.
+    const base = cenario(FAKE_TOKENS.SUCCESS);
+    const chave = randomUUID();
+    const entrada = { ...base.input, idempotencyKey: chave };
+
+    const prismaQueNaoApagaAClaim = new Proxy(prisma, {
+      get(alvo, prop, receiver) {
+        if (prop === 'idempotencyRecord') {
+          // `as unknown as` e obrigatorio aqui: o alvo do Proxy e o prisma
+          // CONCRETO, entao Reflect.get devolve IdempotencyRecordDelegate, e o
+          // TS2352 recusa a conversao direta. No helper do T1 o alvo e generico,
+          // e por isso la o cast simples compila.
+          const delegate = Reflect.get(alvo, prop, receiver) as unknown as Record<string, unknown>;
+          return new Proxy(delegate, {
+            get(d, m, r) {
+              if (m === 'delete') {
+                return async () => {
+                  throw new Error('banco fora na limpeza');
+                };
+              }
+              const v = Reflect.get(d, m, r);
+              return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(delegate) : v;
+            },
+          });
+        }
+        const v = Reflect.get(alvo, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(alvo) : v;
+      },
+    }) as unknown as PrismaClient;
+
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const espiao = jest.spyOn(provider, 'createCharge');
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const service = new PaymentService({
+        prisma: prismaQueNaoApagaAClaim,
+        // Erro que NAO e de dominio: cai no ramo que libera a chave.
+        orderClient: orderClientFalso(jest.fn(async () => {
+          throw new Error('ECONNRESET');
+        })),
+        provider,
+        currency: 'BRL',
+        windowMinutes: 15,
+      });
+
+      // O erro ORIGINAL sobe, e nao o da limpeza.
+      await expect(service.criarPagamento(entrada)).rejects.toThrow('ECONNRESET');
+      expect(espiao).not.toHaveBeenCalled();
+      expect(
+        log.mock.calls.filter(
+          (c) => c[0] === '[payment-service] falha ao liberar claim de idempotencia',
+        ),
+      ).toHaveLength(1);
+
+      // A claim CONTINUA la, em PROCESSING e sem pagamento.
+      const presa = await prisma.idempotencyRecord.findUniqueOrThrow({
+        where: { userId_key: { userId: base.userId, key: chave } },
+      });
+      expect(presa.status).toBe('PROCESSING');
+      expect(presa.paymentId).toBeNull();
+
+      // Retry com a MESMA chave, agora com tudo funcionando: nao passa.
+      await expect(base.service.criarPagamento(entrada)).rejects.toMatchObject({
+        code: 'IDEMPOTENCIA_EM_ANDAMENTO',
+        retryable: true,
+      });
+      expect(base.espiaoCharge).not.toHaveBeenCalled();
+      expect(
+        await prisma.idempotencyRecord.count({ where: { userId: base.userId, key: chave } }),
+      ).toBe(1);
+    } finally {
+      log.mockRestore();
+    }
   });
 });
