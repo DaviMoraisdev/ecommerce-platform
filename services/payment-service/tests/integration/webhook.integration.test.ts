@@ -1733,4 +1733,37 @@ describe('9a-2 — recusa do webhook deixa rastro SEM vazar dado de quem chamou'
       espiao.mockRestore();
     }
   });
+
+  it('W-LOG5: rajada emite UMA linha por janela e reporta as suprimidas na proxima', async () => {
+    // Achados 3.1 e 6.2 da rodada 3 do review. Relogio injetado: a janela e
+    // atravessada sem esperar 60s reais.
+    let agora = 1_000_000;
+    const provider = new FakeProvider({ webhookSecret: SEGREDO_WEBHOOK });
+    const service = new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 });
+    const app = createApp({
+      payments: express.Router(),
+      webhooks: criarWebhookRouter({ provider, service, agora: () => agora }),
+    });
+    const espiao = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        const r = await request(app).post('/webhooks/fake').set('content-type', 'text/plain').send('x');
+        // O teto e do LOG: a rota continua recusando todas.
+        expect(r.status).toBe(400);
+      }
+      expect(espiao.mock.calls.filter((c) => c[0] === LINHA)).toHaveLength(1);
+      expect(espiao.mock.calls.filter((c) => c[0] === LINHA)[0][1]).toEqual({
+        code: 'CORPO_INVALIDO',
+        bytes: null,
+      });
+
+      agora += 60_000;
+      await request(app).post('/webhooks/fake').set('content-type', 'text/plain').send('x');
+      const linhas = espiao.mock.calls.filter((c) => c[0] === LINHA);
+      expect(linhas).toHaveLength(2);
+      expect(linhas[1][1]).toEqual({ code: 'CORPO_INVALIDO', bytes: null, suprimidas: 4 });
+    } finally {
+      espiao.mockRestore();
+    }
+  });
 });

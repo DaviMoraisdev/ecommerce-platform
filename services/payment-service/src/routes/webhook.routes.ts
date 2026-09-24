@@ -17,7 +17,13 @@ export const LIMITE_CORPO_WEBHOOK = '64kb';
 export interface WebhookRouterDeps {
   provider: PaymentProvider;
   service: WebhookService;
+  /** Injetavel para testar o teto de log sem esperar a janela real. */
+  agora?: () => number;
 }
+
+/** Janela e teto do LOG de recusa (nao da rota: a recusa sempre acontece). */
+export const JANELA_DE_LOG_MS = 60_000;
+export const TETO_DE_LOG_POR_JANELA = 1;
 
 /**
  * Bloco 9a-2: uma linha por recusa de 400/401. Antes, assinatura forjada e
@@ -31,15 +37,44 @@ export interface WebhookRouterDeps {
  */
 type CodigoDeRecusa = 'CORPO_INVALIDO' | 'ASSINATURA_INVALIDA' | 'EVENTO_INVALIDO';
 
-function registrarRecusa(code: CodigoDeRecusa, corpo: unknown): void {
-  console.warn('[payment-service] webhook recusado', {
-    code,
-    bytes: Buffer.isBuffer(corpo) ? corpo.length : null,
-  });
-}
-
 export function criarWebhookRouter(deps: WebhookRouterDeps): Router {
   const router = Router();
+  const agora = deps.agora ?? ((): number => Date.now());
+
+  // Estado POR ROUTER, nao de modulo: dois routers no mesmo processo (testes,
+  // ou um segundo provedor) nao dividem contador, e nada precisa ser resetado
+  // entre casos.
+  const janelas = new Map<CodigoDeRecusa, { inicio: number; emitidas: number; suprimidas: number }>();
+
+  /**
+   * Rodada 3 do review do PR #71: o log era ilimitado, e `CORPO_INVALIDO` e
+   * recusado ANTES da verificacao de assinatura — ou seja, sem custo de HMAC
+   * para quem chama. Um laco de requisicoes invalidas viraria flood de log.
+   *
+   * Teto por CODIGO e por janela. As recusas suprimidas nao desaparecem: elas
+   * saem como `suprimidas` na proxima linha emitida daquele codigo, entao o
+   * volume real continua visivel sem uma linha por requisicao.
+   */
+  function registrarRecusa(code: CodigoDeRecusa, corpo: unknown): void {
+    const t = agora();
+    let janela = janelas.get(code);
+    if (janela === undefined || t - janela.inicio >= JANELA_DE_LOG_MS) {
+      janela = { inicio: t, emitidas: 0, suprimidas: janela?.suprimidas ?? 0 };
+      janelas.set(code, janela);
+    }
+    if (janela.emitidas >= TETO_DE_LOG_POR_JANELA) {
+      janela.suprimidas += 1;
+      return;
+    }
+    janela.emitidas += 1;
+    const suprimidas = janela.suprimidas;
+    janela.suprimidas = 0;
+    console.warn('[payment-service] webhook recusado', {
+      code,
+      bytes: Buffer.isBuffer(corpo) ? corpo.length : null,
+      ...(suprimidas > 0 ? { suprimidas } : {}),
+    });
+  }
 
   router.post(
     '/:provider',
