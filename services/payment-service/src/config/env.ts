@@ -420,10 +420,17 @@ function parseStripeSecretKey(
   }
 
   if (!PREFIXOS_DE_CHAVE_SECRETA.some((prefixo) => valor.startsWith(prefixo))) {
+    // Rodada 2 do review: a versao anterior interpolava valor.slice(0, 3) para
+    // QUALQUER entrada. Prefixo da Stripe nao e segredo; tres caracteres de uma
+    // credencial colada por engano SAO. Agora so sai prefixo RECONHECIDO.
+    const prefixo = /^(sk|rk|pk|whsec)_/.exec(valor)?.[0];
     throw new ConfigError(
-      `STRIPE_SECRET_KEY com prefixo inesperado: "${valor.slice(0, 3)}". ` +
-        'Use sk_ (secreta) ou rk_ (restrita). pk_ e a chave PUBLICAVEL, que nao ' +
-        'autentica chamada de servidor.',
+      prefixo === undefined
+        ? 'STRIPE_SECRET_KEY nao parece uma chave da Stripe. Use sk_ (secreta) ' +
+          'ou rk_ (restrita). O valor nao e ecoado nesta mensagem.'
+        : `STRIPE_SECRET_KEY com prefixo inesperado: "${prefixo}". ` +
+          'Use sk_ (secreta) ou rk_ (restrita). pk_ e a chave PUBLICAVEL, que nao ' +
+          'autentica chamada de servidor.',
     );
   }
 

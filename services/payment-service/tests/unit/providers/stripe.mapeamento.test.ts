@@ -8,7 +8,10 @@ import {
   resultadoDoReembolso,
   snapshotDaCobranca,
   eventoDoWebhook,
+  CapturaSemCobrancaError,
+  type CobrancaDeEventoLida,
   type CobrancaLida,
+  type IntentDeEventoLido,
   type EventoLido,
   type IntentComCobranca,
   type ReembolsoLido,
@@ -186,6 +189,20 @@ describe('stripe.mapeamento — snapshotDaCobranca', () => {
   it('S6: status desconhecido vira PROCESSING — a varredura mantem a tentativa presa e visivel', () => {
     expect(snapshotDaCobranca(comCobranca({ status: 'estado_novo_da_stripe' })).state).toBe('PROCESSING');
   });
+
+  it('S7: succeeded SEM Charge lanca — zero reembolsado seria afirmacao falsa', () => {
+    // Achado 4.1 da rodada 2 do review. Antes isto devolvia refundedAmountCents 0.
+    expect(() => snapshotDaCobranca(comCobranca({ status: 'succeeded', latest_charge: null }))).toThrow(
+      CapturaSemCobrancaError,
+    );
+    expect(() => snapshotDaCobranca(comCobranca({ status: 'succeeded' }))).not.toThrow();
+  });
+
+  it('S8: o critERIO e CAPTURA, nao status: valor capturado sem Charge tambem lanca', () => {
+    expect(() =>
+      snapshotDaCobranca(comCobranca({ status: 'processing', amount_received: 500, latest_charge: null })),
+    ).toThrow(CapturaSemCobrancaError);
+  });
 });
 
 describe('stripe.mapeamento — resultadoDoReembolso', () => {
@@ -340,5 +357,34 @@ describe('stripe.mapeamento — eventoDoWebhook', () => {
     expect(() => eventoDoWebhook(ev('payment_intent.succeeded', { id: 'pi_10', amount_received: 12.5 }))).toThrow(
       ProviderInvalidRequestError,
     );
+  });
+
+  it('W11: evento sem `data` da erro de CONTEUDO, nao TypeError', () => {
+    // Achado 4.3: TypeError viraria 500 no handler global, enquanto conteudo
+    // invalido tem de virar 400 — e 500 faz o provedor retentar para sempre.
+    const semData = { id: 'evt_x', type: 'payment_intent.succeeded', created: 1_700_000_000 } as EventoLido;
+    expect(() => eventoDoWebhook(semData)).toThrow(ProviderInvalidRequestError);
+    expect(() => eventoDoWebhook({ ...semData, data: null })).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('W12: inteiro FORA da faixa segura e invalido — acima de 2^53-1 ja perdeu precisao', () => {
+    // Achado 4.4: Number.isInteger aceitava; isSafeInteger recusa. Em valor
+    // monetario, precisao perdida chega ARREDONDADA ao dominio.
+    const foraDaFaixa = Number.MAX_SAFE_INTEGER + 2;
+    expect(Number.isInteger(foraDaFaixa)).toBe(true);
+    expect(() =>
+      eventoDoWebhook(ev('payment_intent.succeeded', { id: 'pi_12', amount_received: foraDaFaixa })),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('W13: os NOMES dos campos lidos do evento sao checados pelo compilador', () => {
+    // Achado 5.1: data.object e unknown, entao o tsc nao protegia os campos que
+    // o mapeador le por nome — a descricao do PR anterior exagerou nisso. Estas
+    // atribuicoes afirmam que os objetos do SDK servem as interfaces, e os
+    // literais no mapeador usam `satisfies keyof` contra elas.
+    const intentDoSdk: IntentDeEventoLido = {} as Stripe.PaymentIntent;
+    const cobrancaDoSdk: CobrancaDeEventoLida = {} as Stripe.Charge;
+    expect(typeof intentDoSdk).toBe('object');
+    expect(typeof cobrancaDoSdk).toBe('object');
   });
 });

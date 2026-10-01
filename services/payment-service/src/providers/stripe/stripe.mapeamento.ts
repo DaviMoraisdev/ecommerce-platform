@@ -148,6 +148,27 @@ export interface IntentComCobranca extends IntentLido {
   latest_charge?: string | CobrancaLida | null;
 }
 
+/**
+ * Captura existente SEM Charge no retorno (achado 4.1 da rodada 2 do review).
+ *
+ * A versao anterior devolvia `refundedAmountCents: 0` nesse caso, raciocinando
+ * que `succeeded` sempre tem Charge. Mas defesa que devolve ZERO em campo
+ * monetario nao e defesa: e afirmacao falsa sobre dinheiro. Zero fica reservado
+ * ao caso COERENTE, que e nao haver captura nenhuma.
+ */
+export class CapturaSemCobrancaError extends Error {
+  constructor(
+    readonly intentId: string,
+    readonly capturadoCents: number,
+  ) {
+    super(
+      `PaymentIntent ${intentId} tem ${capturadoCents} capturado mas nenhum Charge no retorno: ` +
+        'o valor reembolsado vive no Charge, e devolver zero afirmaria que nada foi reembolsado',
+    );
+    this.name = 'CapturaSemCobrancaError';
+  }
+}
+
 export class ExpansaoAusenteError extends Error {
   constructor(readonly intentId: string) {
     super(
@@ -160,6 +181,9 @@ export class ExpansaoAusenteError extends Error {
 
 export function snapshotDaCobranca(intent: IntentComCobranca): ChargeSnapshot {
   const cobranca = cobrancaDe(intent);
+  if (cobranca === null && (intent.status === 'succeeded' || intent.amount_received > 0)) {
+    throw new CapturaSemCobrancaError(intent.id, intent.amount_received);
+  }
   const base = {
     providerRef: intent.id,
     amountCents: intent.amount,
@@ -253,7 +277,30 @@ export interface EventoLido {
   id: string;
   type: string;
   created: number;
-  data: { object: unknown };
+  /** `data` pode faltar num corpo adulterado: validado em runtime, nao assumido. */
+  data?: { object?: unknown } | null;
+}
+
+/**
+ * Achado 5.1 da rodada 2 do review: `data.object` e `unknown`, entao o `tsc` NAO
+ * protegia os campos que o mapeador de evento le por nome. A descricao do PR
+ * anterior exagerou nesse ponto.
+ *
+ * Estas duas interfaces existem para amarrar os NOMES: cada literal passado aos
+ * leitores usa `satisfies keyof ...`, e os testes de tipo afirmam que os objetos
+ * do SDK sao atribuiveis a elas. Renomear um campo lido passa a quebrar o tsc.
+ */
+export interface IntentDeEventoLido {
+  id: string;
+  amount_received: number;
+  last_payment_error?: ErroDeCobrancaLido | null;
+}
+
+export interface CobrancaDeEventoLida {
+  payment_intent?: string | { id?: string } | null;
+  amount_captured: number;
+  amount_refunded: number;
+  refunds?: { data?: unknown } | null;
 }
 
 /**
@@ -282,9 +329,13 @@ export function eventoDoWebhook(evento: EventoLido): WebhookEventPayload {
       return {
         ...base,
         eventType: 'payment.succeeded',
-        providerRef: exigirTexto(intent, 'id', evento.type),
+        providerRef: exigirTexto(intent, 'id' satisfies keyof IntentDeEventoLido, evento.type),
         state: 'SUCCEEDED',
-        capturedAmountCents: exigirInteiro(intent, 'amount_received', evento.type),
+        capturedAmountCents: exigirInteiro(
+          intent,
+          'amount_received' satisfies keyof IntentDeEventoLido,
+          evento.type,
+        ),
         // ZERO de proposito, e verificado: o evento do PaymentIntent nao informa
         // valor reembolsado (ele vive no Charge, e eventos nao vem expandidos).
         // Seguro porque o caminho de captura do WebhookService grava SOMENTE
@@ -304,7 +355,7 @@ export function eventoDoWebhook(evento: EventoLido): WebhookEventPayload {
       return {
         ...base,
         eventType: 'payment.failed',
-        providerRef: exigirTexto(intent, 'id', evento.type),
+        providerRef: exigirTexto(intent, 'id' satisfies keyof IntentDeEventoLido, evento.type),
         state: 'DECLINED',
         ...(codigo === undefined ? {} : { declineCode: codigo }),
       };
@@ -315,7 +366,7 @@ export function eventoDoWebhook(evento: EventoLido): WebhookEventPayload {
       return {
         ...base,
         eventType: 'payment.canceled',
-        providerRef: exigirTexto(intent, 'id', evento.type),
+        providerRef: exigirTexto(intent, 'id' satisfies keyof IntentDeEventoLido, evento.type),
         state: 'CANCELED',
       };
     }
@@ -330,11 +381,23 @@ export function eventoDoWebhook(evento: EventoLido): WebhookEventPayload {
       return {
         ...base,
         eventType: 'refund.succeeded',
-        providerRef: exigirTexto(cobranca, 'payment_intent', evento.type),
+        providerRef: exigirTexto(
+          cobranca,
+          'payment_intent' satisfies keyof CobrancaDeEventoLida,
+          evento.type,
+        ),
         providerRefundRef: refundRefMaisRecente(cobranca, evento.type),
         state: 'SUCCEEDED',
-        capturedAmountCents: exigirInteiro(cobranca, 'amount_captured', evento.type),
-        refundedAmountCents: exigirInteiro(cobranca, 'amount_refunded', evento.type),
+        capturedAmountCents: exigirInteiro(
+          cobranca,
+          'amount_captured' satisfies keyof CobrancaDeEventoLida,
+          evento.type,
+        ),
+        refundedAmountCents: exigirInteiro(
+          cobranca,
+          'amount_refunded' satisfies keyof CobrancaDeEventoLida,
+          evento.type,
+        ),
       };
     }
 
@@ -367,6 +430,13 @@ function instanteDoEvento(evento: EventoLido): Date {
 }
 
 function objetoDoEvento(evento: EventoLido): Record<string, unknown> {
+  // Achado 4.3: ler data.object sem validar `data` produzia TypeError, que o
+  // handler global converte em 500 — enquanto todo o resto deste modulo produz
+  // ProviderInvalidRequestError, que a rota converte em 400. Erro inconsistente
+  // na fronteira de confianca faz o provedor retentar o que nunca vai passar.
+  if (typeof evento.data !== 'object' || evento.data === null) {
+    throw new ProviderInvalidRequestError(`evento ${evento.type} sem data`);
+  }
   const objeto = evento.data.object;
   if (typeof objeto !== 'object' || objeto === null) {
     throw new ProviderInvalidRequestError(`evento ${evento.type} sem data.object`);
@@ -384,14 +454,16 @@ function exigirTexto(objeto: Record<string, unknown>, campo: string, tipo: strin
 
 function exigirInteiro(objeto: Record<string, unknown>, campo: string, tipo: string): number {
   const valor = objeto[campo];
-  if (typeof valor !== 'number' || !Number.isInteger(valor) || valor < 0) {
+  // isSafeInteger, e nao isInteger (achado 4.4): acima de 2^53-1 o inteiro ja
+  // perdeu precisao, e um valor monetario chegaria ARREDONDADO ao dominio.
+  if (typeof valor !== 'number' || !Number.isSafeInteger(valor) || valor < 0) {
     throw new ProviderInvalidRequestError(`evento ${tipo} com ${campo} invalido`);
   }
   return valor;
 }
 
 function refundRefMaisRecente(cobranca: Record<string, unknown>, tipo: string): string {
-  const lista = cobranca.refunds;
+  const lista = cobranca['refunds' satisfies keyof CobrancaDeEventoLida];
   if (typeof lista !== 'object' || lista === null) {
     throw new ProviderInvalidRequestError(`evento ${tipo} sem refunds`);
   }
