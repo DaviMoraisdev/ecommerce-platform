@@ -1,4 +1,5 @@
 import type Stripe from 'stripe';
+import { ProviderInvalidRequestError } from '../../../src/providers/payment-provider.port';
 import {
   EstadoInesperadoDoIntentError,
   EstadoInesperadoDoReembolsoError,
@@ -6,7 +7,9 @@ import {
   REEMBOLSO_SEM_MOTIVO,
   resultadoDoReembolso,
   snapshotDaCobranca,
+  eventoDoWebhook,
   type CobrancaLida,
+  type EventoLido,
   type IntentComCobranca,
   type ReembolsoLido,
   RECUSA_POR_CANCELAMENTO,
@@ -224,5 +227,118 @@ describe('stripe.mapeamento — resultadoDoReembolso', () => {
       EstadoInesperadoDoReembolsoError,
     );
     expect(() => resultadoDoReembolso(reembolso({ status: null }))).toThrow(EstadoInesperadoDoReembolsoError);
+  });
+});
+
+describe('stripe.mapeamento — eventoDoWebhook', () => {
+  const _eventoCompativel: EventoLido = {} as Stripe.Event;
+  void _eventoCompativel;
+
+  function ev(type: string, object: unknown, parcial: Partial<EventoLido> = {}): EventoLido {
+    return { id: 'evt_1', type, created: 1_700_000_000, data: { object }, ...parcial };
+  }
+
+  it('W1: payment_intent.succeeded -> payment.succeeded, com created em segundos', () => {
+    const r = eventoDoWebhook(ev('payment_intent.succeeded', { id: 'pi_1', amount_received: 12990 }));
+    expect(r).toMatchObject({
+      eventType: 'payment.succeeded',
+      providerEventId: 'evt_1',
+      providerEventTypeBruto: 'payment_intent.succeeded',
+      providerRef: 'pi_1',
+      state: 'SUCCEEDED',
+      capturedAmountCents: 12990,
+      refundedAmountCents: 0,
+    });
+    expect(r.providerCreatedAt).toEqual(new Date(1_700_000_000_000));
+  });
+
+  it('W2: payment_intent.payment_failed usa decline_code do emissor', () => {
+    const r = eventoDoWebhook(
+      ev('payment_intent.payment_failed', {
+        id: 'pi_2',
+        last_payment_error: { code: 'card_declined', decline_code: 'insufficient_funds' },
+      }),
+    );
+    expect(r).toMatchObject({ eventType: 'payment.failed', state: 'DECLINED', declineCode: 'insufficient_funds' });
+  });
+
+  it('W3: payment_failed SEM erro omite declineCode — ele e opcional na porta', () => {
+    const r = eventoDoWebhook(ev('payment_intent.payment_failed', { id: 'pi_3' }));
+    expect(r.eventType).toBe('payment.failed');
+    expect(r).not.toHaveProperty('declineCode');
+  });
+
+  it('W4: payment_intent.canceled -> payment.canceled', () => {
+    expect(eventoDoWebhook(ev('payment_intent.canceled', { id: 'pi_4' }))).toMatchObject({
+      eventType: 'payment.canceled',
+      state: 'CANCELED',
+      providerRef: 'pi_4',
+    });
+  });
+
+  it('W5: charge.refunded traz TOTAIS da cobranca e o ref do reembolso mais recente', () => {
+    const r = eventoDoWebhook(
+      ev('charge.refunded', {
+        id: 'ch_1',
+        payment_intent: 'pi_5',
+        amount_captured: 12990,
+        amount_refunded: 5000,
+        refunds: { data: [{ id: 're_novo' }, { id: 're_antigo' }] },
+      }),
+    );
+    expect(r).toMatchObject({
+      eventType: 'refund.succeeded',
+      providerRef: 'pi_5',
+      providerRefundRef: 're_novo',
+      state: 'SUCCEEDED',
+      capturedAmountCents: 12990,
+      refundedAmountCents: 5000,
+    });
+  });
+
+  it('W6: charge.refunded sem payment_intent e conteudo INVALIDO, nao unsupported', () => {
+    expect(() =>
+      eventoDoWebhook(
+        ev('charge.refunded', {
+          id: 'ch_2',
+          amount_captured: 1,
+          amount_refunded: 1,
+          refunds: { data: [{ id: 're_1' }] },
+        }),
+      ),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('W7: charge.refunded com refunds vazio lanca — nao da para nomear o reembolso', () => {
+    expect(() =>
+      eventoDoWebhook(
+        ev('charge.refunded', {
+          id: 'ch_3',
+          payment_intent: 'pi_7',
+          amount_captured: 1,
+          amount_refunded: 1,
+          refunds: { data: [] },
+        }),
+      ),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('W8: tipo que nao tratamos vira unsupported, SEM providerRef nem valores', () => {
+    const r = eventoDoWebhook(ev('charge.dispute.created', { id: 'dp_1' }));
+    expect(r.eventType).toBe('unsupported');
+    expect(r).not.toHaveProperty('providerRef');
+    expect(r.providerEventTypeBruto).toBe('charge.dispute.created');
+  });
+
+  it('W9: created invalido LANCA em vez de virar null — null travaria dinheiro', () => {
+    expect(() =>
+      eventoDoWebhook(ev('payment_intent.succeeded', { id: 'pi_9', amount_received: 1 }, { created: Number.NaN })),
+    ).toThrow(ProviderInvalidRequestError);
+  });
+
+  it('W10: valor nao inteiro no evento e conteudo invalido', () => {
+    expect(() => eventoDoWebhook(ev('payment_intent.succeeded', { id: 'pi_10', amount_received: 12.5 }))).toThrow(
+      ProviderInvalidRequestError,
+    );
   });
 });
