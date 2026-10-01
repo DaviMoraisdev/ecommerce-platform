@@ -1,5 +1,11 @@
 import { loadConfig, ConfigError } from '../../src/config/env';
-import { configDeTeste, envDeProducao, envDeTeste } from '../helpers/config';
+import {
+  CHAVE_STRIPE_LIVE,
+  CHAVE_STRIPE_TEST,
+  configDeTeste,
+  envDeProducao,
+  envDeTeste,
+} from '../helpers/config';
 
 /**
  * Segredo de 48 caracteres: passa o minimo de 32 e nao esta na lista de
@@ -26,6 +32,11 @@ function ambiente(nodeEnv: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.Pr
     ...base,
     NODE_ENV: nodeEnv,
     ...(nodeEnv === 'production' ? { ORDER_SERVICE_URL: 'https://order.interno' } : {}),
+    // 9b-1: com PAYMENT_PROVIDER=stripe a chave passou a ser obrigatoria, e o
+    // MODO dela tem de casar com o ambiente. Vive aqui pelo mesmo motivo do
+    // https acima: fixture que exige duas correcoes testa duas coisas sem dizer.
+    // Com provedor fake ela e ignorada, entao injetar sempre e inofensivo.
+    STRIPE_SECRET_KEY: nodeEnv === 'production' ? CHAVE_STRIPE_LIVE : CHAVE_STRIPE_TEST,
     ...overrides,
   };
 }
@@ -266,7 +277,13 @@ describe('loadConfig — ORDER_SERVICE_URL', () => {
   });
 
   describe('transporte do token em producao (achado 3.3)', () => {
-    const producao = { ...base, NODE_ENV: 'production', PAYMENT_PROVIDER: 'stripe' };
+    const producao = {
+      ...base,
+      NODE_ENV: 'production',
+      PAYMENT_PROVIDER: 'stripe',
+      // Producao exige provedor real, e provedor real exige chave do MODO live.
+      STRIPE_SECRET_KEY: CHAVE_STRIPE_LIVE,
+    };
 
     it('RECUSA http em producao sem declaracao explicita', () => {
       expect(() =>
@@ -650,5 +667,66 @@ describe('PAYMENT_EXPIRATION_ENABLED (Bloco 6e)', () => {
     expect(
       loadConfig({ ...base, PAYMENT_EXPIRATION_ENABLED: 'true' }).expiracaoHabilitada,
     ).toBe(true);
+  });
+});
+
+describe('loadConfig — STRIPE_SECRET_KEY (9b-1)', () => {
+  it('K1: provedor fake IGNORA a chave presente e devolve null', () => {
+    // Chave no ambiente, provedor fake: o campo tem de sair null, e nao a chave.
+    // Guardar credencial que ninguem usa e superficie de vazamento de graca.
+    const config = loadConfig(envDeTeste({ STRIPE_SECRET_KEY: CHAVE_STRIPE_TEST }));
+    expect(config.provider).toBe('fake');
+    expect(config.stripeSecretKey).toBeNull();
+  });
+
+  it('K2: provedor stripe SEM chave recusa no boot', () => {
+    const env = envDeTeste({ PAYMENT_PROVIDER: 'stripe' });
+    delete env.STRIPE_SECRET_KEY;
+    expect(() => loadConfig(env)).toThrow(ConfigError);
+    expect(() => loadConfig(env)).toThrow(/STRIPE_SECRET_KEY e obrigatoria/);
+  });
+
+  it('K3: chave de TESTE com provedor stripe em NODE_ENV=test e aceita', () => {
+    const config = loadConfig(
+      envDeTeste({ PAYMENT_PROVIDER: 'stripe', STRIPE_SECRET_KEY: CHAVE_STRIPE_TEST }),
+    );
+    expect(config.stripeSecretKey).toBe(CHAVE_STRIPE_TEST);
+  });
+
+  it('K4: chave LIVE fora de producao recusa — cobraria cartao de verdade', () => {
+    expect(() =>
+      loadConfig(envDeTeste({ PAYMENT_PROVIDER: 'stripe', STRIPE_SECRET_KEY: CHAVE_STRIPE_LIVE })),
+    ).toThrow(/de PRODUCAO \(live\) com NODE_ENV=test/);
+  });
+
+  it('K5: chave de TESTE em producao recusa — aprovaria pagamento sem dinheiro', () => {
+    expect(() => loadConfig(envDeProducao({ STRIPE_SECRET_KEY: CHAVE_STRIPE_TEST }))).toThrow(
+      /de TESTE com NODE_ENV=production/,
+    );
+  });
+
+  it('K6: chave publicavel pk_ recusa, e a mensagem nao ecoa a chave', () => {
+    const chave = 'pk_test_FALSA_PARA_TESTE_123456';
+    let mensagem = '';
+    try {
+      loadConfig(envDeTeste({ PAYMENT_PROVIDER: 'stripe', STRIPE_SECRET_KEY: chave }));
+    } catch (erro) {
+      mensagem = erro instanceof Error ? erro.message : String(erro);
+    }
+    expect(mensagem).toMatch(/prefixo inesperado: "pk_"/);
+    expect(mensagem).not.toContain(chave);
+  });
+
+  it('K7: chave restrita rk_ e aceita, no modo do ambiente', () => {
+    expect(
+      loadConfig(envDeTeste({ PAYMENT_PROVIDER: 'stripe', STRIPE_SECRET_KEY: 'rk_test_FALSA_000' }))
+        .stripeSecretKey,
+    ).toBe('rk_test_FALSA_000');
+  });
+
+  it('K8: prefixo secreto sem modo recusa — sem modo nao da para conferir o ambiente', () => {
+    expect(() =>
+      loadConfig(envDeTeste({ PAYMENT_PROVIDER: 'stripe', STRIPE_SECRET_KEY: 'sk_FALSA_SEM_MODO' })),
+    ).toThrow(/sem modo reconhecivel/);
   });
 });

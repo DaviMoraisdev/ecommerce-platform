@@ -21,6 +21,14 @@ export const SEGREDO_WEBHOOK = 'webhook0000111122223333444455556666777788889999a
 export const SEGREDO_JWT = 'jwt0000aaaabbbbccccddddeeeeffff11112222333344445555';
 
 /**
+ * Chaves FALSAS, no formato que o loadConfig exige. A de producao precisa ser
+ * `sk_live_` porque a guarda recusa `sk_test_` com NODE_ENV=production — e essa
+ * recusa e justamente um dos comportamentos testados.
+ */
+export const CHAVE_STRIPE_LIVE = 'sk_live_FALSA_APENAS_PARA_TESTE_0000000000';
+export const CHAVE_STRIPE_TEST = 'sk_test_FALSA_APENAS_PARA_TESTE_0000000000';
+
+/**
  * Fonte UNICA da forma do AppConfig nos testes.
  *
  * Antes cada arquivo montava o objeto completo, e toda variavel nova de ambiente
@@ -34,6 +42,7 @@ export function configDeTeste(overrides: Partial<AppConfig> = {}): AppConfig {
     defaultCurrency: 'BRL',
     nodeEnv: 'test',
     provider: 'fake',
+    stripeSecretKey: null,
     webhookSecret: SEGREDO_WEBHOOK,
     jwtSecret: SEGREDO_JWT,
     orderServiceUrl: 'http://localhost:3006',
@@ -87,6 +96,7 @@ export function envDeProducao(overrides: NodeJS.ProcessEnv = {}): NodeJS.Process
   return envDeTeste({
     NODE_ENV: 'production',
     PAYMENT_PROVIDER: 'stripe',
+    STRIPE_SECRET_KEY: CHAVE_STRIPE_LIVE,
     ORDER_SERVICE_URL: 'https://order.interno:3006',
     ...overrides,
   });
