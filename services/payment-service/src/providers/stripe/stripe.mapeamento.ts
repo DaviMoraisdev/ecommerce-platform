@@ -1,4 +1,4 @@
-import type { ChargeResult } from '../payment-provider.port';
+import type { ChargeResult, ChargeSnapshot, RefundResult } from '../payment-provider.port';
 
 /**
  * A variante DECLINED da uniao, extraida em vez de redeclarada: se a porta
@@ -125,4 +125,115 @@ function texto(valor: string | null | undefined): string | undefined {
   if (typeof valor !== 'string') return undefined;
   const limpo = valor.trim();
   return limpo === '' ? undefined : limpo;
+}
+
+// ============================================================
+// Snapshot (getCharge, cancelCharge) — Blocos 6 e 7
+// ============================================================
+
+/** Campos que lemos do Charge. SO existem com expand: ['latest_charge']. */
+export interface CobrancaLida {
+  amount_captured: number;
+  amount_refunded: number;
+}
+
+export interface IntentComCobranca extends IntentLido {
+  /** `string` quando NAO foi expandido — e isso e erro de chamada, nao estado. */
+  latest_charge?: string | CobrancaLida | null;
+}
+
+export class ExpansaoAusenteError extends Error {
+  constructor(readonly intentId: string) {
+    super(
+      `PaymentIntent ${intentId} veio com latest_charge nao expandido: ` +
+        "o valor reembolsado vive no Charge, e sem expand: ['latest_charge'] ele seria lido como zero",
+    );
+    this.name = 'ExpansaoAusenteError';
+  }
+}
+
+export function snapshotDaCobranca(intent: IntentComCobranca): ChargeSnapshot {
+  const cobranca = cobrancaDe(intent);
+  const base = {
+    providerRef: intent.id,
+    amountCents: intent.amount,
+    capturedAmountCents: intent.amount_received,
+    refundedAmountCents: cobranca === null ? 0 : cobranca.amount_refunded,
+  };
+
+  if (intent.status === 'succeeded') return { ...base, state: 'SUCCEEDED' };
+  if (intent.status === 'canceled') return { ...base, state: 'CANCELED' };
+
+  const erro = intent.last_payment_error;
+  if (intent.status === 'requires_payment_method' && erro !== null && erro !== undefined) {
+    const codigo = texto(erro.decline_code) ?? texto(erro.code) ?? RECUSA_SEM_CODIGO;
+    return { ...base, state: 'DECLINED', declineCode: codigo };
+  }
+
+  // Diferente da CRIACAO, que lanca em status inesperado. Aqui o consumidor e a
+  // varredura de reconciliacao, e o estado seguro dela e a tentativa PRESA e
+  // VISIVEL (6b e 6e). PROCESSING e o que mantem a tentativa sob observacao;
+  // lancar faria a varredura falhar inteira por uma linha.
+  return { ...base, state: 'PROCESSING' };
+}
+
+function cobrancaDe(intent: IntentComCobranca): CobrancaLida | null {
+  const cobranca = intent.latest_charge;
+  if (cobranca === null || cobranca === undefined) return null;
+  if (typeof cobranca === 'string') throw new ExpansaoAusenteError(intent.id);
+  return cobranca;
+}
+
+// ============================================================
+// Reembolso (Bloco 7)
+// ============================================================
+
+/** Campos que lemos do Refund. */
+export interface ReembolsoLido {
+  id: string;
+  status?: string | null;
+  amount: number;
+  failure_reason?: string | null;
+}
+
+export class EstadoInesperadoDoReembolsoError extends Error {
+  constructor(
+    readonly refundId: string,
+    readonly status: string,
+  ) {
+    super(`Refund ${refundId} em estado inesperado: ${status}`);
+    this.name = 'EstadoInesperadoDoReembolsoError';
+  }
+}
+
+/** Reembolso recusado sem motivo declarado — o contrato exige codigo. */
+export const REEMBOLSO_SEM_MOTIVO = 'unknown_refund_failure';
+
+export function resultadoDoReembolso(reembolso: ReembolsoLido): RefundResult {
+  const status = texto(reembolso.status) ?? '';
+  switch (status) {
+    case 'succeeded':
+      return { providerRefundRef: reembolso.id, state: 'SUCCEEDED', amountCents: reembolso.amount };
+
+    case 'pending':
+    case 'requires_action':
+      // requires_action: a Stripe pediu dados bancarios ao cliente por e-mail.
+      // Nao e falha; e espera, e a conclusao chega por webhook.
+      return { providerRefundRef: reembolso.id, state: 'PROCESSING', amountCents: reembolso.amount };
+
+    case 'failed':
+    case 'canceled':
+      return {
+        providerRefundRef: reembolso.id,
+        state: 'DECLINED',
+        amountCents: reembolso.amount,
+        declineCode: texto(reembolso.failure_reason) ?? REEMBOLSO_SEM_MOTIVO,
+      };
+
+    default:
+      // Aqui LANCA, ao contrario do snapshot: reembolso e dinheiro saindo, e
+      // classificar errado um status novo registraria devolucao que nao
+      // aconteceu, ou o contrario.
+      throw new EstadoInesperadoDoReembolsoError(reembolso.id, status);
+  }
 }

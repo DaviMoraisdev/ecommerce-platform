@@ -1,6 +1,14 @@
 import type Stripe from 'stripe';
 import {
   EstadoInesperadoDoIntentError,
+  EstadoInesperadoDoReembolsoError,
+  ExpansaoAusenteError,
+  REEMBOLSO_SEM_MOTIVO,
+  resultadoDoReembolso,
+  snapshotDaCobranca,
+  type CobrancaLida,
+  type IntentComCobranca,
+  type ReembolsoLido,
   RECUSA_POR_CANCELAMENTO,
   RECUSA_SEM_CODIGO,
   recusaDeCobranca,
@@ -104,5 +112,117 @@ describe('stripe.mapeamento — recusaDeCobranca', () => {
 
   it('M11: declineMessage e OMITIDA quando vazia, em vez de virar string vazia', () => {
     expect(recusaDeCobranca('pi_2', { code: 'x', message: '  ' })).not.toHaveProperty('declineMessage');
+  });
+});
+
+describe('stripe.mapeamento — snapshotDaCobranca', () => {
+  // Teste de tipo: o Charge do SDK tem de servir ao que lemos, e o
+  // PaymentIntent com expand tambem.
+  const _cobrancaCompativel: CobrancaLida = {} as Stripe.Charge;
+  void _cobrancaCompativel;
+
+  function comCobranca(parcial: Partial<IntentComCobranca>): IntentComCobranca {
+    return {
+      id: 'pi_9',
+      status: 'succeeded',
+      amount: 12990,
+      amount_received: 12990,
+      latest_charge: { amount_captured: 12990, amount_refunded: 0 },
+      ...parcial,
+    };
+  }
+
+  it('S1: succeeded com reembolso parcial traz os tres valores', () => {
+    expect(
+      snapshotDaCobranca(
+        comCobranca({ latest_charge: { amount_captured: 12990, amount_refunded: 3000 } }),
+      ),
+    ).toEqual({
+      providerRef: 'pi_9',
+      state: 'SUCCEEDED',
+      amountCents: 12990,
+      capturedAmountCents: 12990,
+      refundedAmountCents: 3000,
+    });
+  });
+
+  it('S2: latest_charge NAO expandido lanca em vez de ler zero reembolsado', () => {
+    expect(() => snapshotDaCobranca(comCobranca({ latest_charge: 'ch_123' }))).toThrow(ExpansaoAusenteError);
+  });
+
+  it('S3: sem cobranca ainda, reembolsado e zero', () => {
+    expect(
+      snapshotDaCobranca(
+        comCobranca({ status: 'processing', amount_received: 0, latest_charge: null }),
+      ),
+    ).toEqual({
+      providerRef: 'pi_9',
+      state: 'PROCESSING',
+      amountCents: 12990,
+      capturedAmountCents: 0,
+      refundedAmountCents: 0,
+    });
+  });
+
+  it('S4: canceled vira CANCELED, e nao DECLINED como na criacao', () => {
+    expect(snapshotDaCobranca(comCobranca({ status: 'canceled', amount_received: 0 })).state).toBe('CANCELED');
+  });
+
+  it('S5: requires_payment_method com erro vira DECLINED com codigo', () => {
+    const s = snapshotDaCobranca(
+      comCobranca({
+        status: 'requires_payment_method',
+        amount_received: 0,
+        last_payment_error: { decline_code: 'do_not_honor' },
+      }),
+    );
+    expect(s.state).toBe('DECLINED');
+    expect(s.declineCode).toBe('do_not_honor');
+  });
+
+  it('S6: status desconhecido vira PROCESSING — a varredura mantem a tentativa presa e visivel', () => {
+    expect(snapshotDaCobranca(comCobranca({ status: 'estado_novo_da_stripe' })).state).toBe('PROCESSING');
+  });
+});
+
+describe('stripe.mapeamento — resultadoDoReembolso', () => {
+  const _reembolsoCompativel: ReembolsoLido = {} as Stripe.Refund;
+  void _reembolsoCompativel;
+
+  function reembolso(parcial: Partial<ReembolsoLido>): ReembolsoLido {
+    return { id: 're_1', status: 'succeeded', amount: 3000, ...parcial };
+  }
+
+  it('R1: succeeded', () => {
+    expect(resultadoDoReembolso(reembolso({}))).toEqual({
+      providerRefundRef: 're_1',
+      state: 'SUCCEEDED',
+      amountCents: 3000,
+    });
+  });
+
+  it.each(['pending', 'requires_action'])('R2: %s vira PROCESSING, nao falha', (status) => {
+    expect(resultadoDoReembolso(reembolso({ status })).state).toBe('PROCESSING');
+  });
+
+  it.each(['failed', 'canceled'])('R3: %s vira DECLINED com failure_reason', (status) => {
+    expect(resultadoDoReembolso(reembolso({ status, failure_reason: 'lost_or_stolen_card' }))).toEqual({
+      providerRefundRef: 're_1',
+      state: 'DECLINED',
+      amountCents: 3000,
+      declineCode: 'lost_or_stolen_card',
+    });
+  });
+
+  it('R4: failed sem motivo usa o codigo de ausencia', () => {
+    const r = resultadoDoReembolso(reembolso({ status: 'failed' }));
+    expect(r.state === 'DECLINED' && r.declineCode).toBe(REEMBOLSO_SEM_MOTIVO);
+  });
+
+  it('R5: status desconhecido ou ausente LANCA — dinheiro saindo nao admite palpite', () => {
+    expect(() => resultadoDoReembolso(reembolso({ status: 'estado_novo' }))).toThrow(
+      EstadoInesperadoDoReembolsoError,
+    );
+    expect(() => resultadoDoReembolso(reembolso({ status: null }))).toThrow(EstadoInesperadoDoReembolsoError);
   });
 });
