@@ -13,6 +13,15 @@ export interface AppConfig {
   defaultCurrency: Currency;
   nodeEnv: NodeEnv;
   provider: ProviderName;
+  /**
+   * Chave secreta da Stripe. `null` quando o provedor e o fake — e nao string
+   * vazia: vazio obrigaria todo consumidor a checar, e um esquecimento viraria
+   * chamada a Stripe com credencial em branco.
+   *
+   * Validada no BOOT, nao no primeiro uso. Sem isso, chave ausente ou do
+   * ambiente errado so apareceria na primeira cobranca.
+   */
+  stripeSecretKey: string | null;
   webhookSecret: string;
   jwtSecret: string;
   orderServiceUrl: string;
@@ -378,6 +387,74 @@ function parseProvider(raw: string, nodeEnv: NodeEnv): ProviderName {
   throw new ConfigError(`PAYMENT_PROVIDER invalido: "${raw}". Use "fake" ou "stripe".`);
 }
 
+/** Secreta padrao e restrita. `pk_` e PUBLICAVEL e nao autentica chamada de servidor. */
+const PREFIXOS_DE_CHAVE_SECRETA = ['sk_', 'rk_'] as const;
+
+/**
+ * Guarda nos DOIS sentidos, e a simetria e o ponto.
+ *
+ * `sk_live_` fora de producao: cobranca real em ambiente de teste.
+ * `sk_test_` em producao: o servico aprova cobrancas que NUNCA movem dinheiro, e
+ * o pedido vai para PAGO. E o mesmo defeito que a guarda do PAYMENT_PROVIDER=fake
+ * previne, por outro caminho — proteger um e nao o outro seria incoerente.
+ *
+ * Chave sem `live` nem `test` no prefixo tambem recusa: sem saber o MODO, nao da
+ * para afirmar que o ambiente confere. Fail-closed, igual ao resto do arquivo.
+ *
+ * Nenhuma mensagem ecoa a chave. No caso de prefixo inesperado, sai SO o
+ * prefixo, que e o que o operador precisa para corrigir e nao e segredo.
+ */
+function parseStripeSecretKey(
+  raw: string | undefined,
+  provider: ProviderName,
+  nodeEnv: NodeEnv,
+): string | null {
+  if (provider !== 'stripe') return null;
+
+  const valor = (raw ?? '').trim();
+  if (valor === '') {
+    throw new ConfigError(
+      'STRIPE_SECRET_KEY e obrigatoria com PAYMENT_PROVIDER=stripe. ' +
+        'Sem ela o adapter subiria e falharia na primeira cobranca.',
+    );
+  }
+
+  if (!PREFIXOS_DE_CHAVE_SECRETA.some((prefixo) => valor.startsWith(prefixo))) {
+    throw new ConfigError(
+      `STRIPE_SECRET_KEY com prefixo inesperado: "${valor.slice(0, 3)}". ` +
+        'Use sk_ (secreta) ou rk_ (restrita). pk_ e a chave PUBLICAVEL, que nao ' +
+        'autentica chamada de servidor.',
+    );
+  }
+
+  const deProducao = valor.startsWith('sk_live_') || valor.startsWith('rk_live_');
+  const deTeste = valor.startsWith('sk_test_') || valor.startsWith('rk_test_');
+
+  if (!deProducao && !deTeste) {
+    throw new ConfigError(
+      'STRIPE_SECRET_KEY sem modo reconhecivel no prefixo (esperado sk_live_, ' +
+        'sk_test_, rk_live_ ou rk_test_). Sem o modo nao da para verificar se a ' +
+        'chave confere com o ambiente.',
+    );
+  }
+
+  if (deProducao && nodeEnv !== 'production') {
+    throw new ConfigError(
+      `STRIPE_SECRET_KEY de PRODUCAO (live) com NODE_ENV=${nodeEnv}. ` +
+        'Isso cobraria cartao de verdade em ambiente de teste.',
+    );
+  }
+
+  if (deTeste && nodeEnv === 'production') {
+    throw new ConfigError(
+      'STRIPE_SECRET_KEY de TESTE com NODE_ENV=production. O servico aprovaria ' +
+        'cobrancas que nunca movem dinheiro, e o pedido iria para PAGO.',
+    );
+  }
+
+  return valor;
+}
+
 /**
  * Espelha deliberadamente o tratamento de ORDER_SERVICE_URL: a credencial viaja
  * DENTRO da URL do broker, entao transporte em texto claro em producao expoe
@@ -515,12 +592,16 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     );
   }
 
+  const provider = parseProvider(requireEnv('PAYMENT_PROVIDER', source), nodeEnv);
+  const stripeSecretKey = parseStripeSecretKey(source.STRIPE_SECRET_KEY, provider, nodeEnv);
+
   return {
     port: parsePort(requireEnv('PAYMENT_PORT', source)),
     databaseUrl: requireEnv('DATABASE_URL', source),
     defaultCurrency: currency,
     nodeEnv,
-    provider: parseProvider(requireEnv('PAYMENT_PROVIDER', source), nodeEnv),
+    provider,
+    stripeSecretKey,
     webhookSecret,
     jwtSecret,
     orderServiceUrl: parseUrlDeServico(
