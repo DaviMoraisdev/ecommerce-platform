@@ -14,8 +14,13 @@ import {
   type WebhookEventPayload,
   type WebhookRequest,
 } from '../payment-provider.port';
-import { lancarTraduzido } from './stripe.erros';
-import { recusaDeCobranca, resultadoDaCriacao } from './stripe.mapeamento';
+import { CODIGO_ESTADO_INESPERADO, lancarTraduzido } from './stripe.erros';
+import {
+  recusaDeCobranca,
+  resultadoDaCriacao,
+  resultadoDoReembolso,
+  snapshotDaCobranca,
+} from './stripe.mapeamento';
 
 export interface StripeProviderDeps {
   secretKey: string;
@@ -116,8 +121,22 @@ export class StripeProvider implements PaymentProvider {
     }
   }
 
-  async getCharge(_providerRef: ProviderRef): Promise<ChargeSnapshot> {
-    throw new Error(PENDENTE_NO_9B2);
+  async getCharge(providerRef: ProviderRef): Promise<ChargeSnapshot> {
+    try {
+      return snapshotDaCobranca(await this.lerIntent(providerRef));
+    } catch (erro) {
+      lancarTraduzido(erro, 'consultar');
+    }
+  }
+
+  /**
+   * O `expand` NAO e opcional aqui: o valor reembolsado vive no Charge, e sem
+   * ele o snapshot recebe latest_charge como STRING e lanca (9b-1). Centralizado
+   * num metodo porque TODO caminho que monta snapshot precisa dele — cancel
+   * incluido.
+   */
+  private async lerIntent(providerRef: ProviderRef): Promise<Stripe.PaymentIntent> {
+    return this.stripe.paymentIntents.retrieve(providerRef, { expand: ['latest_charge'] });
   }
 
   async buscarCobrancaPorTentativa(
@@ -127,12 +146,50 @@ export class StripeProvider implements PaymentProvider {
     throw new Error(PENDENTE_NO_9B2);
   }
 
-  async cancelCharge(_input: CancelChargeInput): Promise<ChargeSnapshot> {
-    throw new Error(PENDENTE_NO_9B2);
+  async cancelCharge(input: CancelChargeInput): Promise<ChargeSnapshot> {
+    try {
+      const intent = await this.stripe.paymentIntents.cancel(
+        input.providerRef,
+        { expand: ['latest_charge'] },
+        { idempotencyKey: input.idempotencyKey },
+      );
+      return snapshotDaCobranca(intent);
+    } catch (erro) {
+      // A Stripe devolve payment_intent_unexpected_state em DOIS casos opostos:
+      // ja cancelado e ja capturado. O contrato exige no-op no primeiro e
+      // ChargeNotCancelableError no segundo, e o codigo nao distingue — so o
+      // ESTADO distingue. Por isso a leitura extra, apenas no caminho de erro.
+      if (
+        erro instanceof Stripe.errors.StripeInvalidRequestError &&
+        erro.code === CODIGO_ESTADO_INESPERADO
+      ) {
+        const atual = await this.lerIntent(input.providerRef);
+        if (atual.status === 'canceled') {
+          // Idempotencia por ESTADO: cancelar o que ja esta cancelado e no-op,
+          // mesmo com chave nova.
+          return snapshotDaCobranca(atual);
+        }
+        // Capturado (ou qualquer outro estado que recusa cancelamento): a
+        // traducao devolve ChargeNotCancelableError, que o job do 6e le como
+        // "ja capturou" — informacao, nao falha.
+      }
+      lancarTraduzido(erro, 'cancelar');
+    }
   }
 
-  async refund(_input: RefundInput): Promise<RefundResult> {
-    throw new Error(PENDENTE_NO_9B2);
+  async refund(input: RefundInput): Promise<RefundResult> {
+    try {
+      const reembolso = await this.stripe.refunds.create(
+        // payment_intent, e nao charge: reembolsar o PaymentIntent e
+        // equivalente a reembolsar a cobranca por tras dele, e e o id que nos
+        // guardamos como providerRef.
+        { payment_intent: input.providerRef, amount: input.amountCents },
+        { idempotencyKey: input.idempotencyKey },
+      );
+      return resultadoDoReembolso(reembolso);
+    } catch (erro) {
+      lancarTraduzido(erro, 'reembolsar');
+    }
   }
 
   verifyWebhook(_request: WebhookRequest): WebhookEventPayload {

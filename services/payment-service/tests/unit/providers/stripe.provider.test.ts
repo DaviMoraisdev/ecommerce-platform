@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
-import { ProviderInvalidRequestError, type CreateChargeInput } from '../../../src/providers/payment-provider.port';
+import {
+  ChargeNotCancelableError,
+  ChargeNotFoundError,
+  ProviderInvalidRequestError,
+  type CreateChargeInput,
+} from '../../../src/providers/payment-provider.port';
 import { StripeProvider } from '../../../src/providers/stripe/stripe.provider';
 
 /**
@@ -38,6 +43,38 @@ function fetchDublado(resposta: unknown, status = 200) {
     });
   }) as unknown as typeof fetch;
   return { fn, chamadas };
+}
+
+/**
+ * Dublê com FILA de respostas: o caminho de erro do cancelamento faz duas
+ * chamadas (cancel e depois retrieve), e um dublê de resposta unica nao
+ * conseguiria representar isso.
+ */
+function fetchEmFila(respostas: Array<{ corpo: unknown; status?: number }>) {
+  const chamadas: Chamada[] = [];
+  const fn = (async (entradaUrl: unknown, init?: RequestInit) => {
+    const cabecalhos: Record<string, string> = {};
+    new Headers(init?.headers).forEach((valor, nome) => {
+      cabecalhos[nome] = valor;
+    });
+    chamadas.push({
+      url: String(entradaUrl),
+      metodo: init?.method ?? 'GET',
+      cabecalhos,
+      corpo: new URLSearchParams(typeof init?.body === 'string' ? init.body : ''),
+    });
+    const proxima = respostas[chamadas.length - 1];
+    if (proxima === undefined) throw new Error('dublê sem resposta para a chamada ' + chamadas.length);
+    return new Response(JSON.stringify(proxima.corpo), {
+      status: proxima.status ?? 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as unknown as typeof fetch;
+  return { fn, chamadas };
+}
+
+function provedor(fn: typeof fetch): StripeProvider {
+  return new StripeProvider({ secretKey: 'sk_test_x', webhookSecret: 'whsec_x', fetchFn: fn });
 }
 
 function entrada(overrides: Partial<CreateChargeInput> = {}): CreateChargeInput {
@@ -155,5 +192,132 @@ describe('StripeProvider — createCharge, formato da requisicao', () => {
       capturedAmountCents: 0,
       declineCode: 'insufficient_funds',
     });
+  });
+});
+
+
+describe('StripeProvider — getCharge, cancelCharge e refund', () => {
+  const INTENT_CAPTURADO = {
+    id: 'pi_1',
+    object: 'payment_intent',
+    status: 'succeeded',
+    amount: 12990,
+    amount_received: 12990,
+    latest_charge: { id: 'ch_1', object: 'charge', amount_captured: 12990, amount_refunded: 3000 },
+  };
+
+  const INTENT_CANCELADO = {
+    id: 'pi_1',
+    object: 'payment_intent',
+    status: 'canceled',
+    amount: 12990,
+    amount_received: 0,
+    latest_charge: null,
+  };
+
+  const ESTADO_INESPERADO = {
+    error: {
+      type: 'invalid_request_error',
+      code: 'payment_intent_unexpected_state',
+      message: 'cannot be canceled',
+    },
+  };
+
+  it('B1: getCharge pede expand[latest_charge] — sem ele o reembolsado seria lido como zero', async () => {
+    const { fn, chamadas } = fetchEmFila([{ corpo: INTENT_CAPTURADO }]);
+
+    const snapshot = await provedor(fn).getCharge('pi_1');
+
+    expect(chamadas[0].metodo).toBe('GET');
+    expect(decodeURIComponent(chamadas[0].url)).toBe(
+      'https://api.stripe.com/v1/payment_intents/pi_1?expand[0]=latest_charge',
+    );
+    expect(snapshot).toEqual({
+      providerRef: 'pi_1',
+      state: 'SUCCEEDED',
+      amountCents: 12990,
+      capturedAmountCents: 12990,
+      refundedAmountCents: 3000,
+    });
+  });
+
+  it('B2: referencia inexistente vira ChargeNotFoundError pela taxonomia', async () => {
+    const { fn } = fetchEmFila([
+      { corpo: { error: { type: 'invalid_request_error', code: 'resource_missing', message: 'no such pi' } }, status: 404 },
+    ]);
+
+    await expect(provedor(fn).getCharge('pi_nao_existe')).rejects.toBeInstanceOf(ChargeNotFoundError);
+  });
+
+  it('B3: cancelCharge faz POST em /cancel com a NOSSA chave e com expand', async () => {
+    const { fn, chamadas } = fetchEmFila([{ corpo: INTENT_CANCELADO }]);
+
+    const snapshot = await provedor(fn).cancelCharge({ providerRef: 'pi_1', idempotencyKey: 'cancel:pi_1' });
+
+    expect(chamadas[0].metodo).toBe('POST');
+    expect(chamadas[0].url).toBe('https://api.stripe.com/v1/payment_intents/pi_1/cancel');
+    expect(chamadas[0].cabecalhos['idempotency-key']).toBe('cancel:pi_1');
+    expect(chamadas[0].corpo.get('expand[0]')).toBe('latest_charge');
+    expect(snapshot.state).toBe('CANCELED');
+  });
+
+  it('B4: cancelar o que JA esta cancelado e no-op, mesmo com chave nova', async () => {
+    // Estado inesperado, e a leitura seguinte mostra canceled: no-op.
+    const { fn, chamadas } = fetchEmFila([
+      { corpo: ESTADO_INESPERADO, status: 400 },
+      { corpo: INTENT_CANCELADO },
+    ]);
+
+    const snapshot = await provedor(fn).cancelCharge({ providerRef: 'pi_1', idempotencyKey: 'chave-nova' });
+
+    expect(snapshot.state).toBe('CANCELED');
+    // Duas chamadas: o cancel que falhou e a leitura que desambiguou.
+    expect(chamadas).toHaveLength(2);
+    expect(chamadas[1].metodo).toBe('GET');
+  });
+
+  it('B5: cancelar o que JA foi capturado vira ChargeNotCancelableError', async () => {
+    // MESMO codigo de erro do B4; so o estado distingue.
+    const { fn, chamadas } = fetchEmFila([
+      { corpo: ESTADO_INESPERADO, status: 400 },
+      { corpo: INTENT_CAPTURADO },
+    ]);
+
+    await expect(
+      provedor(fn).cancelCharge({ providerRef: 'pi_1', idempotencyKey: 'chave-nova' }),
+    ).rejects.toBeInstanceOf(ChargeNotCancelableError);
+    expect(chamadas).toHaveLength(2);
+  });
+
+  it('B6: refund usa payment_intent, com corpo FECHADO e a nossa chave', async () => {
+    const { fn, chamadas } = fetchEmFila([
+      { corpo: { id: 're_1', object: 'refund', status: 'succeeded', amount: 3000 } },
+    ]);
+
+    const resultado = await provedor(fn).refund({
+      providerRef: 'pi_1',
+      amountCents: 3000,
+      idempotencyKey: 'refund:pi_1:1',
+    });
+
+    expect(chamadas[0].url).toBe('https://api.stripe.com/v1/refunds');
+    expect(chamadas[0].cabecalhos['idempotency-key']).toBe('refund:pi_1:1');
+    expect([...chamadas[0].corpo.keys()].sort()).toEqual(['amount', 'payment_intent']);
+    expect(chamadas[0].corpo.get('payment_intent')).toBe('pi_1');
+    expect(resultado).toEqual({ providerRefundRef: 're_1', state: 'SUCCEEDED', amountCents: 3000 });
+  });
+
+  it('B7: reembolso pendente vira PROCESSING, nao falha', async () => {
+    const { fn } = fetchEmFila([
+      { corpo: { id: 're_2', object: 'refund', status: 'pending', amount: 3000 } },
+    ]);
+
+    const resultado = await provedor(fn).refund({
+      providerRef: 'pi_1',
+      amountCents: 3000,
+      idempotencyKey: 'refund:pi_1:2',
+    });
+
+    expect(resultado.state).toBe('PROCESSING');
   });
 });
