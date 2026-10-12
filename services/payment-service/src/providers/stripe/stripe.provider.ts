@@ -3,6 +3,7 @@ import Stripe from 'stripe';
 import {
   ProviderInvalidRequestError,
   ProviderUnavailableError,
+  WebhookSignatureError,
   type ChargeResult,
   type ChargeSnapshot,
   type CancelChargeInput,
@@ -17,6 +18,7 @@ import {
 } from '../payment-provider.port';
 import { CODIGO_ESTADO_INESPERADO, lancarTraduzido } from './stripe.erros';
 import {
+  eventoDoWebhook,
   recusaDeCobranca,
   resultadoDaCriacao,
   resultadoDoReembolso,
@@ -28,6 +30,10 @@ export interface StripeProviderDeps {
   webhookSecret: string;
   /** Injetavel para o teste do teto nao precisar de dez respostas. */
   tetoDePaginas?: number;
+  /** Janela antirreplay do webhook. Default do SDK: 300s. */
+  toleranciaSegundos?: number;
+  /** Injetavel para o teste de retentativa nao esperar o backoff real. */
+  maxRetentativasDeRede?: number;
   /**
    * `fetch` injetavel, usado via Stripe.createFetchHttpClient(fetchFn).
    * Existe para o TESTE provar o FORMATO DA REQUISICAO sem tocar a rede: o
@@ -52,6 +58,20 @@ export const JANELA_DE_BUSCA_HORAS = 24;
 export const TAMANHO_DA_PAGINA = 100;
 export const TETO_DE_PAGINAS = 10;
 
+/**
+ * Retentativas que o SDK faz por conta propria, DECLARADAS em vez de herdadas.
+ *
+ * O default vem de getDefaultMaxNetworkRetries() e pode mudar entre versoes do
+ * SDK; latencia de fluxo financeiro nao deve depender disso em silencio.
+ *
+ * Retentar aqui e SEGURO porque o SDK reusa a chave de idempotencia que nos
+ * passamos: a Stripe devolve a resposta original em vez de cobrar de novo.
+ */
+export const MAX_RETENTATIVAS_DE_REDE = 2;
+
+/** Cabecalho de assinatura da Stripe, em minusculas (Node normaliza). */
+export const CABECALHO_DE_ASSINATURA = 'stripe-signature';
+
 /** Placeholder dos metodos que entram nos incrementos seguintes do 9b-2. */
 export const PENDENTE_NO_9B2 = 'operacao do adapter da Stripe ainda nao implementada (9b-2)';
 
@@ -70,12 +90,12 @@ export class StripeProvider implements PaymentProvider {
   private readonly stripe: Stripe;
 
   constructor(private readonly deps: StripeProviderDeps) {
-    this.stripe = new Stripe(
-      deps.secretKey,
-      deps.fetchFn === undefined
+    this.stripe = new Stripe(deps.secretKey, {
+      maxNetworkRetries: deps.maxRetentativasDeRede ?? MAX_RETENTATIVAS_DE_REDE,
+      ...(deps.fetchFn === undefined
         ? {}
-        : { httpClient: Stripe.createFetchHttpClient(deps.fetchFn) },
-    );
+        : { httpClient: Stripe.createFetchHttpClient(deps.fetchFn) }),
+    });
   }
 
   async createCharge(input: CreateChargeInput): Promise<ChargeResult> {
@@ -257,7 +277,30 @@ export class StripeProvider implements PaymentProvider {
     }
   }
 
-  verifyWebhook(_request: WebhookRequest): WebhookEventPayload {
-    throw new Error(PENDENTE_NO_9B2);
+  verifyWebhook(request: WebhookRequest): WebhookEventPayload {
+    const bruto = request.headers[CABECALHO_DE_ASSINATURA];
+    const assinatura = Array.isArray(bruto) ? bruto[0] : bruto;
+    if (assinatura === undefined || assinatura.trim() === '') {
+      // Ausencia de cabecalho e falha de ASSINATURA, nao conteudo invalido: sem
+      // ele nao ha como afirmar origem, e a rota responde 401.
+      throw new WebhookSignatureError('cabecalho stripe-signature ausente');
+    }
+
+    try {
+      // SINCRONO de proposito (contrato da porta): HMAC puro, sem I/O. O corpo
+      // vai CRU — se alguem tiver parseado e reserializado, a verificacao falha
+      // para sempre, e e por isso que a rota usa express.raw desde o Bloco 4.
+      const evento = this.stripe.webhooks.constructEvent(
+        request.rawBody,
+        assinatura,
+        this.deps.webhookSecret,
+        this.deps.toleranciaSegundos,
+      );
+      return eventoDoWebhook(evento);
+    } catch (erro) {
+      // StripeSignatureVerificationError -> WebhookSignatureError (401);
+      // ProviderInvalidRequestError do mapeamento passa reto (400).
+      lancarTraduzido(erro, 'webhook');
+    }
   }
 }

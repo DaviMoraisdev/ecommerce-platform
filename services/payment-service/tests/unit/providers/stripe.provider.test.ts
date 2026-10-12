@@ -1,3 +1,5 @@
+import Stripe from 'stripe';
+
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -5,6 +7,7 @@ import {
   ChargeNotFoundError,
   ProviderInvalidRequestError,
   ProviderUnavailableError,
+  WebhookSignatureError,
   type CreateChargeInput,
 } from '../../../src/providers/payment-provider.port';
 import { StripeProvider } from '../../../src/providers/stripe/stripe.provider';
@@ -414,4 +417,101 @@ describe('StripeProvider — buscarCobrancaPorTentativa', () => {
     );
     expect(chamadas).toHaveLength(2);
   });
+});
+
+describe('StripeProvider — verifyWebhook', () => {
+  const SEGREDO = 'whsec_teste_0000111122223333';
+
+  function corpoAssinado(
+    evento: unknown,
+    opcoes: { segredo?: string; timestamp?: number } = {},
+  ): { rawBody: Buffer; headers: Record<string, string> } {
+    const payload = JSON.stringify(evento);
+    const assinatura = Stripe.webhooks.generateTestHeaderString({
+      payload,
+      secret: opcoes.segredo ?? SEGREDO,
+      ...(opcoes.timestamp === undefined ? {} : { timestamp: opcoes.timestamp }),
+    });
+    return { rawBody: Buffer.from(payload, 'utf8'), headers: { 'stripe-signature': assinatura } };
+  }
+
+  function comWebhook(): StripeProvider {
+    const { fn } = fetchEmFila([]);
+    return new StripeProvider({ secretKey: 'sk_test_x', webhookSecret: SEGREDO, fetchFn: fn });
+  }
+
+  const EVENTO_SUCESSO = {
+    id: 'evt_1',
+    object: 'event',
+    type: 'payment_intent.succeeded',
+    created: 1_700_000_000,
+    data: { object: { id: 'pi_1', object: 'payment_intent', amount_received: 12990 } },
+  };
+
+  it('D1: assinatura valida devolve o evento JA no nosso vocabulario', () => {
+    const { rawBody, headers } = corpoAssinado(EVENTO_SUCESSO);
+
+    const evento = comWebhook().verifyWebhook({ rawBody, headers });
+
+    expect(evento).toMatchObject({
+      eventType: 'payment.succeeded',
+      providerEventId: 'evt_1',
+      providerRef: 'pi_1',
+      capturedAmountCents: 12990,
+    });
+  });
+
+  it('D2: assinado com OUTRO segredo vira WebhookSignatureError', () => {
+    const { rawBody, headers } = corpoAssinado(EVENTO_SUCESSO, { segredo: 'whsec_outro_000' });
+
+    expect(() => comWebhook().verifyWebhook({ rawBody, headers })).toThrow(WebhookSignatureError);
+  });
+
+  it('D3: cabecalho ausente vira WebhookSignatureError, nao TypeError', () => {
+    const payload = Buffer.from(JSON.stringify(EVENTO_SUCESSO), 'utf8');
+
+    expect(() => comWebhook().verifyWebhook({ rawBody: payload, headers: {} })).toThrow(
+      WebhookSignatureError,
+    );
+    expect(() =>
+      comWebhook().verifyWebhook({ rawBody: payload, headers: { 'stripe-signature': '   ' } }),
+    ).toThrow(WebhookSignatureError);
+  });
+
+  it('D4: timestamp fora da janela antirreplay vira WebhookSignatureError', () => {
+    // Uma hora atras, contra a tolerancia default de 300s do SDK.
+    const umaHoraAtras = Math.floor(Date.now() / 1000) - 3600;
+    const { rawBody, headers } = corpoAssinado(EVENTO_SUCESSO, { timestamp: umaHoraAtras });
+
+    expect(() => comWebhook().verifyWebhook({ rawBody, headers })).toThrow(WebhookSignatureError);
+  });
+
+  it('D5: evento autentico de tipo que nao tratamos vira unsupported', () => {
+    // Prova que o payload passa pelo nosso mapeamento, e nao direto do SDK.
+    const { rawBody, headers } = corpoAssinado({
+      ...EVENTO_SUCESSO,
+      type: 'charge.dispute.created',
+      data: { object: { id: 'dp_1' } },
+    });
+
+    const evento = comWebhook().verifyWebhook({ rawBody, headers });
+
+    expect(evento.eventType).toBe('unsupported');
+    expect(evento.providerEventTypeBruto).toBe('charge.dispute.created');
+  });
+
+  it('D6: retentativa de rede e DECLARADA — 1 retentativa produz 2 chamadas', async () => {
+    const erro500 = { corpo: { error: { type: 'api_error', message: 'oops' } }, status: 500 };
+    const { fn, chamadas } = fetchEmFila([erro500, erro500]);
+    const provider = new StripeProvider({
+      secretKey: 'sk_test_x',
+      webhookSecret: SEGREDO,
+      fetchFn: fn,
+      maxRetentativasDeRede: 1,
+    });
+
+    await expect(provider.getCharge('pi_1')).rejects.toBeInstanceOf(ProviderUnavailableError);
+    // Retentar e seguro porque o SDK reusa a nossa chave de idempotencia.
+    expect(chamadas).toHaveLength(2);
+  }, 15_000);
 });
