@@ -4,6 +4,7 @@ import {
   ChargeNotCancelableError,
   ChargeNotFoundError,
   ProviderInvalidRequestError,
+  ProviderUnavailableError,
   type CreateChargeInput,
 } from '../../../src/providers/payment-provider.port';
 import { StripeProvider } from '../../../src/providers/stripe/stripe.provider';
@@ -319,5 +320,98 @@ describe('StripeProvider — getCharge, cancelCharge e refund', () => {
     });
 
     expect(resultado.state).toBe('PROCESSING');
+  });
+});
+
+describe('StripeProvider — buscarCobrancaPorTentativa', () => {
+  function intentCom(metadata: Record<string, string>, id = 'pi_achado'): unknown {
+    return {
+      id,
+      object: 'payment_intent',
+      status: 'succeeded',
+      amount: 12990,
+      amount_received: 12990,
+      latest_charge: { id: 'ch_1', object: 'charge', amount_captured: 12990, amount_refunded: 0 },
+      metadata,
+    };
+  }
+
+  const CORRELACAO = { paymentId: 'pay_123', orderId: 'ord_456', attemptCount: '2' };
+
+  it('C1: lista por janela de created com expand de data.latest_charge', async () => {
+    const { fn, chamadas } = fetchEmFila([
+      { corpo: { object: 'list', has_more: false, data: [intentCom(CORRELACAO)] } },
+    ]);
+
+    const snapshot = await provedor(fn).buscarCobrancaPorTentativa('pay_123', 2);
+
+    const url = decodeURIComponent(chamadas[0].url);
+    expect(chamadas[0].metodo).toBe('GET');
+    expect(url).toContain('https://api.stripe.com/v1/payment_intents?');
+    expect(url).toContain('created[gte]=');
+    expect(url).toContain('limit=100');
+    expect(url).toContain('expand[0]=data.latest_charge');
+    expect(snapshot?.providerRef).toBe('pi_achado');
+    expect(snapshot?.refundedAmountCents).toBe(0);
+  });
+
+  it('C2: nao achou e nao ha mais paginas devolve null, com UMA chamada', async () => {
+    const { fn, chamadas } = fetchEmFila([{ corpo: { object: 'list', has_more: false, data: [] } }]);
+
+    expect(await provedor(fn).buscarCobrancaPorTentativa('pay_123', 2)).toBeNull();
+    expect(chamadas).toHaveLength(1);
+  });
+
+  it('C3: pagina com starting_after no ultimo id e acha na pagina seguinte', async () => {
+    const { fn, chamadas } = fetchEmFila([
+      { corpo: { object: 'list', has_more: true, data: [intentCom({ paymentId: 'outro', attemptCount: '1' }, 'pi_outro')] } },
+      { corpo: { object: 'list', has_more: false, data: [intentCom(CORRELACAO)] } },
+    ]);
+
+    const snapshot = await provedor(fn).buscarCobrancaPorTentativa('pay_123', 2);
+
+    expect(snapshot?.providerRef).toBe('pi_achado');
+    expect(chamadas).toHaveLength(2);
+    expect(decodeURIComponent(chamadas[1].url)).toContain('starting_after=pi_outro');
+  });
+
+  it('C4: distingue TENTATIVAS do mesmo pagamento', async () => {
+    // Mesmo paymentId, attemptCount diferente: nao e a cobranca procurada.
+    const { fn } = fetchEmFila([
+      {
+        corpo: {
+          object: 'list',
+          has_more: false,
+          data: [intentCom({ paymentId: 'pay_123', orderId: 'ord_456', attemptCount: '1' })],
+        },
+      },
+    ]);
+
+    expect(await provedor(fn).buscarCobrancaPorTentativa('pay_123', 2)).toBeNull();
+  });
+
+  it('C5: teto de paginas LANCA em vez de afirmar ausencia', async () => {
+    // "Nao terminei de olhar" nao e "nao existe". Devolver null aqui diria ao
+    // job do 6b que a cobranca nunca chegou ao provedor — e ele poderia
+    // liberar a tentativa se a flag permitisse.
+    const pagina = {
+      corpo: {
+        object: 'list',
+        has_more: true,
+        data: [intentCom({ paymentId: 'outro', attemptCount: '9' }, 'pi_x')],
+      },
+    };
+    const { fn, chamadas } = fetchEmFila([pagina, pagina]);
+    const provider = new StripeProvider({
+      secretKey: 'sk_test_x',
+      webhookSecret: 'whsec_x',
+      fetchFn: fn,
+      tetoDePaginas: 2,
+    });
+
+    await expect(provider.buscarCobrancaPorTentativa('pay_123', 2)).rejects.toBeInstanceOf(
+      ProviderUnavailableError,
+    );
+    expect(chamadas).toHaveLength(2);
   });
 });
