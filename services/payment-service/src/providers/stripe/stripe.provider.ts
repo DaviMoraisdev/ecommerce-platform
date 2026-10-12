@@ -14,6 +14,7 @@ import {
   type WebhookEventPayload,
   type WebhookRequest,
 } from '../payment-provider.port';
+import { lancarTraduzido } from './stripe.erros';
 import { recusaDeCobranca, resultadoDaCriacao } from './stripe.mapeamento';
 
 export interface StripeProviderDeps {
@@ -111,10 +112,7 @@ export class StripeProvider implements PaymentProvider {
           message: erro.message,
         });
       }
-      // A taxonomia completa (rede, 5xx, autenticacao, estado) entra no
-      // incremento 2. Ate la o erro sobe cru, de proposito: nao quero um
-      // `catch` generico mapeando errado em silencio.
-      throw erro;
+      lancarTraduzido(erro, 'criar');
     }
   }
 
