@@ -77,13 +77,27 @@ describe('stripe.erros — taxonomia', () => {
     expect(capturar(erro, 'criar')).toBeInstanceOf(ProviderInvalidRequestError);
   });
 
-  it('E5: resource_missing vira ChargeNotFound em qualquer contexto', () => {
-    expect(
-      capturar(bruto('invalid_request_error', 404, { code: CODIGO_RECURSO_AUSENTE }), 'consultar'),
-    ).toBeInstanceOf(ChargeNotFoundError);
-    expect(
-      capturar(bruto('invalid_request_error', 404, { code: CODIGO_RECURSO_AUSENTE }), 'reembolsar'),
-    ).toBeInstanceOf(ChargeNotFoundError);
+  it('E5: resource_missing vira ChargeNotFound nos contextos de cobranca EXISTENTE', () => {
+    for (const contexto of ['consultar', 'cancelar', 'reembolsar'] as const) {
+      const traduzido = capturar(
+        bruto('invalid_request_error', 404, { code: 'resource_missing' }),
+        contexto,
+      );
+      expect(traduzido).toBeInstanceOf(ChargeNotFoundError);
+    }
+  });
+
+  it('E5b: resource_missing na CRIACAO nao e cobranca ausente — e requisicao invalida', () => {
+    // Em criar, o unico id que NOS enviamos e o do metodo de pagamento: a
+    // cobranca ainda nao existe. Nomear "cobranca inexistente" aqui entrega aos
+    // jobs de reconciliacao um FATO que nao e verdade.
+    const traduzido = capturar(
+      bruto('invalid_request_error', 404, { code: 'resource_missing', param: 'payment_method' }),
+      'criar',
+    );
+
+    expect(traduzido).toBeInstanceOf(ProviderInvalidRequestError);
+    expect(traduzido).not.toBeInstanceOf(ChargeNotFoundError);
   });
 
   it('E6: estado inesperado vira ChargeNotCancelable SO no contexto de cancelar', () => {

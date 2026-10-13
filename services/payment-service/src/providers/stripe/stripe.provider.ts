@@ -101,9 +101,7 @@ export class StripeProvider implements PaymentProvider {
   async createCharge(input: CreateChargeInput): Promise<ChargeResult> {
     // Validacoes locais ANTES da rede, espelhando o fake: chamada que a Stripe
     // recusaria de todo jeito nao precisa custar uma ida ate lA.
-    if (input.idempotencyKey.trim() === '') {
-      throw new ProviderInvalidRequestError('idempotencyKey e obrigatoria');
-    }
+    exigirChave(input.idempotencyKey);
     if (input.currency !== 'BRL') {
       throw new ProviderInvalidRequestError('moeda nao suportada');
     }
@@ -232,6 +230,11 @@ export class StripeProvider implements PaymentProvider {
   }
 
   async cancelCharge(input: CancelChargeInput): Promise<ChargeSnapshot> {
+    exigirChave(input.idempotencyKey);
+    // Guardado para ser traduzido no FIM: a desambiguacao abaixo precisa rodar
+    // fora do catch, e so depois dela sabemos se este erro e informacao (ja
+    // cancelado) ou falha (ja capturado).
+    let estadoInesperado: unknown;
     try {
       const intent = await this.stripe.paymentIntents.cancel(
         input.providerRef,
@@ -245,24 +248,38 @@ export class StripeProvider implements PaymentProvider {
       // ChargeNotCancelableError no segundo, e o codigo nao distingue — so o
       // ESTADO distingue. Por isso a leitura extra, apenas no caminho de erro.
       if (
-        erro instanceof Stripe.errors.StripeInvalidRequestError &&
-        erro.code === CODIGO_ESTADO_INESPERADO
+        !(erro instanceof Stripe.errors.StripeInvalidRequestError) ||
+        erro.code !== CODIGO_ESTADO_INESPERADO
       ) {
-        const atual = await this.lerIntent(input.providerRef);
-        if (atual.status === 'canceled') {
-          // Idempotencia por ESTADO: cancelar o que ja esta cancelado e no-op,
-          // mesmo com chave nova.
-          return snapshotDaCobranca(atual);
-        }
-        // Capturado (ou qualquer outro estado que recusa cancelamento): a
-        // traducao devolve ChargeNotCancelableError, que o job do 6e le como
-        // "ja capturou" — informacao, nao falha.
+        lancarTraduzido(erro, 'cancelar');
       }
-      lancarTraduzido(erro, 'cancelar');
+      estadoInesperado = erro;
     }
+
+    // A releitura roda FORA do catch de proposito: um throw dentro de um catch
+    // NAO e capturado pelo try daquele mesmo catch. Dentro dele, uma falha de
+    // conexao nesta segunda chamada de rede subiria crua — sem classe nossa e
+    // sem retryable — logo depois de um cancelamento recusado, que e
+    // exatamente o momento em que o estado da cobranca e ambiguo.
+    try {
+      const atual = await this.lerIntent(input.providerRef);
+      if (atual.status === 'canceled') {
+        // Idempotencia por ESTADO: cancelar o que ja esta cancelado e no-op,
+        // mesmo com chave nova.
+        return snapshotDaCobranca(atual);
+      }
+    } catch (erroDaLeitura) {
+      lancarTraduzido(erroDaLeitura, 'consultar');
+    }
+
+    // Capturado (ou qualquer outro estado que recusa cancelamento): a traducao
+    // devolve ChargeNotCancelableError, que o job do 6e le como "ja capturou" —
+    // informacao, nao falha.
+    lancarTraduzido(estadoInesperado, 'cancelar');
   }
 
   async refund(input: RefundInput): Promise<RefundResult> {
+    exigirChave(input.idempotencyKey);
     try {
       const reembolso = await this.stripe.refunds.create(
         // payment_intent, e nao charge: reembolsar o PaymentIntent e
@@ -302,5 +319,17 @@ export class StripeProvider implements PaymentProvider {
       // ProviderInvalidRequestError do mapeamento passa reto (400).
       lancarTraduzido(erro, 'webhook');
     }
+  }
+}
+
+/**
+ * Chave de idempotencia vazia nao e detalhe de validacao: ela DESLIGA a
+ * protecao da Stripe contra repeticao, e as tres operacoes financeiras
+ * dependem dela. A guarda roda antes da rede, para que entrada invalida nunca
+ * produza efeito no provedor.
+ */
+function exigirChave(chave: string): void {
+  if (chave.trim() === '') {
+    throw new ProviderInvalidRequestError('idempotencyKey e obrigatoria');
   }
 }

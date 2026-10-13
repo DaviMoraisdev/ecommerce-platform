@@ -36,6 +36,17 @@ export const CODIGO_ESTADO_INESPERADO = 'payment_intent_unexpected_state';
 export const CODIGO_JA_REEMBOLSADO = 'charge_already_refunded';
 
 /**
+ * Contextos em que a cobranca JA EXISTE quando chamamos. Fora deles,
+ * resource_missing nao pode significar "cobranca inexistente": em criar, o
+ * unico id que enviamos e o do metodo de pagamento.
+ */
+export const CONTEXTOS_COM_COBRANCA_EXISTENTE: ReadonlySet<ContextoDaChamada> = new Set([
+  'consultar',
+  'cancelar',
+  'reembolsar',
+]);
+
+/**
  * Mensagem com CAMPOS FECHADOS, sem o texto do provedor.
  *
  * Mensagem de SDK pode carregar valor de parametro, e esta string e persistida
@@ -86,7 +97,13 @@ export function lancarTraduzido(erro: unknown, contexto: ContextoDaChamada): nev
 
   if (erro instanceof Stripe.errors.StripeInvalidRequestError) {
     if (erro.code === CODIGO_RECURSO_AUSENTE) {
-      throw new ChargeNotFoundError(motivo(erro, contexto));
+      // O codigo nomeia o recurso que a REQUISICAO citou, nao necessariamente
+      // uma cobranca. Generalizar isto entregaria aos jobos de reconciliacao
+      // "cobranca ausente" como fato, fora dos contextos em que ela existe.
+      if (CONTEXTOS_COM_COBRANCA_EXISTENTE.has(contexto)) {
+        throw new ChargeNotFoundError(motivo(erro, contexto));
+      }
+      throw new ProviderInvalidRequestError(motivo(erro, contexto));
     }
     if (erro.code === CODIGO_ESTADO_INESPERADO && contexto === 'cancelar') {
       throw new ChargeNotCancelableError(motivo(erro, contexto));

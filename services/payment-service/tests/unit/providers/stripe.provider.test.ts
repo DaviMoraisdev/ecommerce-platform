@@ -10,6 +10,7 @@ import {
   WebhookSignatureError,
   type CreateChargeInput,
 } from '../../../src/providers/payment-provider.port';
+import { LIMITE_DA_MENSAGEM_DE_RECUSA } from '../../../src/providers/stripe/stripe.mapeamento';
 import { StripeProvider } from '../../../src/providers/stripe/stripe.provider';
 
 /**
@@ -227,6 +228,57 @@ describe('StripeProvider — getCharge, cancelCharge e refund', () => {
     },
   };
 
+  it('A6: resource_missing na CRIACAO e requisicao invalida, nao cobranca ausente', async () => {
+    // Em criar, o unico id que NOS enviamos e o do metodo de pagamento: a
+    // cobranca ainda nao existe. ChargeNotFoundError nomearia o objeto errado,
+    // e os jobs de reconciliacao leem ausencia de cobranca como FATO.
+    const { fn } = fetchDublado(
+      {
+        error: {
+          type: 'invalid_request_error',
+          code: 'resource_missing',
+          param: 'payment_method',
+          message: 'No such PaymentMethod',
+        },
+      },
+      404,
+    );
+
+    const erro = await provedor(fn)
+      .createCharge(entrada())
+      .catch((e: unknown) => e);
+
+    expect(erro).toBeInstanceOf(ProviderInvalidRequestError);
+    expect(erro).not.toBeInstanceOf(ChargeNotFoundError);
+  });
+
+  it('A7: a mensagem da recusa entra em UMA linha e com tamanho limitado', async () => {
+    // `message` e texto LIVRE do provedor e, diferente das mensagens de erro
+    // (que `motivo` monta com campos fechados), ele atravessa como RESULTADO e
+    // e persistido em failureMessage. Entao entra normalizado.
+    const longa = `recusado\n\n   porque ${'x'.repeat(400)}`;
+    const { fn } = fetchDublado(
+      {
+        error: {
+          type: 'card_error',
+          code: 'card_declined',
+          decline_code: 'generic_decline',
+          message: longa,
+          payment_intent: { id: 'pi_recusado', object: 'payment_intent' },
+        },
+      },
+      402,
+    );
+
+    const resultado = await provedor(fn).createCharge(entrada());
+
+    expect(resultado.state).toBe('DECLINED');
+    const mensagem = resultado.state === 'DECLINED' ? resultado.declineMessage : undefined;
+    expect(mensagem).not.toContain('\n');
+    // +3 pela reticencia que marca o corte.
+    expect((mensagem ?? '').length).toBeLessThanOrEqual(LIMITE_DA_MENSAGEM_DE_RECUSA + 3);
+  });
+
   it('B1: getCharge pede expand[latest_charge] — sem ele o reembolsado seria lido como zero', async () => {
     const { fn, chamadas } = fetchEmFila([{ corpo: INTENT_CAPTURADO }]);
 
@@ -291,6 +343,66 @@ describe('StripeProvider — getCharge, cancelCharge e refund', () => {
       provedor(fn).cancelCharge({ providerRef: 'pi_1', idempotencyKey: 'chave-nova' }),
     ).rejects.toBeInstanceOf(ChargeNotCancelableError);
     expect(chamadas).toHaveLength(2);
+  });
+
+  it('B8: chave de idempotencia vazia no cancelamento NAO chega na rede', async () => {
+    const { fn, chamadas } = fetchDublado(INTENT_OK);
+
+    await expect(
+      provedor(fn).cancelCharge({ providerRef: 'pi_1', idempotencyKey: '   ' }),
+    ).rejects.toThrow(ProviderInvalidRequestError);
+    // Zero chamadas: entrada invalida nunca pode produzir efeito no provedor.
+    expect(chamadas).toHaveLength(0);
+  });
+
+  it('B9: chave de idempotencia vazia no reembolso NAO chega na rede', async () => {
+    const { fn, chamadas } = fetchDublado(INTENT_OK);
+
+    await expect(
+      provedor(fn).refund({ providerRef: 'pi_1', amountCents: 3000, idempotencyKey: '' }),
+    ).rejects.toThrow(ProviderInvalidRequestError);
+    expect(chamadas).toHaveLength(0);
+  });
+
+  it('B10: falha TRANSIENTE na releitura do cancelamento e traduzida, nao sobe crua', async () => {
+    const { fn, chamadas } = fetchEmFila([
+      { corpo: ESTADO_INESPERADO, status: 400 },
+      { corpo: { error: { type: 'api_error', message: 'indisponivel' } }, status: 500 },
+    ]);
+    // Zero retentativas: com o default de 2, o 500 geraria tres chamadas e a
+    // fila acabaria, trocando o erro sob teste por um erro do proprio dublê.
+    const provider = new StripeProvider({
+      secretKey: 'sk_test_x',
+      webhookSecret: 'whsec_x',
+      maxRetentativasDeRede: 0,
+      fetchFn: fn,
+    });
+
+    const erro = await provider
+      .cancelCharge({ providerRef: 'pi_1', idempotencyKey: 'chave-nova' })
+      .catch((e: unknown) => e);
+
+    expect(erro).toBeInstanceOf(ProviderUnavailableError);
+    // A classe sozinha nao basta: quem decide retentar le o retryable.
+    expect((erro as ProviderUnavailableError).retryable).toBe(true);
+    expect(chamadas).toHaveLength(2);
+  });
+
+  it('B11: recurso ausente na releitura e traduzido no contexto de CONSULTAR', async () => {
+    const { fn } = fetchEmFila([
+      { corpo: ESTADO_INESPERADO, status: 400 },
+      { corpo: { error: { type: 'invalid_request_error', code: 'resource_missing' } }, status: 404 },
+    ]);
+    const provider = new StripeProvider({
+      secretKey: 'sk_test_x',
+      webhookSecret: 'whsec_x',
+      maxRetentativasDeRede: 0,
+      fetchFn: fn,
+    });
+
+    await expect(
+      provider.cancelCharge({ providerRef: 'pi_1', idempotencyKey: 'chave-nova' }),
+    ).rejects.toBeInstanceOf(ChargeNotFoundError);
   });
 
   it('B6: refund usa payment_intent, com corpo FECHADO e a nossa chave', async () => {
