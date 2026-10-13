@@ -11,6 +11,7 @@ jest.mock('../../src/config/database', () => ({
 }));
 
 import { construirApp } from '../../src/composition';
+import { ProviderMalConfiguradoError } from '../../src/providers/factory';
 
 describe('construirApp — fiacao de producao', () => {
   it('expoe /health sem exigir autenticacao', async () => {
@@ -58,9 +59,28 @@ describe('construirApp — fiacao de producao', () => {
     expect(resposta.body.code).toBe('REQUISICAO_INVALIDA');
   });
 
-  it('falha na composicao quando o provedor configurado nao tem adapter', () => {
+  it('falha na composicao quando a config do provedor nao permite construi-lo', () => {
     // A config valida a INTENCAO (o valor stripe e aceito); a factory valida a
     // CAPACIDADE. O erro tem que aparecer no boot, nao na primeira cobranca.
-    expect(() => construirApp(configDeTeste({ provider: 'stripe' }))).toThrow(/Bloco 9/);
+    //
+    // Antes este caso cobria "stripe nao tem adapter". O adapter existe desde o
+    // 9b-2, entao a CAUSA mudou — falta credencial —, e a garantia e a mesma.
+    expect(() => construirApp(configDeTeste({ provider: 'stripe' }))).toThrow(
+      ProviderMalConfiguradoError,
+    );
+  });
+
+  it('com credencial e segredo coerentes, a composicao com a Stripe SOBE', () => {
+    // Contraparte obrigatoria: sem ela, um erro que recusasse stripe em
+    // QUALQUER configuracao passaria no caso acima.
+    expect(() =>
+      construirApp(
+        configDeTeste({
+          provider: 'stripe',
+          stripeSecretKey: 'sk_test_FALSA_PARA_TESTE_000',
+          webhookSecret: 'whsec_FALSA_0000111122223333',
+        }),
+      ),
+    ).not.toThrow();
   });
 });

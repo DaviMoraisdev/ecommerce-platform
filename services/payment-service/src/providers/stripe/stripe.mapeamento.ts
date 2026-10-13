@@ -116,7 +116,7 @@ export function resultadoDaCriacao(intent: IntentLido): ChargeResult {
  */
 export function recusaDeCobranca(providerRef: string, erro: ErroDeCobrancaLido): RecusaDeCobranca {
   const codigo = texto(erro.decline_code) ?? texto(erro.code) ?? RECUSA_SEM_CODIGO;
-  const mensagem = texto(erro.message);
+  const mensagem = textoDoProvedor(erro.message);
   return {
     providerRef,
     state: 'DECLINED',
@@ -476,4 +476,20 @@ function refundRefMaisRecente(cobranca: Record<string, unknown>, tipo: string): 
     throw new ProviderInvalidRequestError(`evento ${tipo} com refund invalido`);
   }
   return exigirTexto(primeiro as Record<string, unknown>, 'id', tipo);
+}
+
+/**
+ * Teto do texto de recusa que atravessa como RESULTADO. Nao e sigilo: a Stripe
+ * projeta `message` para ser mostrado ao portador do cartao. E higiene — texto
+ * de terceiro persistido em failureMessage entra em uma linha e com tamanho
+ * conhecido, para nao inflar nosso registro nem quebrar formato de quem o le.
+ */
+export const LIMITE_DA_MENSAGEM_DE_RECUSA = 200;
+
+function textoDoProvedor(valor: string | null | undefined): string | undefined {
+  const limpo = texto(valor);
+  if (limpo === undefined) return undefined;
+  const umaLinha = limpo.replace(/\s+/g, ' ');
+  if (umaLinha.length <= LIMITE_DA_MENSAGEM_DE_RECUSA) return umaLinha;
+  return `${umaLinha.slice(0, LIMITE_DA_MENSAGEM_DE_RECUSA)}...`;
 }
