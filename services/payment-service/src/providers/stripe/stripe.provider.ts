@@ -72,9 +72,6 @@ export const MAX_RETENTATIVAS_DE_REDE = 2;
 /** Cabecalho de assinatura da Stripe, em minusculas (Node normaliza). */
 export const CABECALHO_DE_ASSINATURA = 'stripe-signature';
 
-/** Placeholder dos metodos que entram nos incrementos seguintes do 9b-2. */
-export const PENDENTE_NO_9B2 = 'operacao do adapter da Stripe ainda nao implementada (9b-2)';
-
 export class StripeProvider implements PaymentProvider {
   readonly name: ProviderName = 'stripe';
 
