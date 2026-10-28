@@ -82,6 +82,9 @@ function provedor(fn: typeof fetch): StripeProvider {
   return new StripeProvider({ secretKey: 'sk_test_x', webhookSecret: 'whsec_x', fetchFn: fn });
 }
 
+/** 2026-01-15T12:00:00Z. Menos 24h = 1768392000, o gte esperado no C1. */
+const RELOGIO_FIXO = Date.UTC(2026, 0, 15, 12, 0, 0);
+
 function entrada(overrides: Partial<CreateChargeInput> = {}): CreateChargeInput {
   return {
     amountCents: 12990,
@@ -133,6 +136,7 @@ describe('StripeProvider — createCharge, formato da requisicao', () => {
     expect(corpo.get('currency')).toBe('brl');
     expect(corpo.get('payment_method')).toBe('pm_card_visa');
     expect(corpo.get('confirm')).toBe('true');
+    expect(corpo.get('automatic_payment_methods[enabled]')).toBe('true');
     expect(corpo.get('automatic_payment_methods[allow_redirects]')).toBe('never');
     expect(corpo.get('metadata[paymentId]')).toBe('pay_123');
     expect(corpo.get('metadata[orderId]')).toBe('ord_456');
@@ -191,11 +195,14 @@ describe('StripeProvider — createCharge, formato da requisicao', () => {
 
     const resultado = await provider.createCharge(entrada({ idempotencyKey: randomUUID() }));
 
-    expect(resultado).toMatchObject({
+    expect(resultado).toEqual({
       providerRef: 'pi_recusado',
       state: 'DECLINED',
       capturedAmountCents: 0,
       declineCode: 'insufficient_funds',
+      // Fechar a forma obriga a afirmar tambem a mensagem — texto do provedor
+      // que atravessa como RESULTADO e e persistido (ver A7, que a limita).
+      declineMessage: 'Your card has insufficient funds.',
     });
   });
 });
@@ -277,6 +284,26 @@ describe('StripeProvider — getCharge, cancelCharge e refund', () => {
     expect(mensagem).not.toContain('\n');
     // +3 pela reticencia que marca o corte.
     expect((mensagem ?? '').length).toBeLessThanOrEqual(LIMITE_DA_MENSAGEM_DE_RECUSA + 3);
+  });
+
+  it('A8: recusa SEM payment_intent nao vira resultado — e requisicao invalida', async () => {
+    // Sem payment_intent nao existe providerRef, e um DECLINED sem referencia
+    // seria um resultado que nenhum job consegue reconciliar depois.
+    const { fn } = fetchDublado(
+      {
+        error: {
+          type: 'card_error',
+          code: 'card_declined',
+          decline_code: 'generic_decline',
+          message: 'recusado',
+        },
+      },
+      402,
+    );
+
+    await expect(provedor(fn).createCharge(entrada())).rejects.toBeInstanceOf(
+      ProviderInvalidRequestError,
+    );
   });
 
   it('B1: getCharge pede expand[latest_charge] — sem ele o reembolsado seria lido como zero', async () => {
@@ -418,8 +445,12 @@ describe('StripeProvider — getCharge, cancelCharge e refund', () => {
 
     expect(chamadas[0].url).toBe('https://api.stripe.com/v1/refunds');
     expect(chamadas[0].cabecalhos['idempotency-key']).toBe('refund:pi_1:1');
+    expect(chamadas[0].metodo).toBe('POST');
     expect([...chamadas[0].corpo.keys()].sort()).toEqual(['amount', 'payment_intent']);
     expect(chamadas[0].corpo.get('payment_intent')).toBe('pi_1');
+    // Sem isto, valor errado no corpo passa: a resposta dublada devolve 3000
+    // de qualquer jeito, e a assercao do resultado fica verde.
+    expect(chamadas[0].corpo.get('amount')).toBe('3000');
     expect(resultado).toEqual({ providerRefundRef: 're_1', state: 'SUCCEEDED', amountCents: 3000 });
   });
 
@@ -453,17 +484,74 @@ describe('StripeProvider — buscarCobrancaPorTentativa', () => {
 
   const CORRELACAO = { paymentId: 'pay_123', orderId: 'ord_456', attemptCount: '2' };
 
+  it('B12: falha de CONEXAO vira ProviderUnavailableError, com retryable verdadeiro', async () => {
+    // O dublê REJEITA — e assim que o SDK produz StripeConnectionError. Este e
+    // o UNICO ramo retentavel da taxonomia, e ate aqui ele tinha ZERO cobertura
+    // (contagem: nenhuma ocorrencia de StripeConnectionError em tests).
+    const fn = (async () => {
+      throw new Error('socket hang up');
+    }) as unknown as typeof fetch;
+    const provider = new StripeProvider({
+      secretKey: 'sk_test_x',
+      webhookSecret: 'whsec_x',
+      maxRetentativasDeRede: 0,
+      fetchFn: fn,
+    });
+
+    const erro = await provider.getCharge('pi_1').catch((e: unknown) => e);
+
+    expect(erro).toBeInstanceOf(ProviderUnavailableError);
+    // A classe sozinha nao basta: quem decide retentar le o retryable.
+    expect((erro as ProviderUnavailableError).retryable).toBe(true);
+  });
+
+  it('B13: retentativa de REEMBOLSO repete a MESMA chave e o MESMO corpo', async () => {
+    const { fn, chamadas } = fetchEmFila([
+      { corpo: { error: { type: 'api_error', message: 'instabilidade' } }, status: 500 },
+      { corpo: { id: 're_1', object: 'refund', status: 'succeeded', amount: 3000 } },
+    ]);
+    const provider = new StripeProvider({
+      secretKey: 'sk_test_x',
+      webhookSecret: 'whsec_x',
+      maxRetentativasDeRede: 1,
+      fetchFn: fn,
+    });
+
+    const resultado = await provider.refund({
+      providerRef: 'pi_1',
+      amountCents: 3000,
+      idempotencyKey: 'refund:pi_1:7',
+    });
+
+    expect(resultado.state).toBe('SUCCEEDED');
+    expect(chamadas).toHaveLength(2);
+    // Caracteriza o SDK; o que e NOSSO e passar a opcao, e e isso que a
+    // sabotagem WW remove. Chave diferente entre tentativas significaria
+    // reembolso duplicado quando a primeira talvez tenha chegado.
+    expect(chamadas[1].cabecalhos['idempotency-key']).toBe('refund:pi_1:7');
+    expect(chamadas[1].cabecalhos['idempotency-key']).toBe(chamadas[0].cabecalhos['idempotency-key']);
+    expect(chamadas[1].corpo.toString()).toBe(chamadas[0].corpo.toString());
+  });
+
   it('C1: lista por janela de created com expand de data.latest_charge', async () => {
     const { fn, chamadas } = fetchEmFila([
       { corpo: { object: 'list', has_more: false, data: [intentCom(CORRELACAO)] } },
     ]);
 
-    const snapshot = await provedor(fn).buscarCobrancaPorTentativa('pay_123', 2);
+    const provider = new StripeProvider({
+      secretKey: 'sk_test_x',
+      webhookSecret: 'whsec_x',
+      agora: () => RELOGIO_FIXO,
+      fetchFn: fn,
+    });
+
+    const snapshot = await provider.buscarCobrancaPorTentativa('pay_123', 2);
 
     const url = decodeURIComponent(chamadas[0].url);
     expect(chamadas[0].metodo).toBe('GET');
     expect(url).toContain('https://api.stripe.com/v1/payment_intents?');
-    expect(url).toContain('created[gte]=');
+    // Valor EXATO: 'contem created[gte]=' aceita janela invertida ou no futuro.
+    expect(url).toContain('created[gte]=1768392000');
     expect(url).toContain('limit=100');
     expect(url).toContain('expand[0]=data.latest_charge');
     expect(snapshot?.providerRef).toBe('pi_achado');
@@ -565,12 +653,34 @@ describe('StripeProvider — verifyWebhook', () => {
 
     const evento = comWebhook().verifyWebhook({ rawBody, headers });
 
-    expect(evento).toMatchObject({
+    expect(evento).toEqual({
       eventType: 'payment.succeeded',
       providerEventId: 'evt_1',
+      providerEventTypeBruto: 'payment_intent.succeeded',
       providerRef: 'pi_1',
+      state: 'SUCCEEDED',
       capturedAmountCents: 12990,
+      refundedAmountCents: 0,
+      providerCreatedAt: new Date(1_700_000_000 * 1000),
+      // `raw` carrega o evento INTEIRO da Stripe para dentro do nosso objeto.
+      // Com toMatchObject isso existia sem ninguem afirmar nada; a forma
+      // fechada torna visivel qualquer campo novo que passe a atravessar.
+      raw: EVENTO_SUCESSO,
     });
+  });
+
+  it('D7: corpo alterado DEPOIS de assinado vira WebhookSignatureError', () => {
+    const assinado = corpoAssinado(EVENTO_SUCESSO);
+    const adulterado = String(assinado.rawBody).replace('succeeded', 'canceled');
+
+    expect(() =>
+      comWebhook().verifyWebhook({
+        // O cast e porque o corpo bruto pode ser Buffer ou string conforme o
+        // helper; o que importa e que o byte mudou DEPOIS da assinatura.
+        rawBody: adulterado as unknown as typeof assinado.rawBody,
+        headers: assinado.headers,
+      }),
+    ).toThrow(WebhookSignatureError);
   });
 
   it('D2: assinado com OUTRO segredo vira WebhookSignatureError', () => {
