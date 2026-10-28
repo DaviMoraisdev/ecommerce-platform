@@ -35,6 +35,12 @@ export interface StripeProviderDeps {
   /** Injetavel para o teste de retentativa nao esperar o backoff real. */
   maxRetentativasDeRede?: number;
   /**
+   * Injetavel para que o teste afirme o `created[gte]` EXATO. Sem isso a
+   * janela so pode ser verificada por presenca, e uma janela invertida (ou no
+   * futuro) passa pelo teste.
+   */
+  agora?: () => number;
+  /**
    * `fetch` injetavel, usado via Stripe.createFetchHttpClient(fetchFn).
    * Existe para o TESTE provar o FORMATO DA REQUISICAO sem tocar a rede: o
    * mapeamento da resposta ja esta provado no 9b-1, e o que ninguem tinha
@@ -176,7 +182,8 @@ export class StripeProvider implements PaymentProvider {
     paymentId: string,
     attemptCount: number,
   ): Promise<ChargeSnapshot | null> {
-    const desde = Math.floor(Date.now() / 1000) - JANELA_DE_BUSCA_HORAS * 60 * 60;
+    const agora = this.deps.agora ?? ((): number => Date.now());
+    const desde = Math.floor(agora() / 1000) - JANELA_DE_BUSCA_HORAS * 60 * 60;
     const teto = this.deps.tetoDePaginas ?? TETO_DE_PAGINAS;
     let cursor: string | undefined;
 
