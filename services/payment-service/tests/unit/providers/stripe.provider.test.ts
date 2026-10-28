@@ -195,11 +195,14 @@ describe('StripeProvider — createCharge, formato da requisicao', () => {
 
     const resultado = await provider.createCharge(entrada({ idempotencyKey: randomUUID() }));
 
-    expect(resultado).toMatchObject({
+    expect(resultado).toEqual({
       providerRef: 'pi_recusado',
       state: 'DECLINED',
       capturedAmountCents: 0,
       declineCode: 'insufficient_funds',
+      // Fechar a forma obriga a afirmar tambem a mensagem — texto do provedor
+      // que atravessa como RESULTADO e e persistido (ver A7, que a limita).
+      declineMessage: 'Your card has insufficient funds.',
     });
   });
 });
@@ -650,11 +653,19 @@ describe('StripeProvider — verifyWebhook', () => {
 
     const evento = comWebhook().verifyWebhook({ rawBody, headers });
 
-    expect(evento).toMatchObject({
+    expect(evento).toEqual({
       eventType: 'payment.succeeded',
       providerEventId: 'evt_1',
+      providerEventTypeBruto: 'payment_intent.succeeded',
       providerRef: 'pi_1',
+      state: 'SUCCEEDED',
       capturedAmountCents: 12990,
+      refundedAmountCents: 0,
+      providerCreatedAt: new Date(1_700_000_000 * 1000),
+      // `raw` carrega o evento INTEIRO da Stripe para dentro do nosso objeto.
+      // Com toMatchObject isso existia sem ninguem afirmar nada; a forma
+      // fechada torna visivel qualquer campo novo que passe a atravessar.
+      raw: EVENTO_SUCESSO,
     });
   });
 
