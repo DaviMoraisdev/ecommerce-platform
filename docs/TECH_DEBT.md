@@ -258,6 +258,54 @@ tem superficie demais para uma rodada de review so.
 - **[7b] A guarda `order.total * 100 !== capturado` existe em TRES consumidores e todas caem no MESMO dia.** `payment-capture.service.ts:57`, `payment-expiration.service.ts:59` e `payment-refund.service.ts:81` comparam o valor do evento contra o total do pedido. As tres so sao corretas porque captura parcial e HOJE recusada para a DLQ (ramo `captura-parcial`, CASOS C17 e G10), o que garante `total == capturado` em todo pedido PAGO. Quando a captura em duas fases entrar, as tres passam a recusar eventos LEGITIMOS ao mesmo tempo, e o sintoma sera dinheiro real parado na DLQ, nao teste vermelho: nenhum teste atual exercita captura parcial seguida de reembolso. Correcao conjunta com o achado 3.1 — o order passa a guardar o capturado autoritativo e compara contra ele, nao contra `total`. Descoberto no achado 4.2 da 2a rodada do PR #63, que leu a contradicao entre a migration e a guarda e estava certo sobre o texto, errado sobre o codigo.
 
 
+## Manutenção (itens de execução independente)
+
+Itens que não dependem de fase e podem ser executados a qualquer momento, cada
+um em seu próprio PR. **Regra de escopo:** um PR de manutenção só executa itens
+já registrados aqui com evidência antes de ele abrir. O que for descoberto
+durante a execução vira entrada nova, não escopo adicional — sem isso o PR não
+tem Definition of Done e não fecha.
+
+Fora deste pacote: **CD**. Não existe pipeline de deploy para serviço nenhum, e
+isso não é defeito a corrigir — é a Fase 7, com Dockerfile, gateway e
+configuração por ambiente, que já tem seção própria abaixo.
+
+- **[M1 — essencial agora] Cinco serviços com código estão fora da matriz do CI.**
+  `.github/workflows/ci.yml` (linhas 18 a 23) inclui apenas `order-service` e
+  `payment-service`. Um PR que altere auth, cart, inventory, notification ou
+  product não recebe typecheck, teste nem build automáticos. **Medido em
+  2026-10-28:** os cinco rodam verdes localmente — product 98 testes em 11
+  suítes, inventory 81 em 4, cart 77 em 6, notification 39 em 2, auth 17 em 4,
+  total de 312 em 27 — com `typecheck`/`test`/`verify` na mesma convenção dos
+  dois que já estão no CI, e o inventory com `migrate:test` e
+  `verify:integration`. O trabalho é o do workflow, não de conserto. **A
+  resolver na execução:** se os testes de cart, notification e product abrem
+  conexão real com Redis ou Mongo — passaram com o Docker de pé, o que não
+  distingue mock de conexão; se abrirem, esses três precisam de service
+  container no job. **DoD:** os cinco aparecem como checks no PR, com
+  `fail-fast: false` mantido.
+- **[M2 — essencial agora] Três diretórios vazios no repositório.** `gateway` e
+  `frontend` têm zero arquivo fora de `node_modules`; `user-service` tem zero
+  linha de código. É casca da estrutura inicial do monorepo, nunca preenchida.
+  Decisão binária: entram no roadmap com fase definida, ou saem do repositório.
+  **DoD:** nenhum diretório de serviço ou área vazio no `main`.
+- **[M3 — pode esperar, com data] O auth-service é o menos testado do
+  repositório.** 17 testes em 4 suítes, contra 39 do notification, 77 do cart,
+  81 do inventory, 98 do product e 882 do payment — e é o serviço cuja falha
+  compromete todos os outros ao mesmo tempo. Não precisa do volume do payment;
+  precisa cobrir expiração de token, assinatura inválida, troca de algoritmo,
+  refresh reutilizado e escalada de papel. **DoD:** os cinco cenários com teste
+  cada, e cada um provado por sabotagem do mecanismo que ele afirma.
+- **[M4 — pode esperar] O `e2e` não está no CI.** Seis suítes (`happy-path`,
+  `concurrency`, `payment`, `auth-journey`, `notification`, `config`), com
+  `package.json` próprio e `jest --runInBand`, exigindo o stack de pé. Não foi
+  executado na varredura de 2026-10-28, então nem se sabe se passa hoje.
+  **Primeiro passo:** rodar localmente e registrar o resultado; entrar no CI só
+  depois, em job separado.
+- **[M5 — pode esperar] Contratos de evento parciais.** `contracts/` versiona
+  `payment.expired.v1` e `payment.refunded.v1`. Os demais eventos do fluxo
+  payment-order trafegam sem contrato versionado ao lado.
+
 ## FASE 7 — Gateway, Segurança e Infra
 
 ### Segurança

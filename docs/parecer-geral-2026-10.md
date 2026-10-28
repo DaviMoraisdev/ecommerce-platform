@@ -131,10 +131,33 @@ Para a análise geral de bugs e lógica das fases finais, o material existe e
 está no lugar certo: o `e2e` com fluxo completo e concorrência é a base natural
 dela, e hoje está subaproveitado.
 
-## 7. O que permanece sem verificação
+## 7. Medição complementar
 
-Contagem de testes dos cinco serviços menores e do `e2e` — só payment e order
-foram executados nesta varredura. E se as suítes do `e2e` passam hoje.
+Os cinco serviços fora do CI foram executados localmente em 2026-10-28. Todos
+com `typecheck` limpo e teste verde:
+
+| Serviço | Suítes | Testes |
+|---|---|---|
+| product-service | 11 | 98 |
+| inventory-service | 4 | 81 |
+| cart-service | 6 | 77 |
+| notification-service | 2 | 39 |
+| auth-service | 4 | 17 |
+
+Somados, 312 testes em 27 suítes. Os cinco já expõem `typecheck`, `test` e
+`verify` na mesma convenção de payment e order, e o `inventory-service` tem
+`test:integration`, `verify:integration` e `migrate:test`. Levá-los à matriz do
+CI é, portanto, barato — a estimativa anterior de risco alto estava errada.
+
+Isso também afia o achado do auth-service: 17 testes é o menor número absoluto
+do repositório entre os serviços com código, não apenas a pior razão
+teste/produção. O serviço que valida o token de todos os outros é o menos
+testado de todos.
+
+Permanece sem verificação: se as seis suítes do `e2e` passam hoje (ele tem
+`package.json` próprio, roda com `--runInBand` e exige o stack de pé), e se os
+testes de cart, notification e product dependem de Redis ou Mongo reais — eles
+passaram com o Docker ativo, o que não distingue mock de conexão.
 
 ## 8. Recomendações classificadas
 
