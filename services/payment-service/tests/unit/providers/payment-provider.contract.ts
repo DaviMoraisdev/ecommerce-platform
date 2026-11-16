@@ -90,6 +90,14 @@ export interface KitDeContrato {
   ): WebhookRequest;
 
   /**
+   * O tipo BRUTO que este provedor usa para um tipo do NOSSO vocabulario. No
+   * fake os dois coincidem; na Stripe nao ('payment_intent.succeeded'). Ate o
+   * 9c o contrato comparava o bruto com o nosso rotulo — certo por acidente no
+   * fake, e refutado na primeira execucao contra o provedor real.
+   */
+  tipoBrutoDe(eventType: string): string;
+
+  /**
    * Declaracao EXPLICITA do que este provedor nao consegue simular. Existe para
    * que um gap de cobertura seja decisao visivel em code review, e nao ausencia
    * silenciosa de teste. Ha um teste que confere se a declaracao bate com os
@@ -187,13 +195,15 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         );
       });
 
-      it('encontra a cobranca mesmo quando a RESPOSTA se perdeu', async () => {
+      // Antes: `it` com `if (!falhaAmbigua) return;` dentro — contra a Stripe isso
+      // aparecia como VERDE em 2 ms sem testar nada. Lacuna declarada tem de ser
+      // VISIVEL como pulada, como ja era a de falha transiente.
+      (kit.capacidades.falhaAmbigua ? it : it.skip)('encontra a cobranca mesmo quando a RESPOSTA se perdeu', async () => {
         // O caso que justifica o job inteiro: o provedor cobrou, a resposta nao
         // voltou, e do nosso lado ficou uma tentativa PENDING sem providerRef.
         // Se a busca nao encontrasse aqui, o job nao teria como distinguir
         // "cobrou" de "nao cobrou" — e liberar a chave nesse estado e a receita
         // da segunda cobranca.
-        if (!kit.capacidades.falhaAmbigua) return;
         const paymentId = randomUUID();
 
         await expect(
@@ -564,7 +574,7 @@ export function rodarContratoDeProvedor(kit: KitDeContrato): void {
         expect(evento.providerEventId.length).toBeGreaterThan(0);
         // O tipo BRUTO tem de sobreviver: e ele que vai para a coluna eventType
         // do inbox, e gravar o nosso rotulo perderia informacao de triagem.
-        expect(evento.providerEventTypeBruto).toBe('payment.succeeded');
+        expect(evento.providerEventTypeBruto).toBe(kit.tipoBrutoDe('payment.succeeded'));
       });
 
       it('recusa quando o corpo foi alterado apos a assinatura', async () => {

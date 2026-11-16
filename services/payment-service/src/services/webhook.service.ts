@@ -845,6 +845,18 @@ export class WebhookService {
         return this.encerrar(registroId, WebhookStatus.PROCESSED);
       }
 
+      // 9c: sem o id do reembolso e com delta positivo, AINDA NAO APLICAVEL.
+      // O id e identidade (eventId do payment.refunded e chave do indice unico
+      // de estorno), entao nunca e adivinhado. Mesma familia do "providerRef
+      // ainda desconhecido": webhook que chegou antes do efeito que confirma.
+      // Se o caminho sincrono do endpoint gravar nesse meio-tempo, a reentrega
+      // cai no delta zero acima e vira PROCESSED; se nunca gravar — reembolso
+      // feito fora da nossa API —, a quarentena por idade do 6c o torna visivel.
+      const refundRef = evento.providerRefundRef;
+      if (refundRef === undefined) {
+        return this.comoRetentavel(registroId, 'reembolso sem referencia do provedor');
+      }
+
       const baseDoCas = payment.refundedAmountCents;
       const dadosDoPagamento = { id: payment.id, orderId: payment.orderId, currency: payment.currency, capturedAmountCents: payment.capturedAmountCents };
       const idDoPagamento = payment.id;
@@ -856,7 +868,7 @@ export class WebhookService {
           payment: dadosDoPagamento,
           base: baseDoCas,
           total: evento.refundedAmountCents,
-          providerRef: evento.providerRefundRef,
+          providerRef: refundRef,
         });
         if (!aplicouOValor) return false;
         // Mesma assimetria deliberada do caminho de captura: so se chega aqui

@@ -15,7 +15,10 @@ const config: Config = {
   testMatch: ['**/*.test.ts'],
   clearMocks: true,
   setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
-  testPathIgnorePatterns: ['/node_modules/', 'integration'],
+  // '/tests/contract/' (9c): a suite de contrato chama a Stripe REAL, exige
+  // credencial e cria cobrancas. Sem esta linha o verify — e o CI — passariam a
+  // depender de rede e de chave. Ela roda so por `npm run test:contract`.
+  testPathIgnorePatterns: ['/node_modules/', 'integration', '/tests/contract/'],
   transform: {
     '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json', diagnostics: false }],
   },

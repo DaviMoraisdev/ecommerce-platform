@@ -729,4 +729,43 @@ describe('loadConfig — STRIPE_SECRET_KEY (9b-1)', () => {
       loadConfig(envDeTeste({ PAYMENT_PROVIDER: 'stripe', STRIPE_SECRET_KEY: 'sk_FALSA_SEM_MODO' })),
     ).toThrow(/sem modo reconhecivel/);
   });
+
+  it('K9: chave de sandbox rkcs_test_ e aceita fora de producao', () => {
+    // 9c: e o prefixo que `stripe sandbox create` entrega, visto na saida real.
+    // E o caminho que um avaliador externo segue pelo README.
+    const config = loadConfig(
+      ambiente('test', { PAYMENT_PROVIDER: 'stripe', STRIPE_SECRET_KEY: 'rkcs_test_sandbox_9c' }),
+    );
+    expect(config.stripeSecretKey).toBe('rkcs_test_sandbox_9c');
+  });
+
+  it('K10: chave de sandbox em producao recusa PELA GUARDA DE MODO, nao por prefixo', () => {
+    // A mensagem e a asercao. Antes do 9c esta chave ja era recusada, mas por
+    // "nao parece uma chave" — o caso passaria pelo motivo errado, antes e
+    // depois da correcao, sem provar que a guarda de modo a enxerga.
+    expect(() =>
+      loadConfig(
+        ambiente('production', {
+          PAYMENT_PROVIDER: 'stripe',
+          STRIPE_SECRET_KEY: 'rkcs_test_sandbox_9c',
+        }),
+      ),
+    ).toThrow(/de TESTE com NODE_ENV=production/);
+  });
+
+  it('K11: rkcs_live_ nunca observado recusa em QUALQUER ambiente — falha fechado', () => {
+    // Aceitar o que nunca vimos seria apostar que existe e se comporta como
+    // imaginamos. E uma chave da Stripe (passa pelo filtro de prefixo), mas
+    // de um modo que nao sabemos validar.
+    for (const nodeEnv of ['test', 'production']) {
+      expect(() =>
+        loadConfig(
+          ambiente(nodeEnv, {
+            PAYMENT_PROVIDER: 'stripe',
+            STRIPE_SECRET_KEY: 'rkcs_live_nunca_visto',
+          }),
+        ),
+      ).toThrow(/sem modo reconhecivel/);
+    }
+  });
 });

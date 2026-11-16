@@ -300,20 +300,23 @@ export interface CobrancaDeEventoLida {
   payment_intent?: string | { id?: string } | null;
   amount_captured: number;
   amount_refunded: number;
-  refunds?: { data?: unknown } | null;
 }
 
 /**
- * SUPOSICAO, e marcada como tal: em `charge.refunded`, `refunds.data[0]` e o
- * reembolso MAIS RECENTE, ou seja, o que disparou o evento. A documentacao da
- * Stripe nao afirma essa ordem. VERIFICAR no 9c, contra a API real.
+ * charge.refunded — o que o 9c verificou contra o sandbox.
  *
- * Consequencia se a suposicao for falsa: com DOIS reembolsos na mesma janela, o
- * id atribuido pode ser o do outro. O DINHEIRO continua correto, porque o que
- * decide e o TOTAL comparado pelo compare-and-swap do Bloco 7 — o dano fica na
- * trilha, nao no saldo.
+ * O 9b supunha que `refunds.data[0]` era o reembolso mais recente. A ORDEM esta
+ * certa (verificada com a lista expandida), mas a premissa por baixo dela era
+ * falsa: o evento real NAO traz `refunds` (API 2026-10-28.endive). A avaliacao
+ * de risco tambem estava errada. O id nao e so trilha, e IDENTIDADE: vira o
+ * eventId do payment.refunded, que o order-service recalcula e valida, e a
+ * chave do indice unico de estorno bem-sucedido. Adivinhar "o mais recente"
+ * com dois reembolsos proximos grava a identidade errada e trava o segundo
+ * no indice — o saldo para abaixo do real.
+ *
+ * Por isso este evento entrega so os TOTAIS, nunca um id, mesmo quando a lista
+ * vier (conta com API antiga ou expand).
  */
-export const SUPOSICAO_ORDEM_DE_REEMBOLSOS = 'charge.refunded: refunds.data[0] e o mais recente';
 
 export function eventoDoWebhook(evento: EventoLido): WebhookEventPayload {
   const base = {
@@ -386,7 +389,6 @@ export function eventoDoWebhook(evento: EventoLido): WebhookEventPayload {
           'payment_intent' satisfies keyof CobrancaDeEventoLida,
           evento.type,
         ),
-        providerRefundRef: refundRefMaisRecente(cobranca, evento.type),
         state: 'SUCCEEDED',
         capturedAmountCents: exigirInteiro(
           cobranca,
@@ -460,22 +462,6 @@ function exigirInteiro(objeto: Record<string, unknown>, campo: string, tipo: str
     throw new ProviderInvalidRequestError(`evento ${tipo} com ${campo} invalido`);
   }
   return valor;
-}
-
-function refundRefMaisRecente(cobranca: Record<string, unknown>, tipo: string): string {
-  const lista = cobranca['refunds' satisfies keyof CobrancaDeEventoLida];
-  if (typeof lista !== 'object' || lista === null) {
-    throw new ProviderInvalidRequestError(`evento ${tipo} sem refunds`);
-  }
-  const itens = (lista as { data?: unknown }).data;
-  if (!Array.isArray(itens) || itens.length === 0) {
-    throw new ProviderInvalidRequestError(`evento ${tipo} com refunds vazio`);
-  }
-  const primeiro = itens[0];
-  if (typeof primeiro !== 'object' || primeiro === null) {
-    throw new ProviderInvalidRequestError(`evento ${tipo} com refund invalido`);
-  }
-  return exigirTexto(primeiro as Record<string, unknown>, 'id', tipo);
 }
 
 /**
