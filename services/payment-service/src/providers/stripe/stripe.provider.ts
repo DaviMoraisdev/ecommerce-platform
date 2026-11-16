@@ -284,6 +284,11 @@ export class StripeProvider implements PaymentProvider {
 
   async refund(input: RefundInput): Promise<RefundResult> {
     exigirChave(input.idempotencyKey);
+    // Valor validado ANTES da rede (9c): e o que permite a taxonomia ler o 400
+    // em `param: amount` sem codigo como "acima do disponivel".
+    if (!Number.isSafeInteger(input.amountCents) || input.amountCents <= 0) {
+      throw new ProviderInvalidRequestError('amountCents do reembolso deve ser inteiro positivo');
+    }
     try {
       const reembolso = await this.stripe.refunds.create(
         // payment_intent, e nao charge: reembolsar o PaymentIntent e

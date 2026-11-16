@@ -138,6 +138,27 @@ describe('stripe.erros — taxonomia', () => {
     expect(traduzido).not.toBeInstanceOf(RefundExceedsAvailableError);
   });
 
+  it('E14: reembolso acima do disponivel — 400 em param amount SEM codigo', () => {
+    // Verificado contra o sandbox no 9c: a Stripe responde assim, sem `code`.
+    const traduzido = capturar(bruto('invalid_request_error', 400, { param: 'amount' }), 'reembolsar');
+    expect(traduzido).toBeInstanceOf(RefundExceedsAvailableError);
+  });
+
+  it('E15: a mesma resposta FORA do reembolso nao vira RefundExceedsAvailable', () => {
+    const traduzido = capturar(bruto('invalid_request_error', 400, { param: 'amount' }), 'criar');
+    expect(traduzido).toBeInstanceOf(ProviderInvalidRequestError);
+    expect(traduzido).not.toBeInstanceOf(RefundExceedsAvailableError);
+  });
+
+  it('E16: param amount COM codigo e outro motivo — amount_too_small nao e falta de saldo', () => {
+    const traduzido = capturar(
+      bruto('invalid_request_error', 400, { param: 'amount', code: 'amount_too_small' }),
+      'reembolsar',
+    );
+    expect(traduzido).toBeInstanceOf(ProviderInvalidRequestError);
+    expect(traduzido).not.toBeInstanceOf(RefundExceedsAvailableError);
+  });
+
   it('E9: falha de assinatura vira WebhookSignatureError', () => {
     const erro = new Stripe.errors.StripeSignatureVerificationError('t=1,v1=x', '{}');
     expect(capturar(erro, 'webhook')).toBeInstanceOf(WebhookSignatureError);

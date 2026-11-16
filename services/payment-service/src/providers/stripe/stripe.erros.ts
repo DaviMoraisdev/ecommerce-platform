@@ -108,6 +108,15 @@ export function lancarTraduzido(erro: unknown, contexto: ContextoDaChamada): nev
     if (erro.code === CODIGO_ESTADO_INESPERADO && contexto === 'cancelar') {
       throw new ChargeNotCancelableError(motivo(erro, contexto));
     }
+    // Reembolso acima do disponivel (verificado no sandbox, 9c): 400 em
+    // `param: amount` e SEM codigo. Inferencia pela AUSENCIA de codigo, aceita
+    // por dois motivos: o adapter valida o valor localmente antes da rede, e
+    // amount_too_small tem codigo proprio — entao nenhum outro motivo de valor
+    // invalido chega aqui; e a suite de contrato vigia isto — se a Stripe passar
+    // a mandar codigo, esta condicao deixa de casar e o contrato fica vermelho.
+    if (contexto === 'reembolsar' && erro.code === undefined && erro.param === 'amount') {
+      throw new RefundExceedsAvailableError(motivo(erro, contexto));
+    }
     if (erro.code === CODIGO_JA_REEMBOLSADO && contexto === 'reembolsar') {
       throw new RefundExceedsAvailableError(motivo(erro, contexto));
     }

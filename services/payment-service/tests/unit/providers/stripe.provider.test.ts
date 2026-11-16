@@ -432,6 +432,19 @@ describe('StripeProvider — getCharge, cancelCharge e refund', () => {
     ).rejects.toBeInstanceOf(ChargeNotFoundError);
   });
 
+  it('B14: valor de reembolso invalido NAO chega na rede', async () => {
+    // Sem isto, "valor invalido" e "acima do disponivel" chegariam a Stripe
+    // com a MESMA resposta (400 em param amount), e a taxonomia nao teria como
+    // distinguir os dois.
+    for (const valor of [0, -1, 1.5]) {
+      const { fn, chamadas } = fetchDublado(INTENT_OK);
+      await expect(
+        provedor(fn).refund({ providerRef: 'pi_1', amountCents: valor, idempotencyKey: 'k' }),
+      ).rejects.toThrow(ProviderInvalidRequestError);
+      expect(chamadas).toHaveLength(0);
+    }
+  });
+
   it('B6: refund usa payment_intent, com corpo FECHADO e a nossa chave', async () => {
     const { fn, chamadas } = fetchEmFila([
       { corpo: { id: 're_1', object: 'refund', status: 'succeeded', amount: 3000 } },
