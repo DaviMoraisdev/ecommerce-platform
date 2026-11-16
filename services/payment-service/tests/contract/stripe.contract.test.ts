@@ -64,6 +64,14 @@ function assinarWebhook(
   };
 }
 
+function tipoBrutoDe(eventType: string): string {
+  const tipo = TIPO_NA_STRIPE[eventType];
+  if (tipo === undefined) {
+    throw new Error(`kit da Stripe nao conhece o tipo bruto de "${eventType}" — limite do KIT`);
+  }
+  return tipo;
+}
+
 rodarContratoDeProvedor({
   nome: 'StripeProvider (sandbox real)',
   criar: () => new StripeProvider({ secretKey: CHAVE, webhookSecret: SEGREDO_LOCAL }),
@@ -85,4 +93,5 @@ rodarContratoDeProvedor({
     falhaAmbigua: false,
   },
   assinarWebhook,
+  tipoBrutoDe,
 });

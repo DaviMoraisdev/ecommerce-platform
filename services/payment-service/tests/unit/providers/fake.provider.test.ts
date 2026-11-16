@@ -49,6 +49,8 @@ rodarContratoDeProvedor({
     transicaoAssincrona: true,
     falhaAmbigua: true,
   },
+  // No fake, o tipo que trafega no fio E o do nosso vocabulario.
+  tipoBrutoDe: (eventType: string) => eventType,
   assinarWebhook: (provider: PaymentProvider, input) =>
     (provider as FakeProvider).construirWebhook({
       providerRef: input.providerRef,
