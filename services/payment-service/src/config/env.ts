@@ -387,8 +387,14 @@ function parseProvider(raw: string, nodeEnv: NodeEnv): ProviderName {
   throw new ConfigError(`PAYMENT_PROVIDER invalido: "${raw}". Use "fake" ou "stripe".`);
 }
 
-/** Secreta padrao e restrita. `pk_` e PUBLICAVEL e nao autentica chamada de servidor. */
-const PREFIXOS_DE_CHAVE_SECRETA = ['sk_', 'rk_'] as const;
+/**
+ * Secreta padrao, restrita, e restrita de SANDBOX. `pk_` e PUBLICAVEL e nao
+ * autentica chamada de servidor.
+ *
+ * `rkcs_` (9c): prefixo que `stripe sandbox create` entrega, visto na saida real
+ * do CLI 1.55.11. So o modo `rkcs_test_` foi observado — ver deTeste abaixo.
+ */
+const PREFIXOS_DE_CHAVE_SECRETA = ['sk_', 'rk_', 'rkcs_'] as const;
 
 /**
  * Guarda nos DOIS sentidos, e a simetria e o ponto.
@@ -435,12 +441,19 @@ function parseStripeSecretKey(
   }
 
   const deProducao = valor.startsWith('sk_live_') || valor.startsWith('rk_live_');
-  const deTeste = valor.startsWith('sk_test_') || valor.startsWith('rk_test_');
+  // `rkcs_test_` entra como TESTE, e por isso a guarda abaixo a recusa em
+  // producao. `rkcs_live_` NAO entra em deProducao: nunca foi observado, e aceitar
+  // o que nunca vimos seria apostar que existe e se comporta como imaginamos. Ele
+  // passa pelo filtro de prefixo e cai em "sem modo reconhecivel" — falha fechado.
+  const deTeste =
+    valor.startsWith('sk_test_') ||
+    valor.startsWith('rk_test_') ||
+    valor.startsWith('rkcs_test_');
 
   if (!deProducao && !deTeste) {
     throw new ConfigError(
       'STRIPE_SECRET_KEY sem modo reconhecivel no prefixo (esperado sk_live_, ' +
-        'sk_test_, rk_live_ ou rk_test_). Sem o modo nao da para verificar se a ' +
+        'sk_test_, rk_live_, rk_test_ ou rkcs_test_). Sem o modo nao da para verificar se a ' +
         'chave confere com o ambiente.',
     );
   }
