@@ -293,51 +293,63 @@ describe('stripe.mapeamento — eventoDoWebhook', () => {
     });
   });
 
-  it('W5: charge.refunded traz TOTAIS da cobranca e o ref do reembolso mais recente', () => {
+  it('W5: charge.refunded no formato REAL (sem refunds) entrega so os TOTAIS', () => {
+    // 9c: formato verificado no sandbox — o evento nao traz a lista de reembolsos.
     const r = eventoDoWebhook(
       ev('charge.refunded', {
         id: 'ch_1',
         payment_intent: 'pi_5',
         amount_captured: 12990,
         amount_refunded: 5000,
-        refunds: { data: [{ id: 're_novo' }, { id: 're_antigo' }] },
       }),
     );
     expect(r).toMatchObject({
       eventType: 'refund.succeeded',
       providerRef: 'pi_5',
-      providerRefundRef: 're_novo',
       state: 'SUCCEEDED',
       capturedAmountCents: 12990,
       refundedAmountCents: 5000,
     });
+    // A CHAVE nao existe — nao basta o valor ser undefined.
+    expect('providerRefundRef' in r).toBe(false);
+  });
+
+  it('W5b: mesmo COM a lista presente, o id NAO e adivinhado', () => {
+    // Com dois reembolsos proximos, "o mais recente" grava a identidade errada
+    // e trava o segundo no indice unico. A lista pode vir em conta com API antiga.
+    const r = eventoDoWebhook(
+      ev('charge.refunded', {
+        id: 'ch_1b',
+        payment_intent: 'pi_5b',
+        amount_captured: 12990,
+        amount_refunded: 5000,
+        refunds: { data: [{ id: 're_novo' }, { id: 're_antigo' }] },
+      }),
+    );
+    expect('providerRefundRef' in r).toBe(false);
   });
 
   it('W6: charge.refunded sem payment_intent e conteudo INVALIDO, nao unsupported', () => {
     expect(() =>
       eventoDoWebhook(
-        ev('charge.refunded', {
-          id: 'ch_2',
-          amount_captured: 1,
-          amount_refunded: 1,
-          refunds: { data: [{ id: 're_1' }] },
-        }),
+        ev('charge.refunded', { id: 'ch_2', amount_captured: 1, amount_refunded: 1 }),
       ),
     ).toThrow(ProviderInvalidRequestError);
   });
 
-  it('W7: charge.refunded com refunds vazio lanca — nao da para nomear o reembolso', () => {
-    expect(() =>
-      eventoDoWebhook(
-        ev('charge.refunded', {
-          id: 'ch_3',
-          payment_intent: 'pi_7',
-          amount_captured: 1,
-          amount_refunded: 1,
-          refunds: { data: [] },
-        }),
-      ),
-    ).toThrow(ProviderInvalidRequestError);
+  it('W7: lista de reembolsos VAZIA nao derruba o evento — o total e o que importa', () => {
+    // Antes do 9c isto lancava: um dado que so servia a identidade derrubava o
+    // TOTAL junto. Agora o evento passa com os totais.
+    const r = eventoDoWebhook(
+      ev('charge.refunded', {
+        id: 'ch_3',
+        payment_intent: 'pi_7',
+        amount_captured: 1000,
+        amount_refunded: 1000,
+        refunds: { data: [] },
+      }),
+    );
+    expect(r).toMatchObject({ eventType: 'refund.succeeded', refundedAmountCents: 1000 });
   });
 
   it('W8: tipo que nao tratamos vira unsupported, SEM providerRef nem valores', () => {

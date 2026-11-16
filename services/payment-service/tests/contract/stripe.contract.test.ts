@@ -1,5 +1,7 @@
 import Stripe from 'stripe';
 
+import { randomUUID } from 'node:crypto';
+
 import type { PaymentProvider, WebhookRequest } from '../../src/providers/payment-provider.port';
 import { StripeProvider } from '../../src/providers/stripe/stripe.provider';
 import { rodarContratoDeProvedor } from '../unit/providers/payment-provider.contract';
@@ -94,4 +96,57 @@ rodarContratoDeProvedor({
   },
   assinarWebhook,
   tipoBrutoDe,
+});
+
+describe('StripeProvider — payload REAL de charge.refunded (9c)', () => {
+  it(
+    'evento lido do sandbox passa pelo verifyWebhook e entrega so os TOTAIS, sem id adivinhado',
+    async () => {
+      // Unico teste que exercita o formato que a Stripe REALMENTE envia — a falta
+      // dele e o que deixou o bug do refunds passar pelo 9b inteiro.
+      const provider = new StripeProvider({ secretKey: CHAVE, webhookSecret: SEGREDO_LOCAL });
+      const cobranca = await provider.createCharge({
+        amountCents: 12990,
+        currency: 'BRL',
+        paymentMethodToken: 'pm_card_visa',
+        idempotencyKey: randomUUID(),
+        reference: { paymentId: randomUUID(), orderId: randomUUID(), attemptCount: 1 },
+      });
+      await provider.refund({
+        providerRef: cobranca.providerRef,
+        amountCents: 3000,
+        idempotencyKey: randomUUID(),
+      });
+
+      // O evento e assincrono: espera ele aparecer, com teto.
+      const stripe = new Stripe(CHAVE);
+      let real: Stripe.Event | undefined;
+      for (let i = 0; i < 20 && real === undefined; i += 1) {
+        const lista = await stripe.events.list({ type: 'charge.refunded', limit: 20 });
+        real = lista.data.find(
+          (e) => (e.data.object as { payment_intent?: string }).payment_intent === cobranca.providerRef,
+        );
+        if (real === undefined) await new Promise((r) => setTimeout(r, 1000));
+      }
+      expect(real).toBeDefined();
+
+      const payload = JSON.stringify(real);
+      const evento = provider.verifyWebhook({
+        rawBody: Buffer.from(payload),
+        headers: {
+          'stripe-signature': Stripe.webhooks.generateTestHeaderString({ payload, secret: SEGREDO_LOCAL }),
+        },
+      });
+
+      expect(evento).toMatchObject({
+        eventType: 'refund.succeeded',
+        providerRef: cobranca.providerRef,
+        state: 'SUCCEEDED',
+        capturedAmountCents: 12990,
+        refundedAmountCents: 3000,
+      });
+      expect('providerRefundRef' in evento).toBe(false);
+    },
+    60_000,
+  );
 });

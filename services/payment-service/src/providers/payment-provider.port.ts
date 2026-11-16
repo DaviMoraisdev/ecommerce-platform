@@ -240,7 +240,13 @@ export type WebhookEventPayload =
     })
   | (WebhookEventBase & {
       eventType: 'refund.succeeded';
-      providerRefundRef: string;
+      /**
+       * OPCIONAL desde o 9c: a Stripe nao manda a lista de reembolsos no
+       * charge.refunded, entao o adapter nao tem o id e NAO o adivinha. Quem
+       * decide o que fazer sem ele e o servico (delta zero e no-op; delta
+       * positivo sem id e "ainda nao aplicavel"). O fake continua mandando.
+       */
+      providerRefundRef?: string;
       providerRef: ProviderRef;
       state: 'SUCCEEDED';
       capturedAmountCents: number;
