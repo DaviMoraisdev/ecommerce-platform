@@ -62,10 +62,17 @@ function autorizacao(): PaymentTransaction {
   } as PaymentTransaction;
 }
 
-// 9c: a fixture NUNCA teve providerRefundRef, e o duplo cast abaixo escondeu
-// isso do compilador — estes testes gravavam a trilha com providerRef
-// indefinido. Agora o id existe sempre aqui; a versao SEM id e outra funcao.
-function eventoDeReembolso(total: number): WebhookEventPayload {
+type ReembolsoDoProvedor = Extract<WebhookEventPayload, { eventType: 'refund.succeeded' }>;
+
+/**
+ * Formato REAL do charge.refunded da Stripe: a chave providerRefundRef NAO existe.
+ *
+ * E a BASE, tipada sem cast: o compilador confere a forma inteira. A primeira
+ * versao usava `as unknown as` e escondeu por meses que a fixture nao tinha o
+ * id; a justificativa para manter o cast ("ProviderRef talvez seja marcado")
+ * nunca foi verificada, e era falsa — ProviderRef e string.
+ */
+function eventoDeReembolsoSemId(total: number): ReembolsoDoProvedor {
   return {
     providerEventId: 'evt_1',
     providerEventTypeBruto: 'refund.succeeded',
@@ -76,21 +83,12 @@ function eventoDeReembolso(total: number): WebhookEventPayload {
     state: 'SUCCEEDED',
     capturedAmountCents: VALOR,
     refundedAmountCents: total,
-    providerRefundRef: 're_1',
-  } as unknown as WebhookEventPayload;
+  };
 }
 
-/**
- * Formato REAL do charge.refunded da Stripe: a CHAVE nao existe.
- *
- * Funcao separada, e nao `eventoDeReembolso(total, undefined)`: parametro com
- * valor padrao USA o padrao quando recebe undefined — foi exatamente assim que
- * a primeira versao destes testes recebeu 're_1' sem ninguem perceber.
- */
-function eventoDeReembolsoSemId(total: number): WebhookEventPayload {
-  const copia = { ...eventoDeReembolso(total) } as unknown as Record<string, unknown>;
-  delete copia.providerRefundRef;
-  return copia as unknown as WebhookEventPayload;
+/** Com o id real — o formato do fake e do caminho sincrono. */
+function eventoDeReembolso(total: number): ReembolsoDoProvedor {
+  return { ...eventoDeReembolsoSemId(total), providerRefundRef: 're_1' };
 }
 
 function eventoDeCaptura(overrides: Partial<WebhookEventPayload> = {}): WebhookEventPayload {
@@ -245,7 +243,10 @@ describe('WebhookService — reembolso SEM id do provedor (9c)', () => {
   it('delta positivo sem id: ainda nao aplicavel, e NENHUMA linha na trilha', async () => {
     // O id e identidade (eventId do payment.refunded e chave do indice unico de
     // estorno). Aplicar sem ele gravaria a trilha com identidade inventada.
-    const { service, criadas } = montar([pagamento({ refundedAmountCents: 0 })], [1]);
+    const { service, criadas, tx, inbox, outboxNoTx, outboxForaDaTx } = montar(
+      [pagamento({ refundedAmountCents: 0 })],
+      [1],
+    );
 
     const evento = eventoDeReembolsoSemId(3000);
     // A premissa do teste mora na fixture, entao o teste a verifica.
@@ -253,14 +254,26 @@ describe('WebhookService — reembolso SEM id do provedor (9c)', () => {
 
     const resultado = await service.processar('fake', evento);
 
-    expect(resultado.retentavel).toBe(true);
+    // Efeitos financeiros PRIMEIRO: com a guarda removida, a primeira coisa a
+    // quebrar e "o total foi movido" — a assercao que protege o dinheiro.
+    expect(tx.payment.updateMany).not.toHaveBeenCalled();
     expect(criadas.filter((c) => c.type === TransactionType.REFUND)).toHaveLength(0);
+    expect(outboxNoTx).not.toHaveBeenCalled();
+    expect(outboxForaDaTx).not.toHaveBeenCalled();
+
+    // Depois o desfecho: retentavel, com o motivo registrado para a triagem.
+    expect(resultado.retentavel).toBe(true);
+    expect(resultado.motivo).toBe('reembolso sem referencia do provedor');
+    expect(inbox).toContainEqual({ lastError: 'reembolso sem referencia do provedor' });
   });
 
   it('delta zero sem id: PROCESSED — o caminho sincrono ja gravou, o id nao faz falta', async () => {
     // E o fluxo do produto: o endpoint grava com o id real do resultado de
     // refund(), e o webhook chega depois com o mesmo total.
-    const { service, criadas } = montar([pagamento({ refundedAmountCents: 3000 })], [1]);
+    const { service, criadas, tx, inbox, outboxNoTx, outboxForaDaTx } = montar(
+      [pagamento({ refundedAmountCents: 3000 })],
+      [1],
+    );
 
     const evento = eventoDeReembolsoSemId(3000);
     // Sem esta linha, a primeira versao deste caso passou VAZIA: tinha id.
@@ -268,9 +281,14 @@ describe('WebhookService — reembolso SEM id do provedor (9c)', () => {
 
     const resultado = await service.processar('fake', evento);
 
+    expect(tx.payment.updateMany).not.toHaveBeenCalled();
+    expect(criadas.filter((c) => c.type === TransactionType.REFUND)).toHaveLength(0);
+    expect(outboxNoTx).not.toHaveBeenCalled();
+    expect(outboxForaDaTx).not.toHaveBeenCalled();
+
     expect(resultado.status).toBe(WebhookStatus.PROCESSED);
     expect(resultado.retentavel).not.toBe(true);
-    expect(criadas.filter((c) => c.type === TransactionType.REFUND)).toHaveLength(0);
+    expect(inbox).toContainEqual(expect.objectContaining({ status: WebhookStatus.PROCESSED }));
   });
 });
 
