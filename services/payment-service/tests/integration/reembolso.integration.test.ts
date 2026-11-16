@@ -4,7 +4,7 @@ import { connectDatabase, disconnectDatabase } from '../../src/config/database';
 import { PaymentDomainError } from '../../src/domain/errors';
 import { FakeProvider } from '../../src/providers/fake/fake.provider';
 import { FAKE_TOKENS } from '../../src/providers/fake/fake.tokens';
-import type { PaymentProvider } from '../../src/providers/payment-provider.port';
+import type { PaymentProvider, WebhookEventPayload } from '../../src/providers/payment-provider.port';
 import { PaymentService } from '../../src/services/payment.service';
 import { WebhookService } from '../../src/services/webhook.service';
 import { assertTestDatabase } from '../helpers/testDbGuard';
@@ -355,6 +355,73 @@ describe('reembolsar', () => {
     );
     expect(sucedidas).toHaveLength(1);
     expect(r).toMatchObject({ tipo: 'aplicado', totalReembolsadoCents: valor });
+  });
+
+  it('CASO R24: webhook SEM id fica pendente, o endpoint grava, e a REENTREGA converge sem duplicar', async () => {
+    // Review do PR #78, item T2. A opcao M do 9c se justifica por esta SEQUENCIA,
+    // e ate aqui ela so existia num comentario: os testes unitarios montavam os
+    // dois estados separadamente e nunca reprocessavam o MESMO evento.
+    const { service, userId, payment } = await pagamentoCapturado();
+    const webhook = new WebhookService({ prisma, tetoDeTentativas: 5, idadeMaximaMinutos: 60 });
+    // Contagem, e nao filtro por tipo: pega QUALQUER publicacao a mais.
+    const outboxAntes = await prisma.outboxEvent.count();
+
+    const autorizacao = await prisma.paymentTransaction.findFirstOrThrow({
+      where: { paymentId: payment.id, type: TransactionType.AUTHORIZE },
+    });
+    expect(autorizacao.providerRef).not.toBeNull();
+
+    const valor = Math.floor(payment.capturedAmountCents / 3);
+
+    // Formato REAL do charge.refunded da Stripe: totais, e a chave do id NAO existe.
+    const evento: Extract<WebhookEventPayload, { eventType: 'refund.succeeded' }> = {
+      providerEventId: `evt_${randomUUID()}`,
+      providerEventTypeBruto: 'charge.refunded',
+      providerCreatedAt: new Date(),
+      raw: {},
+      eventType: 'refund.succeeded',
+      providerRef: autorizacao.providerRef as string,
+      state: 'SUCCEEDED',
+      capturedAmountCents: payment.capturedAmountCents,
+      refundedAmountCents: valor,
+    };
+    expect('providerRefundRef' in evento).toBe(false);
+
+    // 1-2. Primeira entrega: pendente, e NENHUM efeito financeiro.
+    const primeira = await webhook.processar('fake', evento);
+    expect(primeira.retentavel).toBe(true);
+    expect(
+      (await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } })).refundedAmountCents,
+    ).toBe(0);
+    expect(await linhasDeReembolso(payment.id)).toHaveLength(0);
+    expect(await prisma.outboxEvent.count()).toBe(outboxAntes);
+    const pendente = await prisma.webhookEvent.findFirstOrThrow({
+      where: { providerEventId: evento.providerEventId },
+    });
+    expect(pendente.status).toBe('RECEIVED');
+    expect(pendente.lastError).toBe('reembolso sem referencia do provedor');
+
+    // 3. O caminho previsto grava o reembolso, com o id REAL do provedor.
+    const r = await service.reembolsar(pedidoDeReembolso(userId, payment.id, valor));
+    expect(r).toMatchObject({ tipo: 'aplicado', totalReembolsadoCents: valor });
+
+    // 4-5. Reentrega do MESMO evento: delta zero, PROCESSED, nada duplicado.
+    const segunda = await webhook.processar('fake', evento);
+    expect(segunda.status).toBe('PROCESSED');
+    expect(segunda.retentavel).not.toBe(true);
+
+    const final = await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } });
+    expect(final.refundedAmountCents).toBe(valor);
+    const sucedidas = (await linhasDeReembolso(payment.id)).filter(
+      (l) => l.status === TransactionStatus.SUCCEEDED,
+    );
+    expect(sucedidas).toHaveLength(1);
+    // Exatamente +1: o evento do endpoint. A reentrega nao publica de novo.
+    expect(await prisma.outboxEvent.count()).toBe(outboxAntes + 1);
+    const concluido = await prisma.webhookEvent.findFirstOrThrow({
+      where: { providerEventId: evento.providerEventId },
+    });
+    expect(concluido.status).toBe('PROCESSED');
   });
 
   // R12 e R13 cobrem o achado 3.1: a resposta do provedor era aceita sem
