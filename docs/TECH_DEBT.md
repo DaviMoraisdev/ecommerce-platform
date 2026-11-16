@@ -50,8 +50,22 @@ Registros de decisão — não há tarefa a fazer, apenas contexto para o futuro
 
 ## FASE 5 — fechar no Bloco 10 (dentro desta fase)
 
+Escopo do fechamento da fase. Até 2026-11-16 esta seção estava vazia, e o
+escopo existia apenas nos checkpoints de sessão — fora do repositório.
 
-
+- **[B10-1] README do payment-service e da raiz**, incluindo como subir o
+  serviço com uma chave de sandbox (`stripe sandbox create`), que é o caminho
+  que um avaliador externo vai seguir.
+- **[B10-2] PDF de revisão da fase** em `docs/phase-reviews/phase-05.pdf`, no
+  padrão das fases 1 a 4.
+- **[B10-3] Limpeza do TECH_DEBT:** remover as entradas marcadas `[PAGO]`
+  (41 linhas contendo `PAGO` em 2026-10-28) e mover os critérios herdados entre
+  blocos para um arquivo próprio — hoje eles são 82 das 153 entradas e fazem o
+  documento parecer uma lista de dívidas que não é.
+- **[B10-4] Explicação 3 do DoD do Bloco 8,** adiada para o PDF: por que chamar
+  `iniciar` depois do `parar` espera a abertura que já estava em voo.
+- **[B10-5] Registro dos resultados do 9c:** cada suposição declarada do 9b
+  marcada como confirmada ou refutada pela suíte de contrato, com o output.
 
 ## FASE 5 — critérios herdados entre blocos
 
