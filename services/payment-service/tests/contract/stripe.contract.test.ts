@@ -112,20 +112,33 @@ describe('StripeProvider — payload REAL de charge.refunded (9c)', () => {
         idempotencyKey: randomUUID(),
         reference: { paymentId: randomUUID(), orderId: randomUUID(), attemptCount: 1 },
       });
+      // Margem de 60 s contra desvio entre o relogio local e o da Stripe.
+      const antesDoReembolso = Math.floor(Date.now() / 1000) - 60;
       await provider.refund({
         providerRef: cobranca.providerRef,
         amountCents: 3000,
         idempotencyKey: randomUUID(),
       });
 
-      // O evento e assincrono: espera ele aparecer, com teto.
-      const stripe = new Stripe(CHAVE);
+      // O evento e assincrono. PRAZO TOTAL, e nao contador — o contador limitava
+      // consultas, nao a duracao de cada uma (review do PR #78, F2). Timeout curto
+      // no cliente, para uma requisicao pendurada nao sobreviver ao teste. Filtro
+      // por `created` com paginacao, para o evento nao ficar fora dos primeiros
+      // itens quando houver atividade concorrente na conta.
+      const stripe = new Stripe(CHAVE, { timeout: 5_000, maxNetworkRetries: 0 });
+      const prazo = Date.now() + 40_000;
       let real: Stripe.Event | undefined;
-      for (let i = 0; i < 20 && real === undefined; i += 1) {
-        const lista = await stripe.events.list({ type: 'charge.refunded', limit: 20 });
-        real = lista.data.find(
-          (e) => (e.data.object as { payment_intent?: string }).payment_intent === cobranca.providerRef,
-        );
+      while (real === undefined && Date.now() < prazo) {
+        for await (const e of stripe.events.list({
+          type: 'charge.refunded',
+          created: { gte: antesDoReembolso },
+          limit: 100,
+        })) {
+          if ((e.data.object as { payment_intent?: string }).payment_intent === cobranca.providerRef) {
+            real = e;
+            break;
+          }
+        }
         if (real === undefined) await new Promise((r) => setTimeout(r, 1000));
       }
       expect(real).toBeDefined();
